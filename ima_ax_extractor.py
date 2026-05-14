@@ -35,7 +35,7 @@ WAIT_SCROLL = 2.0
 WAIT_ACTIVATE = 0.5
 
 MAX_PAGES = 65
-MAX_CONSECUTIVE_SEEN = 40 # 连续遇到已存在文章后停止
+MAX_CONSECUTIVE_SEEN = 2 # 连续遇到已存在文章后停止
 
 
 # ==================== 数据库 ====================

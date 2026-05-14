@@ -27,3 +27,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log
+incremental_update*.log

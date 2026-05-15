@@ -25,8 +25,10 @@ from pathlib import Path
 # 要监控的知识库列表
 KNOWLEDGE_BASES = [
     "AI",
-    "Python",
-    # 添加更多知识库名称
+    "投资人生",
+    "英语教与学",
+    "Andrew",
+    "皮皮鲁的知识库",
 ]
 
 LOG_FILE = Path(__file__).parent / "incremental_update.log"
@@ -133,27 +135,92 @@ def activate_ima():
     time.sleep(1)
 
 
+def navigate_to_kb(kb_name: str) -> bool:
+    """
+    通过 cua-driver 自动导航到指定知识库
+
+    在侧边栏找到知识库名称并点击切换
+
+    返回: True 表示成功点击
+    """
+    window = get_ima_main_window()
+    if not window:
+        log("❌ 未找到 IMA 窗口，无法导航")
+        return False
+
+    pid = window["pid"]
+    window_id = window["window_id"]
+
+    # 获取窗口状态
+    import re
+    state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
+    state = json.loads(state_result)
+    md = state.get("tree_markdown", "")
+
+    # 在侧边栏查找知识库名称的 element_index
+    # 侧边栏知识库列表结构: AXStaticText = "知识库名称"
+    for line in md.split("\n"):
+        # 匹配 AXStaticText 且文本完全等于知识库名称
+        m = re.search(r'\[(\d+)\] AXStaticText = "' + re.escape(kb_name) + '"', line)
+        if m:
+            elem_idx = int(m.group(1))
+            log(f"找到知识库 '{kb_name}' (element {elem_idx})，点击导航...")
+
+            # 点击知识库名称
+            click_result = run_cua(["call", "click", json.dumps({
+                "pid": pid,
+                "window_id": window_id,
+                "element_index": elem_idx
+            })])
+            time.sleep(3)  # 等待页面加载
+
+            # 验证是否切换成功
+            title = get_kb_window_title(kb_name)
+            if kb_name in title:
+                log(f"✅ 已导航到 {kb_name} 知识库")
+                return True
+            else:
+                log(f"⚠️  点击后窗口标题不包含 '{kb_name}'，标题: {title}")
+                return False
+
+    log(f"⚠️  在侧边栏未找到知识库 '{kb_name}'")
+    return False
+
+
 def ensure_ima_ready(kb_name: str, timeout: int = 60) -> bool:
     """
     确保 IMA 已就绪并位于目标知识库
 
-    如果检测不到目标知识库，等待用户手动切换
+    先尝试自动导航，如果失败则等待
 
     返回: True 表示就绪，False 表示超时
     """
     log(f"确保 IMA 位于 {kb_name} 知识库...")
 
+    # 先检查是否已经在目标知识库
+    title = get_kb_window_title(kb_name)
+    if kb_name in title:
+        log(f"✅ 已确认在 {kb_name} 知识库")
+        return True
+
+    # 尝试自动导航
+    activate_ima()
+    time.sleep(1)
+    if navigate_to_kb(kb_name):
+        return True
+
+    # 自动导航失败，等待用户手动切换
+    log(f"⏳ 自动导航失败，等待手动切换...")
     start_time = time.time()
     while time.time() - start_time < timeout:
         title = get_kb_window_title(kb_name)
         if kb_name in title:
             log(f"✅ 已确认在 {kb_name} 知识库")
             return True
-
-        # 每 10 秒提示一次
         elapsed = int(time.time() - start_time)
         if elapsed % 10 == 0 and elapsed > 0:
             log(f"⏳ 等待切换到 {kb_name} 知识库... ({elapsed}/{timeout}秒)")
+        time.sleep(2)
 
         time.sleep(2)
 
@@ -289,6 +356,11 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
     if dry_run:
         log(f"[DRY RUN] 将提取 {kb_name} 知识库新增文章")
         return {"new": 0, "skipped": 0, "failed": 0}
+
+    # 调用提取器前再次激活 IMA，确保窗口在前台
+    log("激活 IMA 窗口...")
+    activate_ima()
+    time.sleep(2)  # 等待窗口完全激活
 
     # 调用提取器脚本
     cmd = [

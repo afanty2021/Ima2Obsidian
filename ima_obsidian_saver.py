@@ -462,6 +462,10 @@ def main():
         except KeyboardInterrupt:
             print("\n已取消")
             return
+        except EOFError:
+            # 非交互模式（如自动化脚本），自动继续
+            print("⚠️  检测到非交互模式，自动继续执行...")
+            print()
 
     saved_count = 0
     failed_count = 0

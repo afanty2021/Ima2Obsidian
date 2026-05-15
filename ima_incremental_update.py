@@ -91,12 +91,74 @@ def get_ima_main_window():
     return max(ima_windows, key=lambda w: w["bounds"].get("width", 0) * w["bounds"].get("height", 0))
 
 
+def is_ima_running() -> bool:
+    """检查 IMA 是否正在运行"""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "ima.copilot"],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def launch_ima():
+    """启动 IMA 应用"""
+    log("启动 IMA 应用...")
+    subprocess.run(
+        ["open", "-a", "ima.copilot"],
+        capture_output=True, timeout=10
+    )
+    # 等待应用启动
+    for i in range(30):  # 最多等待 30 秒
+        time.sleep(1)
+        if is_ima_running():
+            log("✅ IMA 已启动")
+            time.sleep(3)  # 额外等待应用初始化
+            return True
+    log("⚠️  IMA 启动超时")
+    return False
+
+
 def activate_ima():
+    """激活 IMA 应用，如果未运行则启动"""
+    if not is_ima_running():
+        launch_ima()
+
     subprocess.run(
         ["osascript", "-e", 'tell application "ima.copilot" to activate'],
         capture_output=True, timeout=5
     )
-    time.sleep(0.5)
+    time.sleep(1)
+
+
+def ensure_ima_ready(kb_name: str, timeout: int = 60) -> bool:
+    """
+    确保 IMA 已就绪并位于目标知识库
+
+    如果检测不到目标知识库，等待用户手动切换
+
+    返回: True 表示就绪，False 表示超时
+    """
+    log(f"确保 IMA 位于 {kb_name} 知识库...")
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        title = get_kb_window_title(kb_name)
+        if kb_name in title:
+            log(f"✅ 已确认在 {kb_name} 知识库")
+            return True
+
+        # 每 10 秒提示一次
+        elapsed = int(time.time() - start_time)
+        if elapsed % 10 == 0 and elapsed > 0:
+            log(f"⏳ 等待切换到 {kb_name} 知识库... ({elapsed}/{timeout}秒)")
+
+        time.sleep(2)
+
+    log(f"⚠️  等待超时，未能确认在 {kb_name} 知识库")
+    return False
 
 
 def get_kb_window_title(kb_name: str) -> str:
@@ -204,6 +266,15 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
     log(f"开始更新知识库: {kb_name}")
     log(f"{'='*50}")
 
+    # 激活 IMA 并确保就绪
+    activate_ima()
+
+    # 等待确认在目标知识库
+    if not dry_run:
+        if not ensure_ima_ready(kb_name, timeout=60):
+            log(f"⚠️  无法确认在 {kb_name} 知识库，跳过")
+            return {"new": 0, "skipped": 0, "failed": 0}
+
     # 获取 IMA 窗口
     window = get_ima_main_window()
     if not window:
@@ -212,17 +283,6 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
 
     pid = window["pid"]
     window_id = window["window_id"]
-
-    # 检查是否在目标知识库
-    activate_ima()
-    time.sleep(1)
-    title = get_kb_window_title(kb_name)
-
-    if kb_name not in title:
-        log(f"⚠️  当前不在 {kb_name} 知识库")
-        log(f"   窗口标题: {title}")
-        log(f"   请手动切换到 {kb_name} 知识库列表页")
-        return {"new": 0, "skipped": 0, "failed": 0}
 
     log(f"✅ 确认在 {kb_name} 知识库")
 

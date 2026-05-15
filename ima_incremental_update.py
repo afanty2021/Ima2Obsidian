@@ -172,16 +172,20 @@ def navigate_to_kb(kb_name: str) -> bool:
                 "window_id": window_id,
                 "element_index": elem_idx
             })])
-            time.sleep(3)  # 等待页面加载
 
-            # 验证是否切换成功
-            title = get_kb_window_title(kb_name)
-            if kb_name in title:
-                log(f"✅ 已导航到 {kb_name} 知识库")
-                return True
-            else:
-                log(f"⚠️  点击后窗口标题不包含 '{kb_name}'，标题: {title}")
-                return False
+            # 等待页面加载并验证
+            for wait in range(5):  # 最多等待 5 次，每次 2 秒
+                time.sleep(2)
+                title = get_kb_window_title(kb_name)
+                if kb_name in title:
+                    log(f"✅ 已导航到 {kb_name} 知识库 (等待 {(wait+1)*2}秒)")
+                    # 额外等待文章列表渲染
+                    time.sleep(2)
+                    return True
+                log(f"  等待页面加载... ({(wait+1)*2}秒)")
+
+            log(f"⚠️  点击后窗口标题不包含 '{kb_name}'，标题: {title}")
+            return False
 
     log(f"⚠️  在侧边栏未找到知识库 '{kb_name}'")
     return False

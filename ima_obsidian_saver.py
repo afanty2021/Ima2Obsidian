@@ -257,7 +257,7 @@ def find_and_rename_in_vault(
     if search_dirs is None:
         search_dirs = [CLIPPINGS_DIR, VAULT_DIR]
 
-    target_name = f"{date_str}{sanitize_filename(title)}.md"
+    target_name = f"{date_str} {sanitize_filename(title)}.md"
 
     # 确定目标路径
     if target_folder:
@@ -348,7 +348,7 @@ def save_one_article(
     if dry_run:
         date_str = extract_publish_date(url)
         folder_info = f" → {target_folder}/" if target_folder else ""
-        new_name = f"{date_str}{sanitize_filename(title)}.md"
+        new_name = f"{date_str} {sanitize_filename(title)}.md"
         print(f"  [DRY RUN] {title[:50]}...")
         print(f"    发布日期: {date_str}")
         print(f"    目标位置: {folder_info}{new_name[:60]}")
@@ -394,7 +394,7 @@ def save_one_article(
 
     if not renamed:
         folder_info = f"{target_folder}/" if target_folder else ""
-        print(f"    ⚠️  未找到保存的文件，可能需要手动移动到: {folder_info}{date_str}{sanitize_filename(title)}.md")
+        print(f"    ⚠️  未找到保存的文件，可能需要手动移动到: {folder_info}{date_str} {sanitize_filename(title)}.md")
 
     # 5. 关闭标签页（尝试后台关闭，不激活浏览器）
     close_tab(browser_app)

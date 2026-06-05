@@ -38,6 +38,10 @@ from pathlib import Path
 
 import requests
 
+# 确保sys可用于isatty()检查
+if sys.stdin is None:
+    sys.stdin = open('/dev/null')
+
 
 # ==================== 配置 ====================
 
@@ -457,14 +461,17 @@ def main():
         print("  3. Web Clipper 已在扩展中连接到 Obsidian")
         print("  4. 保存期间不要操作键盘和鼠标")
         print()
-        try:
-            input("按 Enter 开始，Ctrl+C 取消...")
-        except KeyboardInterrupt:
-            print("\n已取消")
-            return
-        except EOFError:
-            # 非交互模式（如自动化脚本），自动继续
-            print("⚠️  检测到非交互模式，自动继续执行...")
+
+        # 只在交互式终端（stdin 是 tty）时要求用户确认
+        if sys.stdin.isatty():
+            try:
+                input("按 Enter 开始，Ctrl+C 取消...")
+            except KeyboardInterrupt:
+                print("\n已取消")
+                return
+        else:
+            # 非交互模式（如从 subprocess 调用），自动继续执行
+            print("⚠️  检测到非交互模式，自动开始执行...")
             print()
 
     saved_count = 0

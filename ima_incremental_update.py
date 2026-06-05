@@ -25,7 +25,7 @@ from pathlib import Path
 # 要监控的知识库列表
 KNOWLEDGE_BASES = [
     "AI",
-    "投资人生",
+    "Invest",
     "英语教与学",
     "Andrew",
     "皮皮鲁的知识库",
@@ -71,6 +71,38 @@ def is_daemon_running() -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def start_daemon() -> bool:
+    """启动 cua-driver daemon"""
+    log("启动 cua-driver daemon...")
+    try:
+        # 使用 nohup 启动，输出到 /dev/null
+        subprocess.Popen(
+            [CUA_DRIVER, "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        # 等待 daemon 启动
+        for i in range(10):
+            time.sleep(1)
+            if is_daemon_running():
+                log("✅ cua-driver daemon 已启动")
+                time.sleep(2)  # 额外等待初始化
+                return True
+        log("⚠️  cua-driver daemon 启动超时")
+        return False
+    except Exception as e:
+        log(f"❌ 启动 cua-driver daemon 失败: {e}")
+        return False
+
+
+def ensure_daemon() -> bool:
+    """确保 cua-driver daemon 正在运行"""
+    if is_daemon_running():
+        return True
+    return start_daemon()
 
 
 def get_ima_main_window():
@@ -135,13 +167,13 @@ def activate_ima():
     time.sleep(1)
 
 
-def navigate_to_kb(kb_name: str) -> bool:
+def navigate_to_kb(kb_name: str, max_attempts: int = 3) -> bool:
     """
     通过 cua-driver 自动导航到指定知识库
 
-    在侧边栏找到知识库名称并点击切换
+    在侧边栏找到知识库名称并点击切换，支持多次尝试和滚动查找
 
-    返回: True 表示成功点击
+    返回: True 表示成功导航
     """
     window = get_ima_main_window()
     if not window:
@@ -151,20 +183,27 @@ def navigate_to_kb(kb_name: str) -> bool:
     pid = window["pid"]
     window_id = window["window_id"]
 
-    # 获取窗口状态
-    import re
-    state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
-    state = json.loads(state_result)
-    md = state.get("tree_markdown", "")
+    # 多次尝试
+    for attempt in range(1, max_attempts + 1):
+        log(f"导航尝试 {attempt}/{max_attempts}...")
 
-    # 在侧边栏查找知识库名称的 element_index
-    # 侧边栏知识库列表结构: AXStaticText = "知识库名称"
-    for line in md.split("\n"):
-        # 匹配 AXStaticText 且文本完全等于知识库名称
-        m = re.search(r'\[(\d+)\] AXStaticText = "' + re.escape(kb_name) + '"', line)
-        if m:
-            elem_idx = int(m.group(1))
-            log(f"找到知识库 '{kb_name}' (element {elem_idx})，点击导航...")
+        # 获取窗口状态
+        import re
+        state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
+        state = json.loads(state_result)
+        md = state.get("tree_markdown", "")
+
+        # 在侧边栏查找知识库名称的 element_index
+        elem_idx = None
+        for line in md.split("\n"):
+            # 匹配 AXStaticText 且文本完全等于知识库名称
+            m = re.search(r'\[(\d+)\] AXStaticText = "' + re.escape(kb_name) + '"', line)
+            if m:
+                elem_idx = int(m.group(1))
+                break
+
+        if elem_idx is not None:
+            log(f"  找到知识库 '{kb_name}' (element {elem_idx})，点击...")
 
             # 点击知识库名称
             click_result = run_cua(["call", "click", json.dumps({
@@ -174,20 +213,33 @@ def navigate_to_kb(kb_name: str) -> bool:
             })])
 
             # 等待页面加载并验证
-            for wait in range(5):  # 最多等待 5 次，每次 2 秒
-                time.sleep(2)
+            for wait in range(8):  # 增加到 8 次，每次 2.5 秒 = 最多 20 秒
+                time.sleep(2.5)
                 title = get_kb_window_title(kb_name)
                 if kb_name in title:
-                    log(f"✅ 已导航到 {kb_name} 知识库 (等待 {(wait+1)*2}秒)")
-                    # 额外等待文章列表渲染
-                    time.sleep(2)
+                    log(f"  ✅ 已导航到 {kb_name} 知识库")
+                    time.sleep(2)  # 额外等待文章列表渲染
                     return True
-                log(f"  等待页面加载... ({(wait+1)*2}秒)")
+                if wait < 7:
+                    log(f"    等待页面加载... ({(wait+1)*2.5}秒)")
 
-            log(f"⚠️  点击后窗口标题不包含 '{kb_name}'，标题: {title}")
-            return False
+            log(f"  ⚠️  点击后窗口标题不包含 '{kb_name}'，标题: '{title}'")
+        else:
+            log(f"  ⚠️  在侧边栏未找到知识库 '{kb_name}'")
+            # 尝试滚动侧边栏
+            log(f"  尝试滚动侧边栏...")
+            try:
+                # 按 PageDown 滚动
+                run_cua(["call", "key_press", json.dumps({
+                    "pid": pid,
+                    "window_id": window_id,
+                    "key": "PageDown"
+                })])
+                time.sleep(1)
+            except Exception as e:
+                log(f"    滚动失败: {e}")
 
-    log(f"⚠️  在侧边栏未找到知识库 '{kb_name}'")
+    log(f"❌ 导航到 '{kb_name}' 失败（已尝试 {max_attempts} 次）")
     return False
 
 
@@ -195,40 +247,27 @@ def ensure_ima_ready(kb_name: str, timeout: int = 60) -> bool:
     """
     确保 IMA 已就绪并位于目标知识库
 
-    先尝试自动导航，如果失败则等待
+    完全自动化：先检查，再尝试自动导航，失败则跳过
 
-    返回: True 表示就绪，False 表示超时
+    返回: True 表示就绪，False 表示失败
     """
     log(f"确保 IMA 位于 {kb_name} 知识库...")
 
     # 先检查是否已经在目标知识库
     title = get_kb_window_title(kb_name)
     if kb_name in title:
-        log(f"✅ 已确认在 {kb_name} 知识库")
+        log(f"✅ 已在 {kb_name} 知识库")
         return True
 
     # 尝试自动导航
     activate_ima()
-    time.sleep(1)
+    time.sleep(2)  # 增加等待时间，确保窗口完全激活
+
     if navigate_to_kb(kb_name):
         return True
 
-    # 自动导航失败，等待用户手动切换
-    log(f"⏳ 自动导航失败，等待手动切换...")
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        title = get_kb_window_title(kb_name)
-        if kb_name in title:
-            log(f"✅ 已确认在 {kb_name} 知识库")
-            return True
-        elapsed = int(time.time() - start_time)
-        if elapsed % 10 == 0 and elapsed > 0:
-            log(f"⏳ 等待切换到 {kb_name} 知识库... ({elapsed}/{timeout}秒)")
-        time.sleep(2)
-
-        time.sleep(2)
-
-    log(f"⚠️  等待超时，未能确认在 {kb_name} 知识库")
+    # 自动导航失败，直接跳过（不等待手动操作）
+    log(f"⚠️  自动导航失败，跳过 {kb_name} 知识库")
     return False
 
 
@@ -461,11 +500,11 @@ def main():
     log(f"模式: {'预览' if args.dry_run else '正式'}")
     log(f"保存到 Obsidian: {'否' if args.no_save else '是'}")
 
-    # 检查 cua-driver
-    if not args.dry_run and not is_daemon_running():
-        log("❌ cua-driver daemon 未运行")
-        log("   请先启动: cua-driver serve &")
-        sys.exit(1)
+    # 确保 cua-driver daemon 运行
+    if not args.dry_run:
+        if not ensure_daemon():
+            log("❌ 无法启动 cua-driver daemon")
+            sys.exit(1)
 
     log("✅ cua-driver daemon 运行中")
 

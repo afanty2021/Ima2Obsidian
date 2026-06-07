@@ -183,14 +183,17 @@ def activate_ima():
     time.sleep(1)
 
 
-def navigate_to_kb(kb_name: str, max_attempts: int = 3) -> bool:
+def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
     """
     通过 cua-driver 自动导航到指定知识库
 
-    在侧边栏找到知识库名称并点击切换，支持多次尝试和滚动查找
+    在侧边栏找到知识库名称并点击切换，支持多次尝试和滚动查找。
+    使用 scroll 工具定向滚动侧边栏区域。
 
     返回: True 表示成功导航
     """
+    import re
+
     window = get_ima_main_window()
     if not window:
         log("❌ 未找到 IMA 窗口，无法导航")
@@ -199,21 +202,42 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 3) -> bool:
     pid = window["pid"]
     window_id = window["window_id"]
 
-    # 多次尝试
+    # 先找到侧边栏滚动区域（AXScrollArea），用于定向滚动
+    sidebar_elem = None
+
     for attempt in range(1, max_attempts + 1):
         log(f"导航尝试 {attempt}/{max_attempts}...")
 
         # 获取窗口状态
-        import re
         state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
         state = json.loads(state_result)
         md = state.get("tree_markdown", "")
 
-        # 在侧边栏查找知识库名称的 element_index
+        # 首次尝试时定位侧边栏滚动区域
+        if sidebar_elem is None:
+            for line in md.split("\n"):
+                m = re.search(r'\[(\d+)\] AXScrollArea', line)
+                if m:
+                    sidebar_elem = int(m.group(1))
+                    break
+
+        # 在全文查找知识库名称的 element_index
+        # 匹配多种 AX 类型：AXStaticText, AXButton, AXLink 等
         elem_idx = None
         for line in md.split("\n"):
-            # 匹配 AXStaticText 且文本完全等于知识库名称
-            m = re.search(r'\[(\d+)\] AXStaticText = "' + re.escape(kb_name) + '"', line)
+            # 完全匹配
+            m = re.search(
+                r'\[(\d+)\] (?:AXStaticText|AXButton|AXLink|AXRow) = "' + re.escape(kb_name) + '"',
+                line
+            )
+            if m:
+                elem_idx = int(m.group(1))
+                break
+            # 包含匹配（知识库名可能带前缀/后缀）
+            m = re.search(
+                r'\[(\d+)\] (?:AXStaticText|AXButton|AXLink|AXRow) = ".*' + re.escape(kb_name) + r'.*"',
+                line
+            )
             if m:
                 elem_idx = int(m.group(1))
                 break
@@ -221,20 +245,18 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 3) -> bool:
         if elem_idx is not None:
             log(f"  找到知识库 '{kb_name}' (element {elem_idx})，点击...")
 
-            # 点击知识库名称
             click_result = run_cua(["call", "click", json.dumps({
                 "pid": pid,
                 "window_id": window_id,
                 "element_index": elem_idx
             })])
 
-            # 等待页面加载并验证
-            for wait in range(8):  # 增加到 8 次，每次 2.5 秒 = 最多 20 秒
+            for wait in range(8):
                 time.sleep(2.5)
                 title = get_kb_window_title(kb_name)
                 if kb_name in title:
                     log(f"  ✅ 已导航到 {kb_name} 知识库")
-                    time.sleep(2)  # 额外等待文章列表渲染
+                    time.sleep(2)
                     return True
                 if wait < 7:
                     log(f"    等待页面加载... ({(wait+1)*2.5}秒)")
@@ -242,16 +264,22 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 3) -> bool:
             log(f"  ⚠️  点击后窗口标题不包含 '{kb_name}'，标题: '{title}'")
         else:
             log(f"  ⚠️  在侧边栏未找到知识库 '{kb_name}'")
-            # 尝试滚动侧边栏
             log(f"  尝试滚动侧边栏...")
             try:
-                # 按 PageDown 滚动
-                run_cua(["call", "press_key", json.dumps({
+                # 使用 scroll 工具定向滚动侧边栏
+                scroll_params = {
                     "pid": pid,
-                    "window_id": window_id,
-                    "key": "pagedown"
-                })])
-                time.sleep(1)
+                    "direction": "down",
+                    "by": "page",
+                    "amount": 1
+                }
+                if sidebar_elem is not None:
+                    scroll_params["window_id"] = window_id
+                    scroll_params["element_index"] = sidebar_elem
+                else:
+                    scroll_params["window_id"] = window_id
+                run_cua(["call", "scroll", json.dumps(scroll_params)])
+                time.sleep(1.5)
             except Exception as e:
                 log(f"    滚动失败: {e}")
 

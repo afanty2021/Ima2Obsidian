@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/berton/Github/Ima2Obsidian/ima_incremental_update.py</string>
+        <string>/Users/berton/Github/Myself/Ima2Obsidian/ima_incremental_update.py</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -20,13 +20,13 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/berton/Github/Ima2Obsidian/incremental_update.log</string>
+    <string>/Users/berton/Github/Myself/Ima2Obsidian/incremental_update.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/berton/Github/Ima2Obsidian/incremental_update_error.log</string>
+    <string>/Users/berton/Github/Myself/Ima2Obsidian/incremental_update_error.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/berton/Github/Ima2Obsidian</string>
+    <string>/Users/berton/Github/Myself/Ima2Obsidian</string>
 
     <key>RunAtLoad</key>
     <false/>

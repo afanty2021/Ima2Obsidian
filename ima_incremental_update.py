@@ -13,7 +13,9 @@ IMA 增量更新脚本 — 每日自动提取新增文章并保存到 Obsidian
 """
 
 import argparse
+import fcntl
 import json
+import os
 import subprocess
 import sys
 import time
@@ -32,6 +34,8 @@ KNOWLEDGE_BASES = [
 ]
 
 LOG_FILE = Path(__file__).parent / "incremental_update.log"
+LOCK_FILE = Path(__file__).parent / "incremental_update.lock"
+LOG_MAX_BYTES = 2 * 1024 * 1024  # 日志文件最大 2MB
 
 # cua-driver 路径
 CUA_DRIVER = "/Users/berton/.local/bin/cua-driver"
@@ -41,6 +45,18 @@ WAIT_BETWEEN_KB = 5.0  # 知识库之间等待时间
 
 
 # ==================== 日志 ====================
+
+def rotate_log_if_needed():
+    """日志文件超过阈值时轮转，保留旧日志为 .1 后缀"""
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+            backup = LOG_FILE.with_suffix(".log.1")
+            if backup.exists():
+                backup.unlink()
+            LOG_FILE.rename(backup)
+    except OSError:
+        pass
+
 
 def log(message: str, print_too: bool = True):
     """写入日志文件"""
@@ -230,10 +246,10 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 3) -> bool:
             log(f"  尝试滚动侧边栏...")
             try:
                 # 按 PageDown 滚动
-                run_cua(["call", "key_press", json.dumps({
+                run_cua(["call", "press_key", json.dumps({
                     "pid": pid,
                     "window_id": window_id,
-                    "key": "PageDown"
+                    "key": "pagedown"
                 })])
                 time.sleep(1)
             except Exception as e:
@@ -463,6 +479,17 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
 # ==================== 主函数 ====================
 
 def main():
+    # 文件锁防止并发执行
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("⚠️  另一个增量更新实例正在运行，退出")
+        sys.exit(0)
+
+    # 日志轮转
+    rotate_log_if_needed()
+
     parser = argparse.ArgumentParser(
         description="IMA 增量更新脚本 — 每日自动提取新增文章并保存到 Obsidian"
     )

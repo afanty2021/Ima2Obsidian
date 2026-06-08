@@ -23,6 +23,9 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+# 导入公共模块
+from ima_common import get_ima_main_window, get_kb_window_title
+
 # ==================== 配置 ====================
 
 DB_FILE = Path(__file__).parent / "ima_articles.db"
@@ -51,11 +54,15 @@ def init_database():
             knowledge_base TEXT,
             extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             y_position INTEGER,
-            status TEXT DEFAULT 'success'
+            status TEXT DEFAULT 'success',
+            obsidian_saved INTEGER DEFAULT 0,
+            obsidian_saved_at TEXT,
+            published_date TEXT
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_url ON articles(url)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_kb ON articles(knowledge_base)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
     conn.commit()
     conn.close()
 
@@ -130,28 +137,6 @@ def is_daemon_running() -> bool:
         return result.returncode == 0
     except Exception:
         return False
-
-
-def get_ima_main_window() -> Optional[Dict]:
-    try:
-        output = run_cua(["list_windows"])
-        data = json.loads(output)
-    except Exception as e:
-        print(f"  ❌ list_windows 失败: {e}")
-        return None
-
-    windows = data.get("windows", [])
-    ima_windows = [
-        w for w in windows
-        if IMA_APP_NAME.lower() in w.get("app_name", "").lower()
-        and w.get("bounds", {}).get("height", 0) > 400
-    ]
-
-    if not ima_windows:
-        return None
-
-    # 选最大的窗口（主窗口）
-    return max(ima_windows, key=lambda w: w["bounds"].get("width", 0) * w["bounds"].get("height", 0))
 
 
 def get_window_state(pid: int, window_id: int) -> Optional[Dict]:
@@ -249,66 +234,16 @@ return ""
         return None
 
 
-def get_kb_window_title(kb_name: str = "") -> str:
-    """获取知识库窗口标题"""
-    if kb_name:
-        # 查找包含指定知识库名称的窗口
-        script = f'''
-tell application "System Events"
-    tell process "ima.copilot"
-        set wCount to count of windows
-        repeat with i from 1 to wCount
-            try
-                set wTitle to title of window i
-                if wTitle contains "{kb_name}" then
-                    return wTitle
-                end if
-            end try
-        end repeat
-    end tell
-end tell
-return ""
-'''
-    else:
-        # 查找任意包含 "AI" 或 "知识库" 的窗口（降级方案）
-        script = '''
-tell application "System Events"
-    tell process "ima.copilot"
-        set wCount to count of windows
-        repeat with i from 1 to wCount
-            try
-                set wTitle to title of window i
-                if wTitle contains "AI" or wTitle contains "知识库" then
-                    return wTitle
-                end if
-            end try
-        end repeat
-    end tell
-end tell
-return ""
-'''
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.stdout.strip()
-    except Exception:
-        return ""
-
 
 def cmd_w_close():
-    """Cmd+W 关闭当前文章标签页"""
+    """Cmd+W 关闭当前文章标签页（后台方式，不激活应用）"""
+    # 直接向 IMA 进程发送 keystroke，无需激活应用
     subprocess.run(
-        ["osascript", "-e", 'tell application "ima.copilot" to activate'],
+        ["osascript", "-e",
+         'tell application "System Events" to tell process "ima.copilot" to keystroke "w" using command down'],
         capture_output=True, timeout=5
     )
     time.sleep(0.3)
-    subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to keystroke "w" using command down'],
-        capture_output=True, timeout=5
-    )
 
 
 # ==================== 文章识别 ====================
@@ -347,27 +282,34 @@ def parse_articles_from_tree(state: Dict, kb_name: str = "") -> List[Dict]:
             indent = len(line) - len(line.lstrip())
             static_texts.append((i, elem_idx, text, indent))
 
-    # 检测知识库类型：查找第一个 "公众号" 标记的 indent
-    target_indent = None
+    # 检测知识库类型：查找 "公众号" 标记的 indent
+    # 容错：收集所有 "公众号" 的缩进，选择最常见的
+    indent_counts = {}
     for _, elem_idx, text, indent in static_texts:
         if text == "公众号":
-            target_indent = indent
-            break
+            indent_counts[indent] = indent_counts.get(indent, 0) + 1
 
-    if target_indent is None:
+    if not indent_counts:
         # 未找到 "公众号" 标记，返回空
         return []
+
+    # 选择最常见的缩进层级
+    target_indent = max(indent_counts.items(), key=lambda x: x[1])[0]
 
     # 遍历查找 "公众号" 标记，回溯找标题
     for j, (line_idx, elem_idx, text, indent) in enumerate(static_texts):
         if text != "公众号":
             continue
 
+        # 容错：允许缩进有少量差异（±2 空格）
+        if abs(indent - target_indent) > 2:
+            continue
+
         # 回溯找最近的 indent=target_indent 的 AXStaticText（文章标题）
         title_elem = None
         for k in range(j - 1, max(0, j - 5), -1):
             _, e_idx, t, ind = static_texts[k]
-            if ind == target_indent and t != "公众号" and len(t) > 10:
+            if abs(ind - target_indent) <= 2 and t != "公众号" and len(t) > 10:
                 # 排除已知的非标题文本
                 exclude_titles = {"皮皮鲁", kb_name} if kb_name else {"皮皮鲁"}
                 if t not in exclude_titles and not re.match(r'^\d{4}年', t):
@@ -468,6 +410,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             if not url:
                 print("    ⚠️  未提取到 URL")
                 total_failed += 1
+                consecutive_seen = 0  # 失败时重置计数器
                 cmd_w_close()
                 await asyncio.sleep(WAIT_AFTER_CLOSE)
                 continue

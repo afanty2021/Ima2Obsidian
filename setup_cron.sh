@@ -25,14 +25,16 @@ cp "$PLIST_FILE" "$LAUNCH_AGENT_PATH"
 
 # 加载 launchd 任务
 echo "加载定时任务..."
-launchctl unload "$LAUNCH_AGENT_PATH" 2>/dev/null || true
+if launchctl list | grep -q "com.ima2obsidian.update"; then
+    launchctl unload "$LAUNCH_AGENT_PATH" 2>/dev/null || true
+fi
 launchctl load "$LAUNCH_AGENT_PATH"
 
 echo ""
 echo "✅ 安装完成！"
 echo ""
 echo "定时任务配置:"
-echo "  - 运行时间: 每天 2:00"
+echo "  - 运行时间: 每天 11:45"
 echo "  - 日志文件: $SCRIPT_DIR/incremental_update.log"
 echo "  - 错误日志: $SCRIPT_DIR/incremental_update_error.log"
 echo ""

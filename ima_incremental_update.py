@@ -22,6 +22,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# 导入公共模块
+from ima_common import get_ima_main_window, get_kb_window_title
+
 # ==================== 配置 ====================
 
 # 要监控的知识库列表
@@ -62,7 +65,8 @@ def log(message: str, print_too: bool = True):
     """写入日志文件"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_line = f"[{timestamp}] {message}"
-    if print_too:
+    # 只在交互模式（TTY）下输出到 stdout，避免与 launchd 重定向重复
+    if print_too and sys.stdout.isatty():
         print(log_line)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(log_line + "\n")
@@ -121,26 +125,6 @@ def ensure_daemon() -> bool:
     return start_daemon()
 
 
-def get_ima_main_window():
-    try:
-        output = run_cua(["list_windows"])
-        data = json.loads(output)
-    except Exception as e:
-        log(f"list_windows 失败: {e}")
-        return None
-
-    windows = data.get("windows", [])
-    ima_windows = [
-        w for w in windows
-        if IMA_APP_NAME.lower() in w.get("app_name", "").lower()
-        and w.get("bounds", {}).get("height", 0) > 400
-    ]
-
-    if not ima_windows:
-        return None
-    return max(ima_windows, key=lambda w: w["bounds"].get("width", 0) * w["bounds"].get("height", 0))
-
-
 def is_ima_running() -> bool:
     """检查 IMA 是否正在运行"""
     try:
@@ -172,15 +156,13 @@ def launch_ima():
 
 
 def wake_screen():
-    """唤醒 macOS 屏幕（应对锁屏/睡眠状态）"""
+    """轻量唤醒屏幕（应对显示器休眠）"""
     try:
-        # 用 caffeinate 短暂唤醒显示器
         subprocess.run(
-            ["caffeinate", "-u", "-t", "2"],
+            ["caffeinate", "-u", "-t", "5"],
             capture_output=True, timeout=5
         )
         time.sleep(1)
-        # 模拟鼠标移动唤醒屏幕
         subprocess.run(
             ["osascript", "-e", 'tell application "System Events" to key code 123'],
             capture_output=True, timeout=5
@@ -355,34 +337,6 @@ def ensure_ima_ready(kb_name: str, timeout: int = 60) -> bool:
     # 自动导航失败，直接跳过（不等待手动操作）
     log(f"⚠️  自动导航失败，跳过 {kb_name} 知识库")
     return False
-
-
-def get_kb_window_title(kb_name: str) -> str:
-    """获取知识库窗口标题"""
-    script = f'''
-tell application "System Events"
-    tell process "ima.copilot"
-        set wCount to count of windows
-        repeat with i from 1 to wCount
-            try
-                set wTitle to title of window i
-                if wTitle contains "{kb_name}" then
-                    return wTitle
-                end if
-            end try
-        end repeat
-    end tell
-end tell
-return ""
-'''
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.stdout.strip()
-    except Exception:
-        return ""
 
 
 # ==================== Obsidian 保存器 ====================
@@ -630,12 +584,13 @@ def main():
             if not args.dry_run:
                 time.sleep(WAIT_BETWEEN_KB)
 
-    # 如果不是逐个保存，最后统一保存
-    if not args.no_save and len(kbs) > 1:
-        log(f"\n{'='*50}")
-        log(f"统一保存到 Obsidian...")
-        save_stats = save_to_obsidian(dry_run=args.dry_run)
-        total_saved += save_stats["saved"]
+    # 注释掉统一保存，避免重复处理已在上面逐个保存过的文章
+    # 如果需要统一保存，可以在不指定 --des 的情况下单独调用保存器
+    # if not args.no_save and len(kbs) > 1:
+    #     log(f"\n{'='*50}")
+    #     log(f"统一保存到 Obsidian...")
+    #     save_stats = save_to_obsidian(dry_run=args.dry_run)
+    #     total_saved += save_stats["saved"]
 
     # 总结
     log(f"\n{'='*60}")

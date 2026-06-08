@@ -38,9 +38,18 @@ from pathlib import Path
 
 import requests
 
-# 确保sys可用于isatty()检查
-if sys.stdin is None:
-    sys.stdin = open('/dev/null')
+# 确保stdin可用用于isatty()检查
+# CPython中sys.stdin不会是None，但可能在某些环境下被关闭
+# 使用try-except来安全地访问stdin
+try:
+    _test_stdin = sys.stdin
+    if _test_stdin is None:
+        sys.stdin = open('/dev/null')
+except (AttributeError, OSError):
+    try:
+        sys.stdin = open('/dev/null')
+    except OSError:
+        pass  # 在极端情况下，继续执行
 
 
 # ==================== 配置 ====================
@@ -75,38 +84,55 @@ DEFAULT_LIMIT = 1300
 # ==================== 日期提取 ====================
 
 def extract_publish_date(url: str) -> str:
-    """从微信文章页面提取发布日期，返回 YYMMDD 格式"""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-        resp = requests.get(url, headers=headers, timeout=15)
-        html = resp.text
+    """从微信文章页面提取发布日期，返回 YYMMDD 格式（带重试）"""
+    import time
 
-        # 方法1: create_time: JsDecode('YYYY-MM-DD HH:MM')
-        m = re.search(r"create_time:\s*JsDecode\('(\d{4}-\d{2}-\d{2})", html)
-        if m:
-            dt = datetime.strptime(m.group(1), "%Y-%m-%d")
-            return dt.strftime("%y%m%d")
+    # 指数退避重试：最多3次，超时依次为 15, 20, 25 秒
+    for attempt in range(3):
+        try:
+            timeout = 15 + attempt * 5  # 15, 20, 25 秒
+            headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            html = resp.text
 
-        # 方法2: ori_create_time / create_timestamp (Unix 时间戳)
-        m = re.search(r"(?:ori_create_time|create_timestamp):\s*'(\d{10})'", html)
-        if m:
-            dt = datetime.fromtimestamp(int(m.group(1)))
-            return dt.strftime("%y%m%d")
+            # 方法1: create_time: JsDecode('YYYY-MM-DD HH:MM')
+            m = re.search(r"create_time:\s*JsDecode\('(\d{4}-\d{2}-\d{2})", html)
+            if m:
+                dt = datetime.strptime(m.group(1), "%Y-%m-%d")
+                return dt.strftime("%y%m%d")
 
-        # 方法3: var createTime = 'YYYY-MM-DD HH:MM'
-        m = re.search(r"var\s+createTime\s*=\s*'(\d{4}-\d{2}-\d{2})", html)
-        if m:
-            dt = datetime.strptime(m.group(1), "%Y-%m-%d")
-            return dt.strftime("%y%m%d")
+            # 方法2: ori_create_time / create_timestamp (Unix 时间戳)
+            m = re.search(r"(?:ori_create_time|create_timestamp):\s*'(\d{10})'", html)
+            if m:
+                dt = datetime.fromtimestamp(int(m.group(1)))
+                return dt.strftime("%y%m%d")
 
-        # 方法4: publish_time (Unix 时间戳，在 URL 编码的 JSON 中)
-        m = re.search(r"publish_time%22%3A(\d{10})", html)
-        if m:
-            dt = datetime.fromtimestamp(int(m.group(1)))
-            return dt.strftime("%y%m%d")
+            # 方法3: var createTime = 'YYYY-MM-DD HH:MM'
+            m = re.search(r"var\s+createTime\s*=\s*'(\d{4}-\d{2}-\d{2})", html)
+            if m:
+                dt = datetime.strptime(m.group(1), "%Y-%m-%d")
+                return dt.strftime("%y%m%d")
 
-    except Exception as e:
-        print(f"    ⚠️  日期提取失败: {e}")
+            # 方法4: publish_time (Unix 时间戳，在 URL 编码的 JSON 中)
+            m = re.search(r"publish_time%22%3A(\d{10})", html)
+            if m:
+                dt = datetime.fromtimestamp(int(m.group(1)))
+                return dt.strftime("%y%m%d")
+
+            # 如果成功解析到日期，直接返回
+            break
+
+        except requests.RequestException as e:
+            print(f"    ⚠️  网络请求失败 (尝试 {attempt + 1}/3): {e}")
+            if attempt < 2:  # 前两次失败时重试
+                wait_time = 2 ** attempt  # 指数退避: 1, 2 秒
+                print(f"    等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            else:
+                print(f"    ⚠️  网络重试耗尽，使用当前日期")
+        except Exception as e:
+            print(f"    ⚠️  日期提取失败: {e}")
+            break
 
     # 降级: 使用当前日期
     return datetime.now().strftime("%y%m%d")
@@ -125,9 +151,29 @@ def sanitize_filename(title: str) -> str:
 
 # ==================== 数据库 ====================
 
-def ensure_schema():
+def init_database():
+    """初始化数据库，确保所有列和索引存在"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            title TEXT,
+            knowledge_base TEXT,
+            extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            y_position INTEGER,
+            status TEXT DEFAULT 'success',
+            obsidian_saved INTEGER DEFAULT 0,
+            obsidian_saved_at TEXT,
+            published_date TEXT
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_url ON articles(url)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_kb ON articles(knowledge_base)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
+
+    # 向后兼容：对已有数据库添加缺失的列
     for col, type_def in [
         ("obsidian_saved", "INTEGER DEFAULT 0"),
         ("obsidian_saved_at", "TEXT"),
@@ -136,10 +182,13 @@ def ensure_schema():
         try:
             c.execute(f"ALTER TABLE articles ADD COLUMN {col} {type_def}")
         except sqlite3.OperationalError:
-            pass
-    c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
+            pass  # 列已存在，忽略错误
     conn.commit()
     conn.close()
+
+def ensure_schema():
+    """向后兼容：确保数据库 schema 完整（已弃用，请用 init_database）"""
+
 
 
 def get_unsaved_articles(limit: int):
@@ -211,10 +260,18 @@ def close_tab(browser_app: str = None):
     """关闭浏览器标签页，优先使用后台方式"""
     if browser_app:
         # 尝试使用 AppleScript 后台关闭（不激活应用）
+        # 先检查标签数，避免单标签时关闭整个窗口
         script = f'''
 tell application "{browser_app}"
     if (count of windows) > 0 then
-        close active tab of window 1
+        set w to window 1
+        set tabCount to count of tabs of w
+        if tabCount > 1 then
+            close active tab of w
+        else
+            -- 只有一个标签页时，使用快捷键方式（可能关闭窗口）
+            keystroke "w" using command down
+        end if
     end if
 end tell
 '''
@@ -274,6 +331,7 @@ def find_and_rename_in_vault(
         final_target_path = None
 
     # 第一步：精确匹配 —— 文件名与标题匹配的最近创建文件
+    candidates = []
     for search_dir in search_dirs:
         if not search_dir.exists():
             continue
@@ -285,19 +343,32 @@ def find_and_rename_in_vault(
             except OSError:
                 continue
             stem = md_file.stem
-            if title in stem or stem in title:
-                if target_folder:
-                    # 移动到目标文件夹
-                    if md_file != final_target_path:
-                        md_file.rename(final_target_path)
-                        print(f"    移动: {stem[:40]}... → {target_folder}/{target_name[:50]}...")
-                else:
-                    # 只重命名
-                    new_path = md_file.parent / target_name
-                    if md_file != new_path:
-                        md_file.rename(new_path)
-                        print(f"    重命名: {stem[:40]}... → {target_name[:50]}...")
-                return True
+            # 更精确的匹配：要求标题完全包含在文件名中，或文件名完全包含在标题中
+            # 且要求文件名与标题有较大的重叠部分（避免短词误匹配）
+            if (title in stem or stem in title) and len(stem) > 10 and len(title) > 10:
+                # 额外检查：重叠字符数应该占较短字符串的 50% 以上
+                overlap_len = len(set(stem) & set(title))
+                min_len = min(len(stem), len(title))
+                if overlap_len >= min_len * 0.5:
+                    candidates.append((md_file, mtime))
+
+    # 按修改时间排序，取最近的
+    if candidates:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        md_file = candidates[0][0]
+        stem = md_file.stem
+        if target_folder:
+            # 移动到目标文件夹
+            if md_file != final_target_path:
+                md_file.rename(final_target_path)
+                print(f"    移动: {stem[:40]}... → {target_folder}/{target_name[:50]}...")
+        else:
+            # 只重命名
+            new_path = md_file.parent / target_name
+            if md_file != new_path:
+                md_file.rename(new_path)
+                print(f"    重命名: {stem[:40]}... → {target_name[:50]}...")
+        return True
 
     # 第二步：找新文件（不存在于保存前的快照中）
     existing_paths = {ef[0] for ef in existing_files}
@@ -430,7 +501,7 @@ def main():
     print("IMA 微信文章 → Obsidian 自动保存器")
     print("=" * 60)
 
-    ensure_schema()
+    init_database()
     stats = get_stats()
 
     print(f"\n数据库统计:")

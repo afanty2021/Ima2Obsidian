@@ -171,16 +171,37 @@ def launch_ima():
     return False
 
 
+def wake_screen():
+    """唤醒 macOS 屏幕（应对锁屏/睡眠状态）"""
+    try:
+        # 用 caffeinate 短暂唤醒显示器
+        subprocess.run(
+            ["caffeinate", "-u", "-t", "2"],
+            capture_output=True, timeout=5
+        )
+        time.sleep(1)
+        # 模拟鼠标移动唤醒屏幕
+        subprocess.run(
+            ["osascript", "-e", 'tell application "System Events" to key code 123'],
+            capture_output=True, timeout=5
+        )
+        time.sleep(1)
+    except Exception:
+        pass
+
+
 def activate_ima():
     """激活 IMA 应用，如果未运行则启动"""
     if not is_ima_running():
         launch_ima()
 
+    wake_screen()
+
     subprocess.run(
         ["osascript", "-e", 'tell application "ima.copilot" to activate'],
         capture_output=True, timeout=5
     )
-    time.sleep(1)
+    time.sleep(2)
 
 
 def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
@@ -208,10 +229,31 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
     for attempt in range(1, max_attempts + 1):
         log(f"导航尝试 {attempt}/{max_attempts}...")
 
+        # 激活窗口确保 AX Tree 完整
+        subprocess.run(
+            ["osascript", "-e", 'tell application "ima.copilot" to activate'],
+            capture_output=True, timeout=5
+        )
+        time.sleep(2)
+
         # 获取窗口状态
         state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
         state = json.loads(state_result)
         md = state.get("tree_markdown", "")
+
+        # 验证 AX Tree 是否包含窗口内容（未激活时只有菜单栏）
+        static_text_count = len(re.findall(r'AXStaticText', md))
+        if static_text_count < 5:
+            log(f"  ⚠️  AX Tree 不完整（仅 {static_text_count} 个元素），窗口可能未激活，等待重试...")
+            time.sleep(3)
+            # 再次获取
+            state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
+            state = json.loads(state_result)
+            md = state.get("tree_markdown", "")
+            static_text_count = len(re.findall(r'AXStaticText', md))
+            if static_text_count < 5:
+                log(f"  ⚠️  AX Tree 仍不完整（{static_text_count} 个元素），跳过本次尝试")
+                continue
 
         # 首次尝试时定位侧边栏滚动区域
         if sidebar_elem is None:

@@ -41,6 +41,60 @@ MAX_PAGES = 65
 MAX_CONSECUTIVE_SEEN = 10 # 连续遇到已存在文章后停止
 
 
+# ==================== URL 规范化 ====================
+
+def normalize_url(url: str) -> str:
+    """
+    规范化 URL，去除不影响文章内容的动态参数
+
+    主要处理平台：
+    - 微信公众号：去除 ? 后的参数（如 scene, from 等）
+    - 知乎：去除动态参数
+    - 通用：保留核心 URL，去除追踪参数
+
+    Args:
+        url: 原始 URL
+
+    Returns:
+        规范化后的 URL
+    """
+    if not url:
+        return url
+
+    # 微信公众号文章：https://mp.weixin.qq.com/s/xxx
+    if 'mp.weixin.qq.com/s/' in url:
+        # 去除查询参数，保留文章 ID
+        base_url = url.split('?')[0]
+        return base_url
+
+    # 知乎：去除常见动态参数
+    if 'zhihu.com' in url:
+        # 保留核心路径，去除 ? 后的参数
+        base_url = url.split('?')[0]
+        return base_url
+
+    # 其他平台：通用处理
+    # 去除常见追踪参数（utm_*, ref, source 等）
+    if '?' in url:
+        base, params = url.split('?', 1)
+        param_list = params.split('&')
+        # 保留重要参数
+        important_params = []
+        for param in param_list:
+            # 排除常见追踪参数
+            if not any(param.startswith(prefix) for prefix in [
+                'utm_', 'ref', 'source', 'from', 'scene',
+                '_t', 'timestamp', 'share', 'clicktime'
+            ]):
+                important_params.append(param)
+
+        if important_params:
+            return f"{base}?{'&'.join(important_params)}"
+        return base
+
+    return url
+
+
 # ==================== 数据库 ====================
 
 def init_database():
@@ -68,9 +122,11 @@ def init_database():
 
 
 def url_exists(url: str) -> bool:
+    # 使用规范化后的 URL 进行去重检查
+    normalized_url = normalize_url(url)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT 1 FROM articles WHERE url = ? LIMIT 1", (url,))
+    c.execute("SELECT 1 FROM articles WHERE url = ? LIMIT 1", (normalized_url,))
     exists = c.fetchone() is not None
     conn.close()
     return exists
@@ -78,12 +134,14 @@ def url_exists(url: str) -> bool:
 
 def save_article(url: str, title: str, kb: str) -> bool:
     try:
+        # 使用规范化后的 URL 进行保存
+        normalized_url = normalize_url(url)
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("""
             INSERT OR IGNORE INTO articles (url, title, knowledge_base, status)
             VALUES (?, ?, ?, 'success')
-        """, (url, title, kb))
+        """, (normalized_url, title, kb))
         conn.commit()
         conn.close()
         return True

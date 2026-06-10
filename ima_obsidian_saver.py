@@ -256,8 +256,16 @@ def send_keystroke(key: str, modifiers: list = None):
     )
 
 
-def close_tab(browser_app: str = None):
-    """关闭浏览器标签页，优先使用后台方式"""
+def close_tab(browser_app: str = None, retry_count: int = 0):
+    """
+    关闭浏览器标签页，优先使用后台方式
+
+    Args:
+        browser_app: 浏览器应用名称（如 "Chrome", "Safari"）
+        retry_count: 重试次数（内部使用）
+    """
+    max_retries = 2
+
     if browser_app:
         # 尝试使用 AppleScript 后台关闭（不激活应用）
         # 先检查标签数，避免单标签时关闭整个窗口
@@ -268,11 +276,14 @@ tell application "{browser_app}"
         set tabCount to count of tabs of w
         if tabCount > 1 then
             close active tab of w
+            return "closed"
         else
             -- 只有一个标签页时，使用快捷键方式（可能关闭窗口）
             keystroke "w" using command down
+            return "closed_with_keystroke"
         end if
     end if
+    return "no_window"
 end tell
 '''
         try:
@@ -280,13 +291,33 @@ end tell
                 ["osascript", "-e", script],
                 capture_output=True, text=True, timeout=5
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and "closed" in result.stdout.lower():
+                print(f"    ✓ 标签页已关闭（AppleScript）")
                 return  # 成功后台关闭
-        except Exception:
-            pass  # 降级到快捷键方式
+            else:
+                print(f"    ⚠️ AppleScript 关闭失败: {result.stderr or result.stdout}")
+        except subprocess.TimeoutExpired:
+            print(f"    ⚠️ AppleScript 执行超时")
+        except Exception as e:
+            print(f"    ⚠️ AppleScript 异常: {e}")
 
     # 降级方案：使用快捷键（需要浏览器在前台）
-    send_keystroke("w", ["command"])
+    print(f"    → 尝试快捷键关闭...")
+    try:
+        send_keystroke("w", ["command"])
+        print(f"    ✓ 标签页已关闭（快捷键）")
+        time.sleep(0.5)  # 等待关闭生效
+    except Exception as e:
+        print(f"    ❌ 快捷键关闭失败: {e}")
+
+        # 重试机制
+        if retry_count < max_retries:
+            print(f"    → 重试关闭 ({retry_count + 1}/{max_retries})...")
+            time.sleep(1)
+            close_tab(browser_app, retry_count + 1)
+        else:
+            print(f"    ⚠️ 警告：标签页可能未关闭，请手动检查 {browser_app or '浏览器'}")
+            print(f"    💡 建议：定期清理浏览器标签页以避免内存占用过高")
 
 
 def trigger_quick_clip(mods: list):

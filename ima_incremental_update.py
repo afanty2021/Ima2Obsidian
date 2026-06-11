@@ -352,6 +352,7 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
 
     cmd = [
         "python3",
+        "-u",  # 禁用输出缓冲，实时查看保存进度
         Path(__file__).parent / "ima_obsidian_saver.py",
         "--limit", "1000",  # 每次最多保存 1000 篇
     ]
@@ -448,6 +449,7 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
     # 调用提取器脚本
     cmd = [
         "python3",
+        "-u",  # 禁用输出缓冲，实时查看提取进度
         Path(__file__).parent / "ima_ax_extractor.py",
         "--src", kb_name
     ]

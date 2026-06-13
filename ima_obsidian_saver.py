@@ -267,8 +267,8 @@ def close_tab(browser_app: str = None, retry_count: int = 0):
     max_retries = 2
 
     if browser_app:
-        # 尝试使用 AppleScript 后台关闭（不激活应用）
-        # 先检查标签数，避免单标签时关闭整个窗口
+        # AppleScript 后台关闭，不激活 Chrome
+        # NOTE: AppleScript 字符串中不能有非ASCII注释，会导致 osascript 语法错误
         script = f'''
 tell application "{browser_app}"
     if (count of windows) > 0 then
@@ -278,9 +278,7 @@ tell application "{browser_app}"
             close active tab of w
             return "closed"
         else
-            -- 只有一个标签页时，使用快捷键方式（可能关闭窗口）
-            keystroke "w" using command down
-            return "closed_with_keystroke"
+            return "single_tab"
         end if
     end if
     return "no_window"
@@ -291,9 +289,19 @@ end tell
                 ["osascript", "-e", script],
                 capture_output=True, text=True, timeout=5
             )
-            if result.returncode == 0 and "closed" in result.stdout.lower():
-                print(f"    ✓ 标签页已关闭（AppleScript）")
-                return  # 成功后台关闭
+            if result.returncode == 0:
+                stdout = result.stdout.strip().lower()
+                if "closed" in stdout or "single_tab" in stdout:
+                    if "single_tab" in stdout:
+                        # 只有一个标签，用 keystroke 关闭（发到特定进程而非全局）
+                        subprocess.run(
+                            ["osascript", "-e",
+                             f'tell application "System Events" to tell process "{browser_app}" to keystroke "w" using command down'],
+                            capture_output=True, timeout=5
+                        )
+                        time.sleep(0.3)
+                    print(f"    ✓ 标签页已关闭（AppleScript）")
+                    return
             else:
                 print(f"    ⚠️ AppleScript 关闭失败: {result.stderr or result.stdout}")
         except subprocess.TimeoutExpired:
@@ -301,23 +309,28 @@ end tell
         except Exception as e:
             print(f"    ⚠️ AppleScript 异常: {e}")
 
-    # 降级方案：使用快捷键（需要浏览器在前台）
+    # 降级方案：快捷键发到特定浏览器进程（而非全局）
     print(f"    → 尝试快捷键关闭...")
     try:
-        send_keystroke("w", ["command"])
+        if browser_app:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'tell application "System Events" to tell process "{browser_app}" to keystroke "w" using command down'],
+                capture_output=True, timeout=5
+            )
+        else:
+            send_keystroke("w", ["command"])
         print(f"    ✓ 标签页已关闭（快捷键）")
-        time.sleep(0.5)  # 等待关闭生效
+        time.sleep(0.5)
     except Exception as e:
         print(f"    ❌ 快捷键关闭失败: {e}")
 
-        # 重试机制
         if retry_count < max_retries:
             print(f"    → 重试关闭 ({retry_count + 1}/{max_retries})...")
             time.sleep(1)
             close_tab(browser_app, retry_count + 1)
         else:
             print(f"    ⚠️ 警告：标签页可能未关闭，请手动检查 {browser_app or '浏览器'}")
-            print(f"    💡 建议：定期清理浏览器标签页以避免内存占用过高")
 
 
 def trigger_quick_clip(mods: list):

@@ -48,9 +48,10 @@ def normalize_url(url: str) -> str:
     规范化 URL，去除不影响文章内容的动态参数
 
     主要处理平台：
-    - 微信公众号：去除 ? 后的参数（如 scene, from 等）
+    - 微信公众号短格式 (/s/ARTICLE_ID)：去除全部 ? 参数
+    - 微信公众号长格式 (/s?__biz=...)：保留 __biz, mid, idx, sn，去除追踪参数
     - 知乎：去除动态参数
-    - 通用：保留核心 URL，去除追踪参数
+    - 通用：去除追踪参数（utm_*, scene, from 等）
 
     Args:
         url: 原始 URL
@@ -61,27 +62,35 @@ def normalize_url(url: str) -> str:
     if not url:
         return url
 
-    # 微信公众号文章：https://mp.weixin.qq.com/s/xxx
-    if 'mp.weixin.qq.com/s/' in url:
-        # 去除查询参数，保留文章 ID
-        base_url = url.split('?')[0]
-        return base_url
+    if 'mp.weixin.qq.com' in url:
+        # 短格式: /s/ARTICLE_ID — 去除所有查询参数
+        if '/s/' in url:
+            return url.split('?')[0]
+
+        # 长格式: /s?__biz=...&mid=...&idx=...&sn=...&chksm=...&scene=...
+        if '?' in url:
+            base, params = url.split('?', 1)
+            param_list = params.split('&')
+            # 保留核心文章标识参数，去除追踪/分享参数
+            core_params = []
+            for param in param_list:
+                key = param.split('=')[0]
+                if key in ('__biz', 'mid', 'idx', 'sn'):
+                    core_params.append(param)
+            if core_params:
+                return f"{base}?{'&'.join(core_params)}"
+            return base
 
     # 知乎：去除常见动态参数
     if 'zhihu.com' in url:
-        # 保留核心路径，去除 ? 后的参数
-        base_url = url.split('?')[0]
-        return base_url
+        return url.split('?')[0]
 
-    # 其他平台：通用处理
-    # 去除常见追踪参数（utm_*, ref, source 等）
+    # 其他平台：去除常见追踪参数
     if '?' in url:
         base, params = url.split('?', 1)
         param_list = params.split('&')
-        # 保留重要参数
         important_params = []
         for param in param_list:
-            # 排除常见追踪参数
             if not any(param.startswith(prefix) for prefix in [
                 'utm_', 'ref', 'source', 'from', 'scene',
                 '_t', 'timestamp', 'share', 'clicktime'

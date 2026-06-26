@@ -31,3 +31,9 @@ Thumbs.db
 # Logs
 *.log
 incremental_update*.log
+
+# Runtime lock files
+incremental_update.lock
+
+# Claude Code memory
+MEMORY/

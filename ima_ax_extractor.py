@@ -270,19 +270,19 @@ return ""
 
 
 def extract_title_ax() -> Optional[str]:
-    """从窗口标题提取文章标题"""
+    """从文章窗口标题提取标题（仅对含 http AXDocument 的窗口，避免误取列表窗口标题）"""
     script = '''
 tell application "System Events"
     tell process "ima.copilot"
         set wCount to count of windows
         repeat with i from 1 to wCount
             try
-                set wTitle to title of window i
-                if wTitle is not "" and wTitle does not contain "ima.copilot" then
-                    return wTitle
-                end if
-                if wTitle contains "AI" then
-                    return ""
+                set docUrl to value of attribute "AXDocument" of window i
+                if docUrl is not missing value and docUrl starts with "http" then
+                    set wTitle to title of window i
+                    if wTitle is not "" and wTitle does not contain "ima.copilot" then
+                        return wTitle
+                    end if
                 end if
             end try
         end repeat
@@ -342,7 +342,7 @@ def parse_articles_from_tree(state: Dict, kb_name: str = "") -> List[Dict]:
     # 找所有 AXStaticText 及其索引和文本
     static_texts = []  # (line_idx, element_index, text, indent)
     for i, line in enumerate(lines):
-        m = re.search(r'\[(\d+)\] AXStaticText = "(.+?)"', line)
+        m = re.search(r'\[(\d+)\] AXStaticText = "(.+)"', line)
         if m:
             elem_idx = int(m.group(1))
             text = m.group(2)
@@ -374,7 +374,7 @@ def parse_articles_from_tree(state: Dict, kb_name: str = "") -> List[Dict]:
 
         # 回溯找最近的 indent=target_indent 的 AXStaticText（文章标题）
         title_elem = None
-        for k in range(j - 1, max(0, j - 5), -1):
+        for k in range(j - 1, max(-1, j - 6), -1):
             _, e_idx, t, ind = static_texts[k]
             if abs(ind - target_indent) <= 2 and t != "公众号" and len(t) > 10:
                 # 排除已知的非标题文本
@@ -445,8 +445,13 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             elem_idx = article["element_index"]
             title = article["title"]
 
-            # 去重
+            # 去重：本次运行内已处理过的标题直接跳过
             if title in processed_titles:
+                consecutive_seen += 1
+                if consecutive_seen >= MAX_CONSECUTIVE_SEEN:
+                    print(f"\n  ⚠️  连续 {consecutive_seen} 篇已处理，可能已全部提取")
+                    should_stop = True
+                    break
                 continue
             processed_titles.add(title)
 

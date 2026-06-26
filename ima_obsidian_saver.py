@@ -191,18 +191,31 @@ def ensure_schema():
 
 
 
-def get_unsaved_articles(limit: int):
+def get_unsaved_articles(limit: int, kb: str = None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("""
-        SELECT id, url, title, knowledge_base
-        FROM articles
-        WHERE (obsidian_saved = 0 OR obsidian_saved IS NULL)
-          AND status = 'success'
-          AND url LIKE '%mp.weixin.qq.com%'
-        ORDER BY id ASC
-        LIMIT ?
-    """, (limit,))
+    if kb:
+        # 按知识库过滤，避免把其他 KB 的文章存进 --des 指定的文件夹
+        c.execute("""
+            SELECT id, url, title, knowledge_base
+            FROM articles
+            WHERE (obsidian_saved = 0 OR obsidian_saved IS NULL)
+              AND status = 'success'
+              AND url LIKE '%mp.weixin.qq.com%'
+              AND knowledge_base = ?
+            ORDER BY id ASC
+            LIMIT ?
+        """, (kb, limit))
+    else:
+        c.execute("""
+            SELECT id, url, title, knowledge_base
+            FROM articles
+            WHERE (obsidian_saved = 0 OR obsidian_saved IS NULL)
+              AND status = 'success'
+              AND url LIKE '%mp.weixin.qq.com%'
+            ORDER BY id ASC
+            LIMIT ?
+        """, (limit,))
     rows = c.fetchall()
     conn.close()
     return [{"id": r[0], "url": r[1], "title": r[2], "kb": r[3]} for r in rows]
@@ -519,7 +532,8 @@ def save_one_article(
     close_tab(browser_app)
     time.sleep(WAIT_CLOSE_TAB)
 
-    return True
+    # 仅当文件确实已保存并改名/移动时才算成功，否则不标记为已保存以便下次重试
+    return renamed
 
 
 # ==================== 主函数 ====================
@@ -536,6 +550,8 @@ def main():
                         help="保存模式: quick=快速保存, clipper=弹窗确认")
     parser.add_argument("--des", default=None,
                         help="Obsidian 目标文件夹名称（如 AI），文件将保存到该文件夹")
+    parser.add_argument("--kb", default=None,
+                        help="只保存指定知识库的文章（避免不同 KB 混入同一文件夹）")
     args = parser.parse_args()
 
     browser_config = BROWSERS[args.browser]
@@ -566,7 +582,7 @@ def main():
         print("\n✅ 没有待保存的文章")
         return
 
-    articles = get_unsaved_articles(args.limit)
+    articles = get_unsaved_articles(args.limit, args.kb)
     print(f"\n本次处理: {len(articles)} 篇\n")
 
     if not args.dry_run:

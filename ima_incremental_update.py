@@ -104,13 +104,17 @@ def start_daemon() -> bool:
             stderr=subprocess.DEVNULL,
             start_new_session=True
         )
-        # 等待 daemon 启动
+        # 等待 daemon 启动：进程存在后，再做一次握手确认 IPC socket 就绪
         for i in range(10):
             time.sleep(1)
             if is_daemon_running():
-                log("✅ cua-driver daemon 已启动")
-                time.sleep(2)  # 额外等待初始化
-                return True
+                try:
+                    run_cua(["list_windows"], timeout=10)
+                    log("✅ cua-driver daemon 已就绪")
+                    return True
+                except RuntimeError:
+                    log(f"  daemon 进程已存在，等待 IPC socket 就绪...")
+                    continue
         log("⚠️  cua-driver daemon 启动超时")
         return False
     except Exception as e:
@@ -290,18 +294,15 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
             log(f"  ⚠️  在侧边栏未找到知识库 '{kb_name}'")
             log(f"  尝试滚动侧边栏...")
             try:
-                # 使用 scroll 工具定向滚动侧边栏
+                # 使用 scroll 工具定向滚动侧边栏（参数形状与提取器 scroll_down 一致）
                 scroll_params = {
                     "pid": pid,
+                    "window_id": window_id,
                     "direction": "down",
-                    "by": "page",
-                    "amount": 1
+                    "amount": 3
                 }
                 if sidebar_elem is not None:
-                    scroll_params["window_id"] = window_id
                     scroll_params["element_index"] = sidebar_elem
-                else:
-                    scroll_params["window_id"] = window_id
                 run_cua(["call", "scroll", json.dumps(scroll_params)])
                 time.sleep(1.5)
             except Exception as e:
@@ -357,9 +358,9 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
         "--limit", "1000",  # 每次最多保存 1000 篇
     ]
 
-    # 指定目标文件夹
+    # 指定知识库：只保存该 KB 的文章，并存入对应文件夹（避免不同 KB 混入同一文件夹）
     if kb_name:
-        cmd.extend(["--des", kb_name])
+        cmd.extend(["--kb", kb_name, "--des", kb_name])
 
     if dry_run:
         cmd.append("--dry-run")

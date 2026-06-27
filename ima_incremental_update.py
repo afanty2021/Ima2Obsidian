@@ -23,7 +23,10 @@ from datetime import datetime
 from pathlib import Path
 
 # 导入公共模块
-from ima_common import get_ima_main_window, get_kb_window_title
+from ima_common import (
+    CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running,
+    get_ima_main_window, get_kb_window_title,
+)
 
 # ==================== 配置 ====================
 
@@ -39,10 +42,6 @@ KNOWLEDGE_BASES = [
 LOG_FILE = Path(__file__).parent / "incremental_update.log"
 LOCK_FILE = Path(__file__).parent / "incremental_update.lock"
 LOG_MAX_BYTES = 2 * 1024 * 1024  # 日志文件最大 2MB
-
-# cua-driver 路径
-CUA_DRIVER = "/Users/berton/.local/bin/cua-driver"
-IMA_APP_NAME = "ima.copilot"
 
 WAIT_BETWEEN_KB = 5.0  # 知识库之间等待时间
 
@@ -73,25 +72,6 @@ def log(message: str, print_too: bool = True):
 
 
 # ==================== cua-driver ====================
-
-def run_cua(args: list, timeout: int = 30) -> str:
-    cmd = [CUA_DRIVER] + args
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(f"cua-driver failed: {result.stderr.strip()}")
-    return result.stdout
-
-
-def is_daemon_running() -> bool:
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cua-driver serve"],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
 
 def start_daemon() -> bool:
     """启动 cua-driver daemon"""
@@ -586,14 +566,6 @@ def main():
             log(f"等待 {WAIT_BETWEEN_KB} 秒后处理下一个知识库...")
             if not args.dry_run:
                 time.sleep(WAIT_BETWEEN_KB)
-
-    # 注释掉统一保存，避免重复处理已在上面逐个保存过的文章
-    # 如果需要统一保存，可以在不指定 --des 的情况下单独调用保存器
-    # if not args.no_save and len(kbs) > 1:
-    #     log(f"\n{'='*50}")
-    #     log(f"统一保存到 Obsidian...")
-    #     save_stats = save_to_obsidian(dry_run=args.dry_run)
-    #     total_saved += save_stats["saved"]
 
     # 总结
     log(f"\n{'='*60}")

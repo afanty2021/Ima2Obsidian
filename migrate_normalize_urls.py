@@ -81,6 +81,11 @@ def migrate_urls():
                 WHERE id = ?
             """, (m['new_url'], m['id']))
             success_count += 1
+        except sqlite3.IntegrityError:
+            # 规范化后与其他记录 URL 相同，说明是重复文章，删除该重复行完成去重
+            c.execute("DELETE FROM articles WHERE id = ?", (m['id'],))
+            print(f"   ℹ️  ID {m['id']} 规范化后与其他记录重复，已删除重复行")
+            error_count += 1
         except Exception as e:
             print(f"   ❌ 迁移失败 ID {m['id']}: {e}")
             error_count += 1

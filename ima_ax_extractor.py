@@ -24,13 +24,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 # 导入公共模块
-from ima_common import get_ima_main_window, get_kb_window_title
+from ima_common import (
+    DB_FILE, CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running, init_database,
+    get_ima_main_window, get_kb_window_title,
+)
 
 # ==================== 配置 ====================
-
-DB_FILE = Path(__file__).parent / "ima_articles.db"
-CUA_DRIVER = "/Users/berton/.local/bin/cua-driver"
-IMA_APP_NAME = "ima.copilot"
 
 WAIT_CLICK_LOAD = 3.0
 WAIT_AFTER_CLOSE = 1.5
@@ -106,30 +105,6 @@ def normalize_url(url: str) -> str:
 
 # ==================== 数据库 ====================
 
-def init_database():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE NOT NULL,
-            title TEXT,
-            knowledge_base TEXT,
-            extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            y_position INTEGER,
-            status TEXT DEFAULT 'success',
-            obsidian_saved INTEGER DEFAULT 0,
-            obsidian_saved_at TEXT,
-            published_date TEXT
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_url ON articles(url)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_kb ON articles(knowledge_base)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
-    conn.commit()
-    conn.close()
-
-
 def url_exists(url: str) -> bool:
     # 使用规范化后的 URL 进行去重检查
     normalized_url = normalize_url(url)
@@ -172,14 +147,6 @@ def get_stats() -> Dict:
 
 # ==================== cua-driver ====================
 
-def run_cua(args: List[str], timeout: int = 30) -> str:
-    cmd = [CUA_DRIVER] + args
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(f"cua-driver failed: {result.stderr.strip() or f'exit {result.returncode}'}")
-    return result.stdout
-
-
 def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
     """调用 cua-driver tool。click 等命令返回纯文本而非 JSON，统一处理。"""
     try:
@@ -193,17 +160,6 @@ def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
     except RuntimeError as e:
         print(f"  ⚠️  cua-driver call {tool} 失败: {e}")
     return None
-
-
-def is_daemon_running() -> bool:
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "cua-driver serve"],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
 
 
 def get_window_state(pid: int, window_id: int) -> Optional[Dict]:

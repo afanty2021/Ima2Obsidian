@@ -6,6 +6,7 @@ IMA 公共模块 — 共享函数和工具
 """
 
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from pathlib import Path
 
 CUA_DRIVER = "/Users/berton/.local/bin/cua-driver"
 IMA_APP_NAME = "ima.copilot"
+DB_FILE = Path(__file__).parent / "ima_articles.db"
 
 
 # ==================== cua-driver ====================
@@ -24,6 +26,53 @@ def run_cua(args, timeout: int = 30) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"cua-driver failed: {result.stderr.strip() or f'exit {result.returncode}'}")
     return result.stdout
+
+
+def is_daemon_running() -> bool:
+    """检查 cua-driver daemon 是否在运行"""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "cua-driver serve"],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def init_database():
+    """初始化数据库：建表、索引，并对旧库补齐缺失列（向后兼容）"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            title TEXT,
+            knowledge_base TEXT,
+            extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            y_position INTEGER,
+            status TEXT DEFAULT 'success',
+            obsidian_saved INTEGER DEFAULT 0,
+            obsidian_saved_at TEXT,
+            published_date TEXT
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_url ON articles(url)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_kb ON articles(knowledge_base)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
+    # 向后兼容：对已有数据库添加缺失的列
+    for col, type_def in [
+        ("obsidian_saved", "INTEGER DEFAULT 0"),
+        ("obsidian_saved_at", "TEXT"),
+        ("published_date", "TEXT"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE articles ADD COLUMN {col} {type_def}")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+    conn.commit()
+    conn.close()
 
 
 def get_ima_main_window():

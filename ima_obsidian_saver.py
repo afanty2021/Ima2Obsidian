@@ -38,23 +38,11 @@ from pathlib import Path
 
 import requests
 
-# 确保stdin可用用于isatty()检查
-# CPython中sys.stdin不会是None，但可能在某些环境下被关闭
-# 使用try-except来安全地访问stdin
-try:
-    _test_stdin = sys.stdin
-    if _test_stdin is None:
-        sys.stdin = open('/dev/null')
-except (AttributeError, OSError):
-    try:
-        sys.stdin = open('/dev/null')
-    except OSError:
-        pass  # 在极端情况下，继续执行
+from ima_common import DB_FILE, init_database
 
 
 # ==================== 配置 ====================
 
-DB_FILE = Path(__file__).parent / "ima_articles.db"
 VAULT_DIR = Path("/Users/berton/Documents/Obsidian Vault")
 CLIPPINGS_DIR = VAULT_DIR / "Clippings"
 
@@ -119,7 +107,8 @@ def extract_publish_date(url: str) -> str:
                 dt = datetime.fromtimestamp(int(m.group(1)))
                 return dt.strftime("%y%m%d")
 
-            # 如果成功解析到日期，直接返回
+            # 四种正则均未匹配（页面结构变更或非标准文章），不再重试，降级为当前日期
+            print(f"    ⚠️  未匹配到发布日期正则（页面结构可能变更），将降级使用当前日期")
             break
 
         except requests.RequestException as e:
@@ -138,6 +127,18 @@ def extract_publish_date(url: str) -> str:
     return datetime.now().strftime("%y%m%d")
 
 
+def extract_date_from_content(text: str) -> str:
+    """从 Web Clipper 保存的文章正文提取发布日期（如 *2026年6月25日 10:00*），返回 YYMMDD 或空串"""
+    m = re.search(r'\*(\d{4})年(\d{1,2})月(\d{1,2})日', text)
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return dt.strftime("%y%m%d")
+        except ValueError:
+            pass
+    return ""
+
+
 def sanitize_filename(title: str) -> str:
     """清理文件名中的非法字符"""
     # 移除或替换不适合文件名的字符
@@ -150,46 +151,6 @@ def sanitize_filename(title: str) -> str:
 
 
 # ==================== 数据库 ====================
-
-def init_database():
-    """初始化数据库，确保所有列和索引存在"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE NOT NULL,
-            title TEXT,
-            knowledge_base TEXT,
-            extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            y_position INTEGER,
-            status TEXT DEFAULT 'success',
-            obsidian_saved INTEGER DEFAULT 0,
-            obsidian_saved_at TEXT,
-            published_date TEXT
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_url ON articles(url)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_kb ON articles(knowledge_base)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
-
-    # 向后兼容：对已有数据库添加缺失的列
-    for col, type_def in [
-        ("obsidian_saved", "INTEGER DEFAULT 0"),
-        ("obsidian_saved_at", "TEXT"),
-        ("published_date", "TEXT"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE articles ADD COLUMN {col} {type_def}")
-        except sqlite3.OperationalError:
-            pass  # 列已存在，忽略错误
-    conn.commit()
-    conn.close()
-
-def ensure_schema():
-    """向后兼容：确保数据库 schema 完整（已弃用，请用 init_database）"""
-
-
 
 def get_unsaved_articles(limit: int, kb: str = None):
     conn = sqlite3.connect(DB_FILE)
@@ -232,12 +193,18 @@ def mark_saved(article_id: int, published_date: str = None):
     conn.close()
 
 
-def get_stats():
+def get_stats(kb: str = None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM articles WHERE status = 'success' AND url LIKE '%mp.weixin.qq.com%'")
+    where = "WHERE status = 'success' AND url LIKE '%mp.weixin.qq.com%'"
+    params = []
+    if kb:
+        where += " AND knowledge_base = ?"
+        params.append(kb)
+    c.execute(f"SELECT COUNT(*) FROM articles {where}", params)
     total = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM articles WHERE obsidian_saved = 1")
+    # saved 与 total 同口径（都过滤 status+url，可选 kb），避免脏数据下 saved>total 误判 unsaved=0
+    c.execute(f"SELECT COUNT(*) FROM articles {where} AND obsidian_saved = 1", params)
     saved = c.fetchone()[0]
     conn.close()
     return {"total": total, "saved": saved, "unsaved": max(0, total - saved)}
@@ -306,13 +273,9 @@ end tell
                 stdout = result.stdout.strip().lower()
                 if "closed" in stdout or "single_tab" in stdout:
                     if "single_tab" in stdout:
-                        # 只有一个标签，用 keystroke 关闭（发到特定进程而非全局）
-                        subprocess.run(
-                            ["osascript", "-e",
-                             f'tell application "System Events" to tell process "{browser_app}" to keystroke "w" using command down'],
-                            capture_output=True, timeout=5
-                        )
-                        time.sleep(0.3)
+                        # 仅剩单个标签：Cmd+W 会关闭整个浏览器窗口（含用户其他标签），保留不动
+                        print(f"    ℹ️  浏览器仅剩单标签，保留以避免关闭整个窗口")
+                        return
                     print(f"    ✓ 标签页已关闭（AppleScript）")
                     return
             else:
@@ -326,11 +289,13 @@ end tell
     print(f"    → 尝试快捷键关闭...")
     try:
         if browser_app:
-            subprocess.run(
+            r = subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to tell process "{browser_app}" to keystroke "w" using command down'],
                 capture_output=True, timeout=5
             )
+            if r.returncode != 0:
+                raise RuntimeError(f"osascript 退出码 {r.returncode}")
         else:
             send_keystroke("w", ["command"])
         print(f"    ✓ 标签页已关闭（快捷键）")
@@ -387,73 +352,75 @@ def find_and_rename_in_vault(
         # 不移动，只重命名
         final_target_path = None
 
-    # 第一步：精确匹配 —— 文件名与标题匹配的最近创建文件
-    candidates = []
+    # 一次性扫描所有目录的近 60s 内 .md 文件（避免第一步、第二步各 glob 整个 vault）
+    now = time.time()
+    existing_paths = {ef[0] for ef in existing_files}
+    recent_files = []  # (path, mtime, is_new)
     for search_dir in search_dirs:
         if not search_dir.exists():
             continue
         for md_file in search_dir.glob("*.md"):
             try:
                 mtime = os.path.getmtime(md_file)
-                if time.time() - mtime > 30:
-                    continue
             except OSError:
                 continue
-            stem = md_file.stem
-            # 更精确的匹配：要求标题完全包含在文件名中，或文件名完全包含在标题中
-            # 且要求文件名与标题有较大的重叠部分（避免短词误匹配）
-            if (title in stem or stem in title) and len(stem) > 10 and len(title) > 10:
-                # 额外检查：重叠字符数应该占较短字符串的 50% 以上
-                overlap_len = len(set(stem) & set(title))
-                min_len = min(len(stem), len(title))
-                if overlap_len >= min_len * 0.5:
-                    candidates.append((md_file, mtime))
+            if now - mtime > 60:
+                continue
+            recent_files.append((md_file, mtime, md_file not in existing_paths))
 
-    # 按修改时间排序，取最近的
+    # 第一步：精确匹配 —— 标题与文件名互为子串（substring gate 已足够强，移除对中文无效的字符集启发式）
+    candidates = [
+        (f, m) for f, m, _ in recent_files
+        if now - m <= 30 and (title in f.stem or f.stem in title)
+        and len(f.stem) > 10 and len(title) > 10
+    ]
     if candidates:
         candidates.sort(key=lambda x: x[1], reverse=True)
         md_file = candidates[0][0]
         stem = md_file.stem
+        # 从文件内容提取真实发布日期（Web Clipper 保留 *YYYY年M月D日*），覆盖降级值
+        try:
+            file_date = extract_date_from_content(md_file.read_text(encoding="utf-8"))
+            if file_date and file_date != date_str:
+                date_str = file_date
+                target_name = f"{date_str} {sanitize_filename(title)}.md"
+                if target_folder:
+                    final_target_path = folder_path / target_name
+        except OSError:
+            pass
         if target_folder:
-            # 移动到目标文件夹
             if md_file != final_target_path:
                 md_file.rename(final_target_path)
                 print(f"    移动: {stem[:40]}... → {target_folder}/{target_name[:50]}...")
         else:
-            # 只重命名
             new_path = md_file.parent / target_name
             if md_file != new_path:
                 md_file.rename(new_path)
                 print(f"    重命名: {stem[:40]}... → {target_name[:50]}...")
         return True
 
-    # 第二步：找新文件（不存在于保存前的快照中）
-    existing_paths = {ef[0] for ef in existing_files}
-    new_files = []
-    for search_dir in search_dirs:
-        if not search_dir.exists():
-            continue
-        for md_file in search_dir.glob("*.md"):
-            if md_file in existing_paths:
-                continue
-            try:
-                mtime = os.path.getmtime(md_file)
-                if time.time() - mtime < 60:
-                    new_files.append((md_file, mtime))
-            except OSError:
-                pass
-
+    # 第二步：新文件兜底 —— 仅当恰好一个新文件时才认领；多个则歧义，不自动认领以免错配
+    new_files = [(f, m) for f, m, is_new in recent_files if is_new]
     if new_files:
-        # 取最新创建的文件
-        new_files.sort(key=lambda x: x[1], reverse=True)
+        if len(new_files) > 1:
+            print(f"    ⚠️  发现 {len(new_files)} 个新文件，无法确定本文对应文件，跳过自动重命名")
+            return False
         newest = new_files[0][0]
+        # 从文件内容提取真实发布日期（Web Clipper 保留 *YYYY年M月D日*），覆盖降级值
+        try:
+            file_date = extract_date_from_content(newest.read_text(encoding="utf-8"))
+            if file_date and file_date != date_str:
+                date_str = file_date
+                target_name = f"{date_str} {sanitize_filename(title)}.md"
+                if target_folder:
+                    final_target_path = folder_path / target_name
+        except OSError:
+            pass
         if target_folder:
-            # 移动到目标文件夹
             if newest != final_target_path:
                 newest.rename(final_target_path)
                 print(f"    移动(新文件): {newest.stem[:40]}... → {target_folder}/{target_name[:50]}...")
         else:
-            # 只重命名
             new_path = newest.parent / target_name
             if newest != new_path:
                 newest.rename(new_path)
@@ -562,7 +529,7 @@ def main():
     print("=" * 60)
 
     init_database()
-    stats = get_stats()
+    stats = get_stats(args.kb)
 
     print(f"\n数据库统计:")
     print(f"  微信文章总数: {stats['total']}")
@@ -637,7 +604,7 @@ def main():
         if i < len(articles):
             time.sleep(WAIT_BETWEEN)
 
-    stats = get_stats()
+    stats = get_stats(args.kb)
     print("\n" + "=" * 60)
     print("处理完成")
     print("=" * 60)

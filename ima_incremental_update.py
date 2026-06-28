@@ -25,7 +25,7 @@ from pathlib import Path
 # 导入公共模块
 from ima_common import (
     CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running,
-    get_ima_main_window, get_kb_window_title,
+    get_ima_main_window,
 )
 
 # ==================== 配置 ====================
@@ -133,10 +133,80 @@ def launch_ima():
         time.sleep(1)
         if is_ima_running():
             log("✅ IMA 已启动")
-            time.sleep(3)  # 额外等待应用初始化
+            wait_for_ax_ready()  # 硬等待窗口 AX 树渲染就绪再导航
             return True
     log("⚠️  IMA 启动超时")
     return False
+
+
+def wait_for_ax_ready(min_elements: int = 5, timeout: int = 30) -> bool:
+    """
+    硬等待 IMA 窗口 AX 树就绪（AXStaticText 元素数超过阈值）
+
+    在启动 IMA 后调用，持续轮询主窗口 AX 树，
+    直到 AXStaticText 数量 >= min_elements 或超时。
+    阈值口径与 navigate_to_kb 的完整性判断一致（AXStaticText >= 5）。
+
+    返回: True 表示就绪，False 表示超时（调用方应降级为原行为，不阻断）
+    """
+    import re
+
+    deadline = time.time() + timeout
+    log(f"等待 IMA 窗口 AX 树就绪（阈值 {min_elements} 个元素，超时 {timeout}秒）...")
+
+    while time.time() < deadline:
+        window = get_ima_main_window()
+        if not window:
+            time.sleep(1)
+            continue
+        try:
+            state_result = run_cua(
+                ["call", "get_window_state", json.dumps({
+                    "pid": window["pid"],
+                    "window_id": window["window_id"],
+                })],
+                timeout=10,  # 单次探测限时，避免一次阻塞吃满整个等待预算
+            )
+            state = json.loads(state_result)
+            md = state.get("tree_markdown", "")
+            count = len(re.findall(r'AXStaticText', md))
+            if count >= min_elements:
+                log(f"✅ AX 树就绪（{count} 个元素）")
+                return True
+        except Exception as e:
+            log(f"  AX 树探测异常，重试中: {e}")
+        time.sleep(1)
+
+    log(f"⚠️  AX 树就绪等待超时（{timeout}秒内未达 {min_elements} 个元素），降级继续")
+    return False
+
+
+def get_ax_window_title() -> str:
+    """
+    用 cua-driver AX API 读取 IMA 主窗口标题
+
+    Electron 应用（IMA）的窗口标题对 System Events 不可靠（冷启动后常读空），
+    AX API 能稳定读到 AXWindow 标题。供导航判断使用，替代 get_kb_window_title。
+
+    返回: 窗口标题字符串（如 "AI - ima.copilot"），失败返回 ""
+    """
+    import re
+    try:
+        window = get_ima_main_window()
+        if not window:
+            return ""
+        state_result = run_cua(
+            ["call", "get_window_state", json.dumps({
+                "pid": window["pid"],
+                "window_id": window["window_id"],
+            })],
+            timeout=10,
+        )
+        md = json.loads(state_result).get("tree_markdown", "")
+        m = re.search(r'AXWindow "([^"]*)"', md)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
 
 
 def wake_screen():
@@ -232,23 +302,25 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
         # 在全文查找知识库名称的 element_index
         # 匹配多种 AX 类型：AXStaticText, AXButton, AXLink 等
         elem_idx = None
+        # 第一遍：完全匹配（优先匹配侧边栏知识库入口，避免误点含关键词的文章卡片）
         for line in md.split("\n"):
-            # 完全匹配
             m = re.search(
-                r'\[(\d+)\] (?:AXStaticText|AXButton|AXLink|AXRow) = "' + re.escape(kb_name) + '"',
+                r'\[(\d+)\] (?:AXStaticText|AXButton|AXLink|AXRow) = "' + re.escape(kb_name) + r'"',
                 line
             )
             if m:
                 elem_idx = int(m.group(1))
                 break
-            # 包含匹配（知识库名可能带前缀/后缀）
-            m = re.search(
-                r'\[(\d+)\] (?:AXStaticText|AXButton|AXLink|AXRow) = ".*' + re.escape(kb_name) + r'.*"',
-                line
-            )
-            if m:
-                elem_idx = int(m.group(1))
-                break
+        # 第二遍：包含匹配（仅当完全匹配未命中，知识库名可能带前缀/后缀）
+        if elem_idx is None:
+            for line in md.split("\n"):
+                m = re.search(
+                    r'\[(\d+)\] (?:AXStaticText|AXButton|AXLink|AXRow) = ".*' + re.escape(kb_name) + r'.*"',
+                    line
+                )
+                if m:
+                    elem_idx = int(m.group(1))
+                    break
 
         if elem_idx is not None:
             log(f"  找到知识库 '{kb_name}' (element {elem_idx})，点击...")
@@ -261,7 +333,7 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
 
             for wait in range(8):
                 time.sleep(2.5)
-                title = get_kb_window_title(kb_name)
+                title = get_ax_window_title()
                 if kb_name in title:
                     log(f"  ✅ 已导航到 {kb_name} 知识库")
                     time.sleep(2)
@@ -303,7 +375,7 @@ def ensure_ima_ready(kb_name: str, timeout: int = 60) -> bool:
     log(f"确保 IMA 位于 {kb_name} 知识库...")
 
     # 先检查是否已经在目标知识库
-    title = get_kb_window_title(kb_name)
+    title = get_ax_window_title()
     if kb_name in title:
         log(f"✅ 已在 {kb_name} 知识库")
         return True

@@ -194,8 +194,14 @@ def activate_ima():
     time.sleep(WAIT_ACTIVATE)
 
 
-def extract_url_ax() -> Optional[str]:
-    """从 AXDocument 属性提取当前文章 URL"""
+def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
+    """从 AXDocument 属性提取当前文章 URL，带重试应对冷启动时序
+
+    Electron（IMA）窗口的 AXDocument 是完整文章 URL（mp.weixin.qq.com/s?...）的
+    唯一可靠来源（地址栏 AXTextField 只显示域名）。冷启动后点击文章，AXDocument
+    可能延迟设置，故读取失败时等待重试。失败返回 None，不 fallback 到正文链接
+    （避免错误数据）。pid/window_id 保留兼容调用点，System Events 自行遍历窗口。
+    """
     script = '''
 tell application "System Events"
     tell process "ima.copilot"
@@ -212,16 +218,19 @@ tell application "System Events"
 end tell
 return ""
 '''
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=5
-        )
-        url = result.stdout.strip()
-        if url and url.startswith("http") and "chrome://" not in url:
-            return url
-    except Exception:
-        pass
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=5
+            )
+            url = result.stdout.strip()
+            if url and url.startswith("http") and "chrome://" not in url:
+                return url
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(2)  # AXDocument 冷启动延迟，等待重试
     return None
 
 
@@ -433,7 +442,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             await asyncio.sleep(WAIT_CLICK_LOAD)
 
             # 提取 URL
-            url = extract_url_ax()
+            url = extract_url_ax(pid, window_id)
 
             if not url:
                 print("    ⚠️  未提取到 URL")

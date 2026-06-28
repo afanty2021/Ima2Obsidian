@@ -209,6 +209,29 @@ def get_ax_window_title() -> str:
         return ""
 
 
+def is_on_kb_list(kb_name: str) -> bool:
+    """
+    可靠判断当前是否在目标知识库的【文章列表页】（而非文章详情页）。
+
+    旧判断 `kb_name in title` 对短名（如 "AI"）假阳性：文章详情页标题常含 "AI"
+    （如"让 AI 每次都…"），会被误判为已在 AI 知识库。新判断要求标题含 KB 名
+    **且** 当前是列表页（parse_articles_from_tree 能解析出文章卡片；详情页为 0）。
+    """
+    title = get_ax_window_title()
+    if not title or kb_name not in title:
+        return False
+    window = get_ima_main_window()
+    if not window:
+        return False
+    try:
+        from ima_ax_extractor import get_window_state, parse_articles_from_tree
+        state = get_window_state(window["pid"], window["window_id"])
+        cards = parse_articles_from_tree(state, kb_name) if state else []
+        return len(cards) > 0
+    except Exception:
+        return False
+
+
 def wake_screen():
     """轻量唤醒屏幕（应对显示器休眠）"""
     try:
@@ -312,15 +335,19 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
                 elem_idx = int(m.group(1))
                 break
         # 第二遍：包含匹配（仅当完全匹配未命中，知识库名可能带前缀/后缀）
+        # 短名（如 "AI"）的包含匹配易误命中文章标题/链接（如"人人会AI-智能体"），
+        # 故只接受短文本（KB 入口名通常 ≤ KB名+8 字符），跳过长文章标题。
         if elem_idx is None:
             for line in md.split("\n"):
                 m = re.search(
-                    r'\[(\d+)\] (?:AXStaticText|AXButton|AXLink|AXRow) = ".*' + re.escape(kb_name) + r'.*"',
+                    r'\[(\d+)\] (?:AXStaticText|AXButton|AXLink|AXRow) = "(.*' + re.escape(kb_name) + r'.*)"',
                     line
                 )
                 if m:
-                    elem_idx = int(m.group(1))
-                    break
+                    text_val = m.group(2)
+                    if len(text_val) <= len(kb_name) + 8:
+                        elem_idx = int(m.group(1))
+                        break
 
         if elem_idx is not None:
             log(f"  找到知识库 '{kb_name}' (element {elem_idx})，点击...")
@@ -334,14 +361,14 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
             for wait in range(8):
                 time.sleep(2.5)
                 title = get_ax_window_title()
-                if kb_name in title:
-                    log(f"  ✅ 已导航到 {kb_name} 知识库")
+                if is_on_kb_list(kb_name):
+                    log(f"  ✅ 已导航到 {kb_name} 知识库（列表页验证通过）")
                     time.sleep(2)
                     return True
                 if wait < 7:
-                    log(f"    等待页面加载... ({(wait+1)*2.5}秒)")
+                    log(f"    等待页面加载... ({(wait+1)*2.5}秒) 标题: '{title}'")
 
-            log(f"  ⚠️  点击后窗口标题不包含 '{kb_name}'，标题: '{title}'")
+            log(f"  ⚠️  点击后未到达 {kb_name} 列表页，标题: '{title}'")
         else:
             log(f"  ⚠️  在侧边栏未找到知识库 '{kb_name}'")
             log(f"  尝试滚动侧边栏...")
@@ -374,10 +401,9 @@ def ensure_ima_ready(kb_name: str, timeout: int = 60) -> bool:
     """
     log(f"确保 IMA 位于 {kb_name} 知识库...")
 
-    # 先检查是否已经在目标知识库
-    title = get_ax_window_title()
-    if kb_name in title:
-        log(f"✅ 已在 {kb_name} 知识库")
+    # 先检查是否已经在目标知识库的【列表页】（is_on_kb_list 避免"AI"等短名假阳性）
+    if is_on_kb_list(kb_name):
+        log(f"✅ 已在 {kb_name} 知识库列表页")
         return True
 
     # 尝试自动导航

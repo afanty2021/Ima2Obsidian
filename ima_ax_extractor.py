@@ -245,7 +245,7 @@ tell application "System Events"
                 set docUrl to value of attribute "AXDocument" of window i
                 if docUrl is not missing value and docUrl starts with "http" then
                     set wTitle to title of window i
-                    if wTitle is not "" and wTitle does not contain "ima.copilot" then
+                    if wTitle is not "" then
                         return wTitle
                     end if
                 end if
@@ -261,6 +261,11 @@ return ""
             capture_output=True, text=True, timeout=5
         )
         title = result.stdout.strip()
+        # Electron 恒给窗口标题追加 " - ima.copilot" 后缀，剥离得到干净文章标题
+        # （http AXDocument 门控已确保只取文章窗口，无需再按 app 名过滤）
+        suffix = " - ima.copilot"
+        if title.endswith(suffix):
+            title = title[: -len(suffix)].strip()
         return title if title else None
     except Exception:
         return None

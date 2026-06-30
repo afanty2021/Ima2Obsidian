@@ -61,8 +61,9 @@ CLIPPER_MODS = ["command", "shift"]
 
 # 时间配置（秒）
 WAIT_PAGE_LOAD = 6.0
-WAIT_CLIP_SAVE = 4.0
-WAIT_FILE_APPEAR = 2.0
+WAIT_CLIP_SAVE = 4.0       # 触发 quick_clip 后起步等待（首次轮询前给 Clipper 一个窗口）
+WAIT_CLIP_TOTAL = 25.0     # 轮询等待文件落盘的总预算（修夜间慢盘时序竞争；交互式秒回）
+WAIT_CLIP_POLL = 1.5       # 落盘轮询间隔
 WAIT_CLOSE_TAB = 1.0
 WAIT_BETWEEN = 1.5
 
@@ -483,13 +484,18 @@ def save_one_article(
         print(f"    触发 clipper (Cmd+Shift+{CLIPPER_KEY})...")
         trigger_clipper_and_save(shortcut_mods)
 
-    time.sleep(WAIT_CLIP_SAVE)
-
-    # 4. 查找新保存的文件并重命名/移动
-    print(f"    查找并重命名...")
-    time.sleep(WAIT_FILE_APPEAR)
-
-    renamed = find_and_rename_in_vault(title, date_str, existing_files, target_folder=target_folder)
+    # 4. 轮询查找新保存的文件（替代固定 sleep，修复夜间 Web Clipper 写盘慢的时序竞争）
+    #    交互式通常 2-4s 落盘；launchd 夜间场景（屏幕休眠 / Chrome 后台）常 >6s，
+    #    固定等待会误判"未找到"→ 文件稍后落盘滞留 Clippings。改为轮询：文件一到即认领。
+    print(f"    查找并重命名（轮询等待落盘，最长 {WAIT_CLIP_TOTAL:g}s）...")
+    time.sleep(WAIT_CLIP_SAVE)  # 起步窗口，再开始轮询
+    renamed = False
+    deadline = time.time() + WAIT_CLIP_TOTAL
+    while time.time() < deadline:
+        renamed = find_and_rename_in_vault(title, date_str, existing_files, target_folder=target_folder)
+        if renamed:
+            break
+        time.sleep(WAIT_CLIP_POLL)
 
     if not renamed:
         folder_info = f"{target_folder}/" if target_folder else ""

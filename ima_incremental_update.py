@@ -481,10 +481,10 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
 
     except subprocess.TimeoutExpired:
         log(f"❌ Obsidian 保存超时")
-        return {"saved": 0, "failed": 0}
+        return {"saved": 0, "failed": 1}
     except Exception as e:
         log(f"❌ Obsidian 保存失败: {e}")
-        return {"saved": 0, "failed": 0}
+        return {"saved": 0, "failed": 1}
 
 
 # ==================== 增量更新逻辑 ====================
@@ -506,13 +506,13 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
     if not dry_run:
         if not ensure_ima_ready(kb_name, timeout=60):
             log(f"⚠️  无法确认在 {kb_name} 知识库，跳过")
-            return {"new": 0, "skipped": 0, "failed": 0}
+            return {"new": 0, "skipped": 0, "failed": 1}
 
     # 获取 IMA 窗口
     window = get_ima_main_window()
     if not window:
         log("❌ 未找到 IMA 窗口")
-        return {"new": 0, "skipped": 0, "failed": 0}
+        return {"new": 0, "skipped": 0, "failed": 1}
 
     pid = window["pid"]
     window_id = window["window_id"]
@@ -555,7 +555,7 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
             log(f"❌ 提取器执行失败")
             if result.stderr:
                 log(f"错误: {result.stderr}")
-            return {"new": 0, "skipped": 0, "failed": 0}
+            return {"new": 0, "skipped": 0, "failed": 1}
 
         # 解析统计信息
         new_count = 0
@@ -578,10 +578,10 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
 
     except subprocess.TimeoutExpired:
         log(f"❌ {kb_name} 提取超时")
-        return {"new": 0, "skipped": 0, "failed": 0}
+        return {"new": 0, "skipped": 0, "failed": 1}
     except Exception as e:
         log(f"❌ {kb_name} 提取失败: {e}")
-        return {"new": 0, "skipped": 0, "failed": 0}
+        return {"new": 0, "skipped": 0, "failed": 1}
 
 
 # ==================== 主函数 ====================
@@ -647,7 +647,8 @@ def main():
     total_new = 0
     total_skipped = 0
     total_saved = 0
-    total_failed = 0
+    total_failed = 0       # 保存失败（saver）
+    total_kb_failed = 0    # 知识库处理失败（导航/窗口/提取）
 
     # 逐个处理知识库
     for i, kb_name in enumerate(kbs, 1):
@@ -657,6 +658,7 @@ def main():
         stats = update_knowledge_base(kb_name, args.dry_run)
         total_new += stats["new"]
         total_skipped += stats["skipped"]
+        total_kb_failed += stats["failed"]
 
         # 如果有新文章且不是 --no-save 模式，保存到 Obsidian
         if stats["new"] > 0 and not args.no_save and not args.dry_run:
@@ -678,10 +680,11 @@ def main():
     log(f"总计跳过: {total_skipped} 篇")
     log(f"保存到 Obsidian: {total_saved} 篇")
     log(f"保存失败: {total_failed} 篇")
+    log(f"知识库处理失败: {total_kb_failed} 个")
 
-    # 退出码：保存有失败时非零退出，让 launchd 能暴露静默失败（dry-run 不告警）
-    if total_failed > 0 and not args.dry_run:
-        log(f"⚠️  存在保存失败（{total_failed} 篇），以非零退出码结束以便 launchd 告警")
+    # 退出码：保存失败或 KB 处理失败（如夜间锁屏致导航全跪）时非零退出，让 launchd 暴露静默失败（dry-run 不告警）
+    if (total_failed > 0 or total_kb_failed > 0) and not args.dry_run:
+        log(f"⚠️  存在失败（保存 {total_failed} 篇，KB 处理失败 {total_kb_failed} 个），非零退出以触发告警")
         sys.exit(1)
 
 

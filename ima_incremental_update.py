@@ -458,23 +458,26 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
                 if line.strip():
                     log(f"  {line}", print_too=False)
 
+        # 解析统计（saver 现按统计退出：全失败 exit1、部分失败 exit2，stdout 始终含统计行）
+        def _parse_count(marker: str) -> int:
+            for line in result.stdout.split("\n"):
+                if marker in line:
+                    try:
+                        return int(line.split(":")[-1].strip().split()[0])
+                    except (ValueError, IndexError):
+                        return 0
+            return 0
+
+        saved_count = _parse_count("本次成功")
+        failed_count = _parse_count("本次失败")
+
         if result.returncode != 0:
-            log(f"❌ Obsidian 保存失败")
+            log(f"❌ Obsidian 保存失败（退出码 {result.returncode}：成功 {saved_count}，失败 {failed_count}）")
             if result.stderr:
                 log(f"错误: {result.stderr}")
-            return {"saved": 0, "failed": 0}
-
-        # 解析统计
-        saved_count = 0
-        for line in result.stdout.split("\n"):
-            if "本次成功" in line:
-                try:
-                    saved_count = int(line.split(":")[-1].strip().split()[0])
-                except (ValueError, IndexError):
-                    pass
-
-        log(f"✅ 保存完成: {saved_count} 篇")
-        return {"saved": saved_count, "failed": 0}
+        else:
+            log(f"✅ 保存完成: {saved_count} 篇")
+        return {"saved": saved_count, "failed": failed_count}
 
     except subprocess.TimeoutExpired:
         log(f"❌ Obsidian 保存超时")
@@ -644,6 +647,7 @@ def main():
     total_new = 0
     total_skipped = 0
     total_saved = 0
+    total_failed = 0
 
     # 逐个处理知识库
     for i, kb_name in enumerate(kbs, 1):
@@ -658,6 +662,7 @@ def main():
         if stats["new"] > 0 and not args.no_save and not args.dry_run:
             save_stats = save_to_obsidian(kb_name)
             total_saved += save_stats["saved"]
+            total_failed += save_stats["failed"]
 
         # 知识库之间等待
         if i < len(kbs):
@@ -672,6 +677,12 @@ def main():
     log(f"总计新增: {total_new} 篇")
     log(f"总计跳过: {total_skipped} 篇")
     log(f"保存到 Obsidian: {total_saved} 篇")
+    log(f"保存失败: {total_failed} 篇")
+
+    # 退出码：保存有失败时非零退出，让 launchd 能暴露静默失败（dry-run 不告警）
+    if total_failed > 0 and not args.dry_run:
+        log(f"⚠️  存在保存失败（{total_failed} 篇），以非零退出码结束以便 launchd 告警")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

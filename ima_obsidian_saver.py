@@ -618,6 +618,11 @@ def main():
     print(f"  本次失败: {failed_count} 篇")
     print(f"  剩余待保存: {stats['unsaved']}")
 
+    # 退出码：让上游（incremental_update / launchd）能据失败数告警
+    #   dry-run 不告警；全部失败 exit 1；部分失败 exit 2；否则 0
+    if not args.dry_run and failed_count > 0:
+        sys.exit(1 if saved_count == 0 else 2)
+
 
 if __name__ == "__main__":
     main()

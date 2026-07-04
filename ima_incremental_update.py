@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -420,18 +421,68 @@ def ensure_ima_ready(kb_name: str, timeout: int = 60) -> bool:
 
 # ==================== Obsidian 保存器 ====================
 
+def is_obsidian_running() -> bool:
+    """检查 Obsidian 是否正在运行"""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "Obsidian"],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def launch_obsidian(timeout: int = 30) -> bool:
+    """
+    启动 Obsidian 并等待 Vault 加载（与 launch_ima 同构）
+
+    Obsidian 未运行时 Web Clipper 扩展无法连接 Vault，所有文章保存必然失败。
+    启动后额外等待 5 秒，给 Vault 自动加载留时间，Web Clipper 才能连上。
+
+    返回: True 表示就绪，False 表示启动超时
+    """
+    log("启动 Obsidian 应用...")
+    subprocess.run(
+        ["open", "-a", "Obsidian"],
+        capture_output=True, timeout=10
+    )
+    for _ in range(timeout):
+        time.sleep(1)
+        if is_obsidian_running():
+            log("✅ Obsidian 已启动，等待 Vault 加载...")
+            time.sleep(5)  # 让 Vault 完成加载，Web Clipper 才能连上
+            return True
+    log("⚠️  Obsidian 启动超时")
+    return False
+
+
+def ensure_obsidian_ready() -> bool:
+    """确保 Obsidian 已运行（未运行则自动启动），供保存器前置检查使用"""
+    if is_obsidian_running():
+        return True
+    return launch_obsidian()
+
+
 def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
     """
-    调用 Obsidian 保存器
+    调用 Obsidian 保存器（行级实时透传 saver 输出，避免长时间无输出被误判"卡死"）
 
     返回统计信息: {saved, failed}
     """
     log(f"\n{'─'*40}")
     log(f"保存到 Obsidian...")
 
+    # 保存前确保 Obsidian 已运行（没开则自动启动，与 IMA 同构），
+    # 否则 Web Clipper 连不上 Vault，全部文章必然失败白跑
+    if not dry_run:
+        if not ensure_obsidian_ready():
+            log("❌ Obsidian 无法启动，跳过本次保存")
+            return {"saved": 0, "failed": 1}
+
     cmd = [
         "python3",
-        "-u",  # 禁用输出缓冲，实时查看保存进度
+        "-u",  # 禁用输出缓冲，配合下面的行级透传实时显示保存进度
         Path(__file__).parent / "ima_obsidian_saver.py",
         "--limit", "1000",  # 每次最多保存 1000 篇
     ]
@@ -444,47 +495,78 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
         cmd.append("--dry-run")
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,  # 隔离父进程 tty，让 saver 判定非交互自动开始，否则卡在 input() 等 Enter
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=7200,  # 2小时超时
-            cwd=Path(__file__).parent
+            cwd=Path(__file__).parent,
         )
-
-        # 记录输出
-        if result.stdout:
-            for line in result.stdout.split("\n"):
-                if line.strip():
-                    log(f"  {line}", print_too=False)
-
-        # 解析统计（saver 现按统计退出：全失败 exit1、部分失败 exit2，stdout 始终含统计行）
-        def _parse_count(marker: str) -> int:
-            for line in result.stdout.split("\n"):
-                if marker in line:
-                    try:
-                        return int(line.split(":")[-1].strip().split()[0])
-                    except (ValueError, IndexError):
-                        return 0
-            return 0
-
-        saved_count = _parse_count("本次成功")
-        failed_count = _parse_count("本次失败")
-
-        if result.returncode != 0:
-            log(f"❌ Obsidian 保存失败（退出码 {result.returncode}：成功 {saved_count}，失败 {failed_count}）")
-            if result.stderr:
-                log(f"错误: {result.stderr}")
-        else:
-            log(f"✅ 保存完成: {saved_count} 篇")
-        return {"saved": saved_count, "failed": failed_count}
-
-    except subprocess.TimeoutExpired:
-        log(f"❌ Obsidian 保存超时")
-        return {"saved": 0, "failed": 1}
     except Exception as e:
-        log(f"❌ Obsidian 保存失败: {e}")
+        log(f"❌ 启动 Obsidian 保存器失败: {e}")
         return {"saved": 0, "failed": 1}
+
+    # 行级实时透传 saver stdout → 日志：替代 capture_output=True 的全量缓冲，
+    # 让每篇文章的提取日期/触发 clipper/落盘轮询进度立即可见，
+    # 避免 13 篇 × 30-40s 期间无输出被误判"卡死"
+    captured_lines = []
+    stderr_lines = []
+
+    def _stream(stream, sink, log_too: bool):
+        try:
+            for line in iter(stream.readline, ""):
+                if not line:
+                    break
+                line = line.rstrip("\n")
+                sink.append(line)
+                if log_too and line.strip():
+                    log(f"  {line}", print_too=True)  # 实时显示 saver 进度到终端（launchd 下 isatty=False 自动只写日志，不会重复）
+        finally:
+            stream.close()
+
+    stdout_t = threading.Thread(target=_stream, args=(proc.stdout, captured_lines, True), daemon=True)
+    stderr_t = threading.Thread(target=_stream, args=(proc.stderr, stderr_lines, False), daemon=True)
+    stdout_t.start()
+    stderr_t.start()
+
+    try:
+        proc.wait(timeout=1800)  # 30 分钟超时（13 篇正常 6-8 分钟，原 7200s 过长）
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        stdout_t.join(timeout=3)
+        stderr_t.join(timeout=3)
+        log(f"❌ Obsidian 保存超时（1800s），已终止 saver")
+        return {"saved": 0, "failed": 1}
+
+    stdout_t.join(timeout=5)
+    stderr_t.join(timeout=5)
+    returncode = proc.returncode
+
+    # 解析统计（saver 现按统计退出：全失败 exit1、部分失败 exit2，stdout 始终含统计行）
+    def _parse_count(marker: str) -> int:
+        for line in captured_lines:
+            if marker in line:
+                try:
+                    return int(line.split(":")[-1].strip().split()[0])
+                except (ValueError, IndexError):
+                    return 0
+        return 0
+
+    saved_count = _parse_count("本次成功")
+    failed_count = _parse_count("本次失败")
+
+    if returncode != 0:
+        log(f"❌ Obsidian 保存失败（退出码 {returncode}：成功 {saved_count}，失败 {failed_count}）")
+        if stderr_lines:
+            log(f"错误: {chr(10).join(stderr_lines)}")
+    else:
+        log(f"✅ 保存完成: {saved_count} 篇")
+    return {"saved": saved_count, "failed": failed_count}
 
 
 # ==================== 增量更新逻辑 ====================

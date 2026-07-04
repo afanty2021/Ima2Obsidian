@@ -569,6 +569,27 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
     return {"saved": saved_count, "failed": failed_count}
 
 
+def count_unsaved_articles(kb_name: str) -> int:
+    """统计该知识库未保存到 Obsidian 的微信文章数（含历史漏存，用于决定是否触发保存重试）"""
+    import sqlite3
+    try:
+        from ima_common import DB_FILE
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            SELECT COUNT(*) FROM articles
+            WHERE knowledge_base = ?
+              AND status = 'success'
+              AND url LIKE '%mp.weixin.qq.com%'
+              AND (obsidian_saved = 0 OR obsidian_saved IS NULL)
+        """, (kb_name,))
+        count = c.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
+
 # ==================== 增量更新逻辑 ====================
 
 def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
@@ -742,8 +763,12 @@ def main():
         total_skipped += stats["skipped"]
         total_kb_failed += stats["failed"]
 
-        # 如果有新文章且不是 --no-save 模式，保存到 Obsidian
-        if stats["new"] > 0 and not args.no_save and not args.dry_run:
+        # 触发保存：有新文章，或该 KB 有历史漏存（之前保存失败/超时未保存）。
+        # 后者让失败文章能在后续运行中自动重试，避免 new=0 时永久漏存。
+        unsaved = count_unsaved_articles(kb_name) if (not args.no_save and not args.dry_run) else 0
+        if (stats["new"] > 0 or unsaved > 0) and not args.no_save and not args.dry_run:
+            if stats["new"] == 0 and unsaved > 0:
+                log(f"检测到 {kb_name} 有 {unsaved} 篇历史漏存未保存，触发保存重试")
             save_stats = save_to_obsidian(kb_name)
             total_saved += save_stats["saved"]
             total_failed += save_stats["failed"]

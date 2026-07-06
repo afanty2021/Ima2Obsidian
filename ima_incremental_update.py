@@ -572,20 +572,20 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
 def count_unsaved_articles(kb_name: str) -> int:
     """统计该知识库未保存到 Obsidian 的微信文章数（含历史漏存，用于决定是否触发保存重试）"""
     import sqlite3
+    from contextlib import closing
     try:
         from ima_common import DB_FILE
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""
-            SELECT COUNT(*) FROM articles
-            WHERE knowledge_base = ?
-              AND status = 'success'
-              AND url LIKE '%mp.weixin.qq.com%'
-              AND (obsidian_saved = 0 OR obsidian_saved IS NULL)
-        """, (kb_name,))
-        count = c.fetchone()[0]
-        conn.close()
-        return count
+        # closing 保证异常路径也关闭连接，避免 launchd 长跑累积 fd 泄漏
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT COUNT(*) FROM articles
+                WHERE knowledge_base = ?
+                  AND status = 'success'
+                  AND url LIKE '%mp.weixin.qq.com%'
+                  AND (obsidian_saved = 0 OR obsidian_saved IS NULL)
+            """, (kb_name,))
+            return c.fetchone()[0]
     except Exception:
         return 0
 
@@ -745,6 +745,26 @@ def main():
             sys.exit(1)
 
     log("✅ cua-driver daemon 运行中")
+
+    # URL 规范化入口自检：避免 normalize_url 改格式后旧 DB 未迁移导致重复入库。
+    # 必须先 init_database 自建 schema（fresh DB / 首次安装 / DB 被删场景），
+    # 否则 verify_urls_canonical 在空 DB 上抛 'no such table: articles'。
+    # 此处守卫是唯一的"未规范 DB 短路"机制——update_knowledge_base 内不再做
+    # 基于 stdout 子串的判定（守卫-通过行 '✅ URL 规范化自检通过' 含相同子串，
+    # 会让 extractor 后续任何 exit 1（daemon/窗口/AX 失败）被误判为守卫触发，
+    # 静默跳过剩余 KB）。
+    if not args.dry_run:
+        from ima_common import init_database, verify_urls_canonical
+        init_database()
+        non_canonical = verify_urls_canonical()
+        if non_canonical:
+            log(f"❌ 检测到 {len(non_canonical)} 行 URL 未规范（normalize_url 口径变更后需迁移）")
+            log(f"   示例 id={non_canonical[0][0]}:")
+            log(f"     当前: {non_canonical[0][1][:80]}")
+            log(f"     规范: {non_canonical[0][2][:80]}")
+            log(f"   请先运行: python3 migrate_normalize_urls.py")
+            sys.exit(1)
+        log("✅ URL 规范化自检通过")
 
     # 总计统计
     total_new = 0

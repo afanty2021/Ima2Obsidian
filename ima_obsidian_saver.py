@@ -33,12 +33,14 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import requests
 
-from ima_common import DB_FILE, init_database
+from ima_common import DB_FILE, init_database, now_saved_at
 
 
 # ==================== 配置 ====================
@@ -128,8 +130,17 @@ def extract_publish_date(url: str) -> str:
     return datetime.now().strftime("%y%m%d")
 
 
-def extract_date_from_content(text: str) -> str:
-    """从 Web Clipper 保存的文章正文提取发布日期（如 *2026年6月25日 10:00*），返回 YYMMDD 或空串"""
+def extract_date_from_content(text: str) -> Optional[str]:
+    """从 Web Clipper 保存的文章正文提取发布日期（如 *2026年6月25日 10:00*）
+
+    Returns:
+        YYMMDD 字符串；正文无匹配模式时返回 None（不是空串）。
+
+        契约要求：调用方把返回值喂给 SQL COALESCE(?, published_date) 时，
+        必须传 None（而非 ""）才能让 COALESCE 跳过保留 DB 已有值——
+        SQLite 中空串非 NULL，COALESCE('', 'fallback') 会选中空串覆盖 DB。
+        本函数的历史 bug 是返回 "" 导致 reclaim 把 DB 已有真实日期清空。
+    """
     m = re.search(r'\*(\d{4})年(\d{1,2})月(\d{1,2})日', text)
     if m:
         try:
@@ -137,7 +148,7 @@ def extract_date_from_content(text: str) -> str:
             return dt.strftime("%y%m%d")
         except ValueError:
             pass
-    return ""
+    return None
 
 
 def sanitize_filename(title: str) -> str:
@@ -154,61 +165,81 @@ def sanitize_filename(title: str) -> str:
 # ==================== 数据库 ====================
 
 def get_unsaved_articles(limit: int, kb: str = None):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    if kb:
-        # 按知识库过滤，避免把其他 KB 的文章存进 --des 指定的文件夹
-        c.execute("""
-            SELECT id, url, title, knowledge_base
-            FROM articles
-            WHERE (obsidian_saved = 0 OR obsidian_saved IS NULL)
-              AND status = 'success'
-              AND url LIKE '%mp.weixin.qq.com%'
-              AND knowledge_base = ?
-            ORDER BY id ASC
-            LIMIT ?
-        """, (kb, limit))
-    else:
-        c.execute("""
-            SELECT id, url, title, knowledge_base
-            FROM articles
-            WHERE (obsidian_saved = 0 OR obsidian_saved IS NULL)
-              AND status = 'success'
-              AND url LIKE '%mp.weixin.qq.com%'
-            ORDER BY id ASC
-            LIMIT ?
-        """, (limit,))
-    rows = c.fetchall()
-    conn.close()
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        c = conn.cursor()
+        if kb:
+            # 按知识库过滤，避免把其他 KB 的文章存进 --des 指定的文件夹
+            c.execute("""
+                SELECT id, url, title, knowledge_base
+                FROM articles
+                WHERE (obsidian_saved = 0 OR obsidian_saved IS NULL)
+                  AND status = 'success'
+                  AND url LIKE '%mp.weixin.qq.com%'
+                  AND knowledge_base = ?
+                ORDER BY id ASC
+                LIMIT ?
+            """, (kb, limit))
+        else:
+            c.execute("""
+                SELECT id, url, title, knowledge_base
+                FROM articles
+                WHERE (obsidian_saved = 0 OR obsidian_saved IS NULL)
+                  AND status = 'success'
+                  AND url LIKE '%mp.weixin.qq.com%'
+                ORDER BY id ASC
+                LIMIT ?
+            """, (limit,))
+        rows = c.fetchall()
     return [{"id": r[0], "url": r[1], "title": r[2], "kb": r[3]} for r in rows]
 
 
 def mark_saved(article_id: int, published_date: str = None):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "UPDATE articles SET obsidian_saved = 1, obsidian_saved_at = ?, published_date = ? WHERE id = ?",
-        (datetime.now().isoformat(), published_date, article_id),
-    )
-    conn.commit()
-    conn.close()
+    """
+    标记文章为已保存到 Obsidian。
+
+    published_date 采用 COALESCE 保护：
+      - 调用方传入新日期 → 写入新值
+      - 调用方未传（None）→ 保留 DB 中已有的值，避免重试场景误清空
+      - DB 中也无值 → 保持 NULL（与 reclaim_clippings 的 UPDATE 口径一致）
+    """
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE articles SET obsidian_saved = 1, obsidian_saved_at = ?, "
+            "published_date = COALESCE(?, published_date) WHERE id = ?",
+            (now_saved_at(), published_date, article_id),
+        )
+        conn.commit()
 
 
 def get_stats(kb: str = None):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    where = "WHERE status = 'success' AND url LIKE '%mp.weixin.qq.com%'"
-    params = []
-    if kb:
-        where += " AND knowledge_base = ?"
-        params.append(kb)
-    c.execute(f"SELECT COUNT(*) FROM articles {where}", params)
-    total = c.fetchone()[0]
-    # saved 与 total 同口径（都过滤 status+url，可选 kb），避免脏数据下 saved>total 误判 unsaved=0
-    c.execute(f"SELECT COUNT(*) FROM articles {where} AND obsidian_saved = 1", params)
-    saved = c.fetchone()[0]
-    conn.close()
-    return {"total": total, "saved": saved, "unsaved": max(0, total - saved)}
+    """
+    返回 {total, saved, unsaved}。
+
+    unsaved 直接用与 get_unsaved_articles 完全相同的 WHERE 计算，
+    避免 max(0, total-saved) 在 obsidian_saved 出现非 {0,1,NULL} 异常值时
+    与实际可被处理的文章数分叉（导致 stats 显示有待保存但 main 取不到文章）。
+    """
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        c = conn.cursor()
+        where = "WHERE status = 'success' AND url LIKE '%mp.weixin.qq.com%'"
+        params = []
+        if kb:
+            where += " AND knowledge_base = ?"
+            params.append(kb)
+        c.execute(f"SELECT COUNT(*) FROM articles {where}", params)
+        total = c.fetchone()[0]
+        # saved 与 total 同口径（都过滤 status+url，可选 kb）
+        c.execute(f"SELECT COUNT(*) FROM articles {where} AND obsidian_saved = 1", params)
+        saved = c.fetchone()[0]
+        # unsaved 必须与 get_unsaved_articles 同口径：
+        # (obsidian_saved = 0 OR obsidian_saved IS NULL)，避免异常值导致分叉
+        c.execute(
+            f"SELECT COUNT(*) FROM articles {where} AND (obsidian_saved = 0 OR obsidian_saved IS NULL)",
+            params,
+        )
+        unsaved = c.fetchone()[0]
+    return {"total": total, "saved": saved, "unsaved": unsaved}
 
 
 # ==================== 浏览器自动化 ====================
@@ -330,13 +361,20 @@ def find_and_rename_in_vault(
     existing_files: set,
     search_dirs: list = None,
     target_folder: str = None,
-) -> bool:
+):
     """
     在 Obsidian vault 中找到 Web Clipper 刚保存的文件，
     重命名为 YYMMDD title.md 格式，并移动到目标文件夹。
 
     existing_files: set of (Path, mtime) tuples captured before opening article
     target_folder: 目标文件夹名称（如 "AI"），如果为 None 则保持在原位置
+
+    返回 (renamed: bool, actual_date_used: Optional[str])：
+      - renamed=True 时 actual_date_used 是实际用于命名的日期
+        （可能从文件内容 *YYYY年M月D日* 提取，覆盖了降级为"今天"的输入 date_str）
+      - renamed=False 时 actual_date_used 为 None
+    调用方（save_one_article → mark_saved）必须用此返回值把真实日期存进 DB published_date，
+    避免 DB 存今天、文件名存真实日期的不一致。
     """
     if search_dirs is None:
         search_dirs = [CLIPPINGS_DIR, VAULT_DIR]
@@ -398,14 +436,14 @@ def find_and_rename_in_vault(
             if md_file != new_path:
                 md_file.rename(new_path)
                 print(f"    重命名: {stem[:40]}... → {target_name[:50]}...")
-        return True
+        return True, date_str
 
     # 第二步：新文件兜底 —— 仅当恰好一个新文件时才认领；多个则歧义，不自动认领以免错配
     new_files = [(f, m) for f, m, is_new in recent_files if is_new]
     if new_files:
         if len(new_files) > 1:
             print(f"    ⚠️  发现 {len(new_files)} 个新文件，无法确定本文对应文件，跳过自动重命名")
-            return False
+            return False, None
         newest = new_files[0][0]
         # 从文件内容提取真实发布日期（Web Clipper 保留 *YYYY年M月D日*），覆盖降级值
         try:
@@ -426,9 +464,9 @@ def find_and_rename_in_vault(
             if newest != new_path:
                 newest.rename(new_path)
                 print(f"    重命名(新文件): {newest.stem[:40]}... → {target_name[:50]}...")
-        return True
+        return True, date_str
 
-    return False
+    return False, None
 
 
 # ==================== 核心保存逻辑 ====================
@@ -439,7 +477,14 @@ def save_one_article(
     mode: str = "quick",
     dry_run: bool = False,
     target_folder: str = None,
-) -> bool:
+):
+    """
+    返回 (success: bool, date_str: Optional[str])。
+
+    date_str 在成功时为用于文件命名的 YYMMDD；失败时为 None。
+    调用方应将 date_str 传给 mark_saved 持久化到 published_date 列，
+    避免 DB 中只留文件名而查不到日期。
+    """
     url = article["url"]
     title = article.get("title", "Unknown") or "Unknown"
     browser_app = browser_config["app"]
@@ -452,7 +497,7 @@ def save_one_article(
         print(f"  [DRY RUN] {title[:50]}...")
         print(f"    发布日期: {date_str}")
         print(f"    目标位置: {folder_info}{new_name[:60]}")
-        return True
+        return True, date_str
 
     # 1. 提取发布日期
     print(f"  提取日期...")
@@ -490,9 +535,12 @@ def save_one_article(
     print(f"    查找并重命名（轮询等待落盘，最长 {WAIT_CLIP_TOTAL:g}s）...")
     time.sleep(WAIT_CLIP_SAVE)  # 起步窗口，再开始轮询
     renamed = False
+    actual_date = None  # find_and_rename_in_vault 可能从内容提取到真实日期覆盖降级值
     deadline = time.time() + WAIT_CLIP_TOTAL
     while time.time() < deadline:
-        renamed = find_and_rename_in_vault(title, date_str, existing_files, target_folder=target_folder)
+        renamed, actual_date = find_and_rename_in_vault(
+            title, date_str, existing_files, target_folder=target_folder,
+        )
         if renamed:
             break
         time.sleep(WAIT_CLIP_POLL)
@@ -506,7 +554,9 @@ def save_one_article(
     time.sleep(WAIT_CLOSE_TAB)
 
     # 仅当文件确实已保存并改名/移动时才算成功，否则不标记为已保存以便下次重试
-    return renamed
+    # actual_date 优先取 find_and_rename_in_vault 从文件内容提取的真实日期
+    # （覆盖 extract_publish_date 降级为今天的值），让 DB published_date 与文件名一致
+    return renamed, (actual_date or date_str if renamed else None)
 
 
 # ==================== 主函数 ====================
@@ -584,13 +634,13 @@ def main():
     for i, article in enumerate(articles, 1):
         print(f"\n[{i}/{len(articles)}]", end=" ")
         try:
-            success = save_one_article(
+            success, date_str = save_one_article(
                 article, browser_config, mode=args.mode, dry_run=args.dry_run,
                 target_folder=args.des
             )
             if success:
                 if not args.dry_run:
-                    mark_saved(article["id"])
+                    mark_saved(article["id"], published_date=date_str)
                 saved_count += 1
                 print(f"    ✅ 完成")
             else:

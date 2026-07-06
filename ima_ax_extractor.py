@@ -103,18 +103,28 @@ def normalize_url(url: str) -> str:
         return url.split('?', 1)[0]
 
     # 通用（含上面 fall-through 的微信长格式无核心参数情形）：
-    # 去除常见追踪参数，剩余参数排序保证顺序无关
+    # 去除追踪参数，保留内容参数。两类匹配：
+    #   (1) 前缀匹配：仅 'utm_'（行业标准追踪前缀，无歧义）
+    #   (2) 精确匹配：'ref'/'source' 等单字追踪参数必须精确匹配，
+    #       不能 startswith——否则会误剥 'ref_id'/'source_id' 等内容参数，
+    #       导致不同内容的 URL 折叠到同一规范形式 → UNIQUE 约束触发误判重复 → 漏存。
     if '?' in url:
         base, params = url.split('?', 1)
         param_list = params.split('&')
+        # 仅 'utm_' 用前缀匹配（无歧义）；其余单字追踪参数用精确匹配
+        TRACKING_EXACT = {
+            'ref', 'ref_src', 'ref_url',  # 不剥 'ref_id'（内容参数）
+            'source', 'from', 'scene', 'sessionid',
+            'share', 'clicktime', '_t', 'timestamp',
+        }
         kept = []
         for param in param_list:
             key = param.split('=', 1)[0]
-            if not any(key.startswith(prefix) for prefix in [
-                'utm_', 'ref', 'source', 'from', 'scene',
-                '_t', 'timestamp', 'share', 'clicktime'
-            ]):
-                kept.append(param)
+            if key.startswith('utm_'):
+                continue
+            if key in TRACKING_EXACT:
+                continue
+            kept.append(param)
         kept.sort()
         return f"{base}?{'&'.join(kept)}" if kept else base
 
@@ -170,13 +180,16 @@ def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
       - 非 JSON 文本（如 click 的纯文本回复）→ 包装为 {"raw": ...}
       - 空/仅空白输出（click/scroll 成功时常如此）→ 返回 {}（视为成功，无 payload）
       - run_cua 抛 RuntimeError（非零退出码）→ 返回 None（调用方据此判失败）
+      - run_cua 抛 subprocess.TimeoutExpired（cua-driver 超时）→ 返回 None
+        历史问题：旧实现只捕 RuntimeError，TimeoutExpired 穿透到 extractor main
+        把整个提取流程崩掉（cua-driver 卡死场景）。
 
     历史问题：旧实现把空输出当作"无返回"返回 None，导致 click_element 在
     cua-driver 静默成功时误判失败，触发不必要的 AX Tree re-fetch。
     """
     try:
         output = run_cua(["call", tool, json.dumps(params)])
-    except RuntimeError as e:
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
         print(f"  ⚠️  cua-driver call {tool} 失败: {e}")
         return None
 

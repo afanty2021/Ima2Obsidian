@@ -130,12 +130,15 @@ def main():
                 no_folder.append((f, kb))
                 continue
 
-            # 从正文提取发布日期，提取不到用文件 mtime
+            # 从正文提取发布日期：内容日期是高质量（Web Clipper 保留 *YYYY年M月D日*），
+            # mtime 是低质量兜底（仅用于文件命名，不写入 DB）。
+            # 区分两者：只有内容日期才允许覆盖 DB 已有值（避免 mtime 兜底误覆盖）。
             try:
                 content = f.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 content = ""
-            date_str = extract_date_from_content(content) or mtime_yymmd(f)
+            content_date = extract_date_from_content(content)
+            date_str = content_date or mtime_yymmd(f)  # 文件命名用（任意可用日期）
             target_name = f"{date_str} {sanitize_filename(title)}.md"
             target = folder / target_name
 
@@ -143,7 +146,9 @@ def main():
                 conflict.append((f, target))
                 continue
 
-            matched.append((f, target, aid, date_str))
+            # db_date_for_update：内容日期非空时用它（覆盖 DB 兜底/降级值），
+            # 内容日期为空时传 None 让 COALESCE 保留 DB 已有值（不用 mtime 覆盖）
+            matched.append((f, target, aid, date_str, content_date))
             claimed_article_ids.add(aid)
             flag = "→" if args.apply else "[DRY]"
             print(f"  {flag} {f.stem[:38]!s:40} → {kb}/{target_name[:46]}")
@@ -168,7 +173,7 @@ def main():
             # Phase 1: rename + UPDATE 循环
             # BaseException 在此期间触发 → commit 还没尝试 → 安全回滚
             try:
-                for f, target, aid, date_str in matched:
+                for f, target, aid, date_str, content_date in matched:
                     try:
                         f.rename(target)
                     except OSError as e:
@@ -177,10 +182,14 @@ def main():
                     renamed_pairs.append((f, target))
 
                     try:
+                        # published_date 用 COALESCE(?, published_date)（与 mark_saved 同形式）：
+                        #   - content_date 非空 → 用真实日期覆盖 DB 兜底/降级值
+                        #   - content_date 为空 → 传 None，COALESCE 保留 DB 已有值
+                        #     （不用 mtime 兜底误覆盖，mtime 仅用于文件命名）
                         c.execute(
                             "UPDATE articles SET obsidian_saved=1, obsidian_saved_at=?, "
-                            "published_date=COALESCE(published_date,?) WHERE id=?",
-                            (now_saved_at(), date_str, aid),
+                            "published_date=COALESCE(?, published_date) WHERE id=?",
+                            (now_saved_at(), content_date, aid),
                         )
                     except sqlite3.Error as e:
                         # (a) UPDATE 单条失败：回滚该条 rename

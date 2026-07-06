@@ -265,36 +265,39 @@ class TestMigrateMetadataPreservation:
         # 必须有合并计数；不应报告失败
         assert "合并去重: 1" in out, f"应单列合并计数，实际输出: {out!r}"
         # 关键不变式：成功的合并去重不应被算作失败
-        assert "失败: 0 条" in out or "失败:" not in out, \
+        # 'error_count' 在新代码里是死代码（永不自增），所以 '失败: N 条' 永不打印
+        assert "失败:" not in out or "失败: 0 条" in out, \
             f"合并成功不应计入失败，实际输出: {out!r}"
 
     def test_migrate_locked_db_rolls_back_cleanly(self, temp_db, capsys, monkeypatch):
-        """'database is locked' 命中迁移中任一语句时，整批 UPDATE/DELETE 必须回滚
+        """'database is locked' 命中迁移中第 N 条 UPDATE 时，前 N-1 条已成功的 UPDATE 必须被回滚
 
-        回归 #3：旧实现碰撞处理 UPDATE/DELETE 没有 try，'database is locked'
-        直接穿透 for 循环、跳过 commit，closing 回滚整批——但日志只打顶层 traceback，
-        没明确告诉运维"已回滚，请重试"。
+        回归 #2（round-3 测试孪生）：旧测试在第一条 UPDATE 就抛错，0 条真正
+        执行，'5 行原始 URL 保留' 只是"没改过"而非"回滚了"。要真正测回滚：
+        让前几条 UPDATE 成功（落库），第 4 条抛错，验证前 3 条 URL 被还原。
         """
         init_database()
-        # 插若干行需要迁移的旧格式 URL
         conn = sqlite3.connect(temp_db)
+        # 插 5 行需要迁移的旧格式 URL
+        original_urls = []
         for i in range(5):
+            u = f"https://mp.weixin.qq.com/s?sn=S{i}&idx=1&mid=M{i}&__biz=B{i}"
             conn.execute(
                 "INSERT INTO articles (url, title, status) VALUES (?,?,?)",
-                (f"https://mp.weixin.qq.com/s?sn=S{i}&idx=1&mid=M{i}&__biz=B{i}",
-                 f"T{i}", "success"),
+                (u, f"T{i}", "success"),
             )
+            original_urls.append(u)
         conn.commit()
         conn.close()
 
-        # 用 TrackingConnection 让 UPDATE 抛 'database is locked'
+        # 用 TrackingConnection 让第 4 次 UPDATE 抛错（前 3 次成功）
         from tests.test_db_connections import TrackingConnection
         real_connect = sqlite3.connect
 
         def faulty_connect(*args, **kwargs):
             real = real_connect(*args, **kwargs)
             wrapper = TrackingConnection(real)
-            wrapper.set_failure_on_sql("UPDATE", sqlite3.OperationalError("database is locked"))
+            wrapper.set_fail_on_nth_update(4)
             return wrapper
 
         with monkeypatch.context() as m:
@@ -304,21 +307,25 @@ class TestMigrateMetadataPreservation:
                 migrate_urls()
 
         out = capsys.readouterr().out
-        # 必须明确告知运维"已回滚"
         assert "已回滚" in out or "回滚" in out, \
             f"locked DB 中断时应明确提示已回滚，实际: {out!r}"
 
-        # 验证 DB 状态：所有原始 URL 仍存在（未半完成）
+        # 关键不变式：5 行原始 URL 全部保留（前 3 条 UPDATE 已成功但必须被回滚还原）
         conn = sqlite3.connect(temp_db)
         c = conn.cursor()
         c.execute("SELECT url FROM articles ORDER BY url")
-        urls = [r[0] for r in c.fetchall()]
+        urls_after = [r[0] for r in c.fetchall()]
         conn.close()
-        # 5 行原始数据应全部保留（无 UPDATE 成功）
-        assert len(urls) == 5, f"回滚后应保留全部 5 行，实际: {len(urls)}"
-        # 所有 URL 应保持原状（未规范），便于重试
-        for u in urls:
-            assert "sn=S" in u, f"URL 应保持原状（未规范），实际: {u}"
+
+        assert len(urls_after) == 5, f"行数应保留 5 行，实际: {len(urls_after)}"
+        # 关键：前 3 条 UPDATE 已成功（URL 已改成规范形式）但必须被回滚还原
+        # 若回滚失效，会留下部分已规范的 URL——下次 migrate 时它们无需迁移，
+        # 但第 4 条以后的 URL 仍是旧格式，导致半完成状态
+        for original, current in zip(sorted(original_urls), urls_after):
+            assert current == original, (
+                f"已成功的 UPDATE 必须被回滚还原：原 {original!r}，"
+                f"当前 {current!r}（这条若通过说明回滚失效，半完成状态被保留）"
+            )
 
 
 class TestExtractorGuard:

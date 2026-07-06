@@ -17,6 +17,8 @@ class TrackingCursor:
         self._real = real_cursor
         self.execute_exception = None  # 无条件触发
         self.conditional_exceptions = []  # [(sql_substr, exc), ...] 按 SQL 内容触发
+        self.update_call_count = 0  # UPDATE 调用计数，支持"第 N 次 UPDATE 抛错"
+        self.fail_on_nth_update = None  # int N：第 N 次 UPDATE 时抛错
 
     def execute(self, sql, *args, **kwargs):
         for substr, exc in self.conditional_exceptions:
@@ -24,6 +26,12 @@ class TrackingCursor:
                 raise exc
         if self.execute_exception:
             raise self.execute_exception
+        # 按 UPDATE 调用计数触发（让前 N-1 次 UPDATE 成功，第 N 次抛错）
+        if self.fail_on_nth_update is not None and "UPDATE" in sql.upper():
+            self.update_call_count += 1
+            if self.update_call_count == self.fail_on_nth_update:
+                self.fail_on_nth_update = None  # 触发后清除
+                raise sqlite3.OperationalError("database is locked (nth UPDATE)")
         return self._real.execute(sql, *args, **kwargs)
 
     def fetchall(self):
@@ -45,6 +53,7 @@ class TrackingConnection:
         self._cursor_exception = None
         self._conditional = []  # [(sql_substr, exc), ...]
         self._commit_exception = None  # 注入 commit() 异常
+        self._post_commit_exception = None  # commit 成功返回后立即抛（模拟字节码窗口）
 
     def set_cursor_exception(self, exc):
         """让后续 cursor().execute() 抛指定异常，用于测试异常路径"""
@@ -58,11 +67,31 @@ class TrackingConnection:
         """让下次 commit() 抛指定异常（模拟 'database is locked' 等）"""
         self._commit_exception = exc
 
+    def set_post_commit_exception(self, exc):
+        """commit() 成功返回后立即抛异常（模拟字节码窗口的 Ctrl+C）
+
+        模拟场景：conn.commit() 在 SQLite 层已成功，但 CPython 在下一条
+        字节码（如 STORE_FAST committed）前检查信号并抛 KeyboardInterrupt。
+        用于测试 commit 与 committed 标志之间的窗口期处理。
+        """
+        self._post_commit_exception = exc
+
+    def set_fail_on_nth_update(self, n):
+        """第 n 次 UPDATE 时抛 'database is locked'（前 n-1 次成功）
+
+        用于测试 migrate 的真实回滚：让前几条 UPDATE 成功（已落库），
+        第 n 条抛错，验证 conn.rollback() 是否把已成功的 UPDATE 还原。
+        """
+        self._fail_on_nth_update = n
+
     def cursor(self):
         c = TrackingCursor(self._real.cursor())
         if self._cursor_exception:
             c.execute_exception = self._cursor_exception
         c.conditional_exceptions = list(self._conditional)
+        if getattr(self, "_fail_on_nth_update", None) is not None:
+            c.fail_on_nth_update = self._fail_on_nth_update
+            self._fail_on_nth_update = None  # 只注入到下个 cursor
         return c
 
     def commit(self):
@@ -70,7 +99,13 @@ class TrackingConnection:
             exc = self._commit_exception
             self._commit_exception = None  # 触发后清除，避免 close 时再抛
             raise exc
-        return self._real.commit()
+        # 真实 commit 必须先成功（SQLite 层提交），再模拟字节码窗口
+        result = self._real.commit()
+        if self._post_commit_exception:
+            exc = self._post_commit_exception
+            self._post_commit_exception = None
+            raise exc
+        return result
 
     def rollback(self):
         return self._real.rollback()
@@ -104,21 +139,22 @@ def tracked_db(temp_db):
         return wrapper
 
     # patch 所有相关模块的 sqlite3.connect 引用
-    patches = []
+    # 用 ExitStack 管理，确保 LIFO stop 顺序——start 时第 1 个先 start，
+    # stop 时必须最后 stop，否则 sqlite3.connect 仍是 tracking_connect 包装器，
+    # 后续测试看到的是代理而非真实 Connection（isinstance / 真实连接语义会失效）。
+    from contextlib import ExitStack
+    stack = ExitStack()
     for mod_name in ("ima_common", "ima_ax_extractor", "ima_obsidian_saver",
                      "ima_incremental_update"):
         import importlib
         mod = importlib.import_module(mod_name)
         if hasattr(mod, "sqlite3"):
-            patches.append(patch.object(mod.sqlite3, "connect", tracking_connect))
-
-    for p in patches:
-        p.start()
+            stack.enter_context(patch.object(mod.sqlite3, "connect", tracking_connect))
 
     yield temp_db, instances
 
-    for p in patches:
-        p.stop()
+    # LIFO：后入栈的先退出，最早 start 的最后 stop，保证完全回退
+    stack.close()
 
 
 @pytest.fixture

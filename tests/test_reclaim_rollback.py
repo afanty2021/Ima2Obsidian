@@ -309,5 +309,75 @@ def test_reclaim_keyboard_interrupt_rolls_back_all(temp_db, tmp_path, monkeypatc
         except KeyboardInterrupt:
             pass  # 顶层会重抛，但回滚已发生
 
-    # 关键不变式：第一条 rename 成功的文件必须被回滚到 Clippings
+    # 文件系统半：file_a 必须被回滚到 Clippings
     assert file_a.exists(), "KeyboardInterrupt 时 file_a 必须回滚到 Clippings（不能丢）"
+    # file_b 应仍在 Clippings（rename 抛异常前未移动）
+    assert file_b.exists(), "file_b 应仍在 Clippings"
+
+    # 事务半：DB 必须未标记（commit 没发生）
+    conn = sqlite3.connect(temp_db)
+    c = conn.cursor()
+    c.execute("SELECT obsidian_saved FROM articles WHERE title='测试文章A'")
+    saved_a = c.fetchone()[0]
+    c.execute("SELECT obsidian_saved FROM articles WHERE title='测试文章B'")
+    saved_b = c.fetchone()[0]
+    conn.close()
+    assert saved_a == 0, "KeyboardInterrupt 时 file_a 对应 DB 行必须未标记（事务半）"
+    assert saved_b == 0, "file_b 对应 DB 行必须未标记"
+
+
+def test_reclaim_ctrl_c_during_commit_does_not_orphan(temp_db, tmp_path, monkeypatch):
+    """commit 成功后 BaseException 不应回滚文件（避免 Clippings 孤儿 + DB 已 saved）
+
+    回归 #1（round-3 引入）：单 try 包裹 commit 与 for 循环，Ctrl+C 在
+    conn.commit() 返回与 committed=True 之间的字节码窗口触发 →
+    BaseException 处理器看到 committed=False → 回滚 renamed_pairs，
+    但 SQLite 已提交 → 文件回 Clippings、DB 标 saved → saver/reclaim
+    都只查 obsidian_saved=0 → 永久孤儿。
+
+    修法：commit 拆出独立 try，BaseException 不在 commit 成功后回滚文件。
+    测试模拟"所有 rename+UPDATE 已成功，commit 也返回，紧接着 BaseException"
+    的场景——文件应留在 KB（与 DB 一致，丑但不漏）。
+    """
+    vault, clip_dir = _setup_isolated_vault(tmp_path, temp_db)
+    file_a = clip_dir / "测试文章A.md"
+    file_a.write_text("正文\n*2026年1月2日 10:00*\n", encoding="utf-8")
+
+    monkeypatch.setattr("reclaim_clippings.VAULT_DIR", vault)
+    monkeypatch.setattr("reclaim_clippings.CLIPPINGS_DIR", clip_dir)
+    monkeypatch.setattr("ima_obsidian_saver.VAULT_DIR", vault)
+    monkeypatch.setattr("ima_obsidian_saver.CLIPPINGS_DIR", clip_dir)
+    monkeypatch.setattr("sys.argv", ["reclaim_clippings.py", "--apply"])
+
+    # 用 TrackingConnection 让 commit() 后立即抛 BaseException
+    # 模拟字节码窗口：commit 成功返回，但下一条字节码前 KeyboardInterrupt
+    from tests.test_db_connections import TrackingConnection
+    real_connect = sqlite3.connect
+
+    def faulty_connect(*args, **kwargs):
+        real = real_connect(*args, **kwargs)
+        wrapper = TrackingConnection(real)
+        wrapper.set_post_commit_exception(KeyboardInterrupt("Ctrl+C"))
+        return wrapper
+
+    with patch.object(sqlite3, "connect", faulty_connect):
+        try:
+            reclaim_main()
+        except KeyboardInterrupt:
+            pass
+
+    # 不变式：file_a 必须留在 KB（DB 已 saved），不能被回滚到 Clippings
+    # 否则就是 Clippings 孤儿 + DB 标 saved → 永久漏存
+    in_kb = (vault / "AI" / "260102 测试文章A.md").exists()
+    in_clippings = file_a.exists()
+    assert in_kb, (
+        f"commit 已成功时文件应留在 KB（与 DB 一致）；"
+        f"实际 in_kb={in_kb} in_clippings={in_clippings}——若 in_clippings 则是孤儿"
+    )
+
+    # DB 必须 marked saved（commit 成功）
+    conn = sqlite3.connect(temp_db)
+    c = conn.cursor()
+    c.execute("SELECT obsidian_saved FROM articles WHERE title='测试文章A'")
+    assert c.fetchone()[0] == 1, "commit 成功时 DB 应已标记"
+    conn.close()

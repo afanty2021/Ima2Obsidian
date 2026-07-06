@@ -29,7 +29,12 @@ class TestMainEntryGuardCallsRealMain:
     """真正调 main()，覆盖入口预检的 init_database() 与 verify_urls_canonical() 顺序"""
 
     def test_main_aborts_on_unmigrated_db(self, temp_db, tmp_path, monkeypatch):
-        """DB 含未规范 URL 时，main 应在入口预检 sys.exit(1)"""
+        """DB 含未规范 URL 时，main 应在入口预检 sys.exit(1)
+
+        防回归锁：守卫逻辑若被移到循环后或被 try 吞掉，main 会进
+        update_knowledge_base → 真实 IMA 激活/导航/extractor 子进程，
+        测试会挂数十分钟。故全部 IMA 副作用也 mock，任何调用都视为失败。
+        """
         # 隔离 LOCK/LOG 文件
         monkeypatch.setattr("ima_incremental_update.LOCK_FILE", tmp_path / "l.lock")
         monkeypatch.setattr("ima_incremental_update.LOG_FILE", tmp_path / "l.log")
@@ -38,6 +43,12 @@ class TestMainEntryGuardCallsRealMain:
 
         monkeypatch.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI"])
         monkeypatch.setattr("ima_incremental_update.ensure_daemon", lambda: True)
+        # 防回归：守卫失效时 main 会跑到这些函数，必须 mock 让其快速失败
+        sentinel = AssertionError("守卫失效：main 进入 IMA 自动化路径")
+        monkeypatch.setattr("ima_incremental_update.activate_ima",
+                            lambda *a, **kw: (_ for _ in ()).throw(sentinel))
+        monkeypatch.setattr("ima_incremental_update.update_knowledge_base",
+                            lambda *a, **kw: (_ for _ in ()).throw(sentinel))
 
         with pytest.raises(SystemExit) as exc_info:
             main()
@@ -127,8 +138,11 @@ class TestExtractorFailureHandling:
                    return_value={"pid": 1, "window_id": 1, "bounds": {}}):
             stats = update_knowledge_base("AI", dry_run=False)
 
-        # 关键不变式：不能有 abort_remaining（它只该被守卫失败触发，
-        # 而入口预检已先拦截真正的守卫失败，extractor 子进程的守卫总通过）
-        assert not stats.get("abort_remaining"), \
-            f"守卫已通过的失败被误判为守卫触发 → 会静默跳过剩余 KB；stats={stats}"
+        # 关键不变式：update_knowledge_base 不应在返回的 stats 里塞任何"建议跳过剩余 KB"
+        # 的标记字段——入口预检已先拦截真正的守卫失败，子进程的 stdout 检测只会误伤。
+        # 用 'failed' 字段做唯一可观测失败信号（main 不会据此跳过其他 KB）。
+        for forbidden_key in ("abort_remaining", "skip_remaining", "guard_triggered"):
+            assert forbidden_key not in stats, \
+                f"不应返回 {forbidden_key}（入口预检已替代）；stats={stats}"
         assert stats["failed"] == 1, "应当作为普通失败计数"
+        # main 据此 stats 不会跳过下个 KB（验证 stats 里没有让 main 短路的字段）

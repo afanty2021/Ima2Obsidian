@@ -84,7 +84,6 @@ def migrate_urls(db_file=None):
         print("4. 开始迁移...")
         success_count = 0
         merged_count = 0  # 合并去重的行数（不是错误，单独维度）
-        error_count = 0
 
         try:
             for m in migrations:
@@ -134,8 +133,6 @@ def migrate_urls(db_file=None):
         print(f"   ✅ 成功: {success_count} 条")
         if merged_count > 0:
             print(f"   🔀 合并去重: {merged_count} 条（不算失败）")
-        if error_count > 0:
-            print(f"   ❌ 失败: {error_count} 条")
         print()
 
         # 5. 验证去重效果

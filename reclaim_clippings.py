@@ -149,18 +149,24 @@ def main():
             print(f"  {flag} {f.stem[:38]!s:40} → {kb}/{target_name[:46]}")
 
         # 4. 执行（仅 --apply）
-        #    rename 与 UPDATE 必须保持一致。四类失败需要回滚：
+        #    rename 与 UPDATE 必须保持一致。失败分类与处理：
         #      (a) UPDATE 单条失败 → 回滚该条 rename
-        #      (b) commit() 失败 → SQLite 自动回滚 UPDATE，但 rename 需手动全量回滚
-        #      (c) 任何其他异常（如运维 Ctrl+C 即 KeyboardInterrupt）穿透循环
-        #          → 已 rename 的 renamed_pairs 必须全量回滚，否则文件滞留 KB
-        #      (d) 回滚 rename 也失败（磁盘满 / 权限）→ dead-letter，打印 src/dst/错误
-        #    否则文件滞留 KB 而 DB 仍 unsaved → 下次 reclaim 因 conflict 分支跳过 → 永久漏存
+        #      (b) commit() 失败（sqlite3.Error）→ SQLite 自动回滚 UPDATE，
+        #          rename 全量回滚
+        #      (c) Phase 1 期间的 BaseException（如 Ctrl+C）→ commit 还没尝试过，
+        #          rename 全量回滚（事务由 close 时自动 rollback）
+        #      (d) Phase 2 commit 成功后的 BaseException → 不能回滚 rename！
+        #          SQLite 已提交（DB 标 saved），若把文件移回 Clippings 会变成
+        #          "Clippings 孤儿 + DB 标 saved"——saver/reclaim 都只查
+        #          obsidian_saved=0 → 永久漏存。修法：commit 拆出独立 try，
+        #          BaseException 不在 commit 后回滚文件（保留"丑但一致"状态）。
+        #      (e) 回滚 rename 也失败（磁盘满 / 权限）→ dead-letter，打印 src/dst/错误
         moved, marked = 0, 0
         rollback_failures = []  # 回滚 rename 失败的 (src, dst, err)，供 dead-letter 汇总
         renamed_pairs = []  # [(src_path, dst_path), ...] 已成功的 rename，供全量回滚
-        committed = False
         if args.apply:
+            # Phase 1: rename + UPDATE 循环
+            # BaseException 在此期间触发 → commit 还没尝试 → 安全回滚
             try:
                 for f, target, aid, date_str in matched:
                     try:
@@ -184,27 +190,29 @@ def main():
                         continue
                     moved += 1
                     marked += 1
-
-                # commit 阶段：失败则全量回滚
-                try:
-                    conn.commit()
-                    committed = True
-                except sqlite3.Error as e:
-                    print(f"  ❌ commit 失败：{e}，开始全量回滚 {len(renamed_pairs)} 个文件到 Clippings")
-                    for src, dst in renamed_pairs:
-                        rollback_failures.extend(_safe_rename_back(dst, src))
-                    moved = 0
-                    marked = 0
             except BaseException as e:
-                # (c) 任何未预期异常（最现实：Ctrl+C 即 KeyboardInterrupt）穿透 for/commit
-                #     已 rename 的必须全量回滚，避免文件滞留 KB 文件夹
+                # (c) Phase 1 期间的中断：commit 没尝试过，安全回滚
                 print(f"  ❌ reclaim 中断（{type(e).__name__}: {e}），回滚已 rename 文件")
-                if not committed:
-                    for src, dst in renamed_pairs:
-                        rollback_failures.extend(_safe_rename_back(dst, src))
-                    moved = 0
-                    marked = 0
+                for src, dst in renamed_pairs:
+                    rollback_failures.extend(_safe_rename_back(dst, src))
+                moved = 0
+                marked = 0
                 raise
+
+            # Phase 2: commit（独立 try，BaseException 不在此回滚文件）
+            # sqlite3.Error 时 SQLite 已自动 rollback UPDATE，对应 (b)
+            # 成功后 CPython 在 committed=True 之前的字节码窗口若被 BaseException
+            # 中断，文件留在 KB + DB 标 saved（一致状态），不再回滚——对应 (d)
+            try:
+                conn.commit()
+            except sqlite3.Error as e:
+                print(f"  ❌ commit 失败：{e}，开始全量回滚 {len(renamed_pairs)} 个文件到 Clippings")
+                for src, dst in renamed_pairs:
+                    rollback_failures.extend(_safe_rename_back(dst, src))
+                moved = 0
+                marked = 0
+            # 注意：commit 成功后若发生 BaseException，让其在汇总前正常传播，
+            # 文件保留在 KB（与已提交的 DB 一致），避免永久孤儿
 
     # 5. 汇总
     print("=" * 60)

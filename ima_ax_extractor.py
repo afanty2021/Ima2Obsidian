@@ -17,6 +17,7 @@ import asyncio
 import json
 import re
 import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 import time
@@ -44,61 +45,78 @@ MAX_CONSECUTIVE_SEEN = 10 # 连续遇到已存在文章后停止
 
 def normalize_url(url: str) -> str:
     """
-    规范化 URL，去除不影响文章内容的动态参数
+    规范化 URL，去除不影响文章内容的动态参数。
+
+    保证以下性质：
+      - 幂等：反复应用得到相同结果
+      - 顺序无关：长格式核心参数 (__biz/mid/idx/sn) 任意顺序都规范化到同一结果
+      - 无碰撞：不把两条不同 URL 折叠到同一规范形式
 
     主要处理平台：
-    - 微信公众号短格式 (/s/ARTICLE_ID)：去除全部 ? 参数
-    - 微信公众号长格式 (/s?__biz=...)：保留 __biz, mid, idx, sn，去除追踪参数
-    - 知乎：去除动态参数
-    - 通用：去除追踪参数（utm_*, scene, from 等）
+      - 微信短格式 (/s/ARTICLE_ID)：去除全部 ? 参数和 # 锚点
+      - 微信长格式 (/s?__biz=...&mid=...&idx=...&sn=...)：仅保留四个核心参数并排序
+      - 知乎：去除全部动态参数
+      - 通用：去除追踪参数（utm_*, ref, source, from, scene, _t, ...），保留其余并排序
+
+    已知限制（不在本层修复）：
+      微信短格式 /s/ID 与长格式 /s?__biz=..&mid=.. 指向同一篇文章时，
+      在不发起网络请求的前提下无法判定等价。跨形式去重需要在 saver/extractor
+      层通过 URL 解析回调或额外索引列处理。
 
     Args:
         url: 原始 URL
 
     Returns:
-        规范化后的 URL
+        规范化后的 URL；空输入原样返回
     """
     if not url:
         return url
 
+    # 先去除 #fragment（如微信 #rd），保证所有后续分支不必重复处理
+    url = url.split('#', 1)[0]
+
     if 'mp.weixin.qq.com' in url:
         # 短格式: /s/ARTICLE_ID — 去除所有查询参数
         if '/s/' in url:
-            return url.split('?')[0]
+            return url.split('?', 1)[0]
 
-        # 长格式: /s?__biz=...&mid=...&idx=...&sn=...&chksm=...&scene=...
+        # 长格式: /s?__biz=...&mid=...&idx=...&sn=...（核心参数按固定顺序规范）
         if '?' in url:
             base, params = url.split('?', 1)
             param_list = params.split('&')
-            # 保留核心文章标识参数，去除追踪/分享参数
+            # 按 (__biz, mid, idx, sn) 固定顺序排列核心参数；
+            # 任意输入顺序都映射到同一规范形式（顺序无关性）
+            core_order = ('__biz', 'mid', 'idx', 'sn')
             core_params = []
-            for param in param_list:
-                key = param.split('=')[0]
-                if key in ('__biz', 'mid', 'idx', 'sn'):
-                    core_params.append(param)
+            for key in core_order:
+                for p in param_list:
+                    if p.split('=', 1)[0] == key:
+                        core_params.append(p)
+                        break
             if core_params:
                 return f"{base}?{'&'.join(core_params)}"
-            return base
+            # 无核心参数：fall through 到通用处理，避免不同 URL 折叠到 bare base
+            # （例如 /s?scene=1 与 /s?scene=2 不应都折叠成 /s）
 
-    # 知乎：去除常见动态参数
+    # 知乎：去除所有动态参数
     if 'zhihu.com' in url:
-        return url.split('?')[0]
+        return url.split('?', 1)[0]
 
-    # 其他平台：去除常见追踪参数
+    # 通用（含上面 fall-through 的微信长格式无核心参数情形）：
+    # 去除常见追踪参数，剩余参数排序保证顺序无关
     if '?' in url:
         base, params = url.split('?', 1)
         param_list = params.split('&')
-        important_params = []
+        kept = []
         for param in param_list:
-            if not any(param.startswith(prefix) for prefix in [
+            key = param.split('=', 1)[0]
+            if not any(key.startswith(prefix) for prefix in [
                 'utm_', 'ref', 'source', 'from', 'scene',
                 '_t', 'timestamp', 'share', 'clicktime'
             ]):
-                important_params.append(param)
-
-        if important_params:
-            return f"{base}?{'&'.join(important_params)}"
-        return base
+                kept.append(param)
+        kept.sort()
+        return f"{base}?{'&'.join(kept)}" if kept else base
 
     return url
 
@@ -108,26 +126,24 @@ def normalize_url(url: str) -> str:
 def url_exists(url: str) -> bool:
     # 使用规范化后的 URL 进行去重检查
     normalized_url = normalize_url(url)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM articles WHERE url = ? LIMIT 1", (normalized_url,))
-    exists = c.fetchone() is not None
-    conn.close()
-    return exists
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM articles WHERE url = ? LIMIT 1", (normalized_url,))
+        return c.fetchone() is not None
 
 
 def save_article(url: str, title: str, kb: str) -> bool:
     try:
         # 使用规范化后的 URL 进行保存
         normalized_url = normalize_url(url)
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""
-            INSERT OR IGNORE INTO articles (url, title, knowledge_base, status)
-            VALUES (?, ?, ?, 'success')
-        """, (normalized_url, title, kb))
-        conn.commit()
-        conn.close()
+        # closing 保证异常路径也关闭连接（避免长提取任务里 fd 泄漏）
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT OR IGNORE INTO articles (url, title, knowledge_base, status)
+                VALUES (?, ?, ?, 'success')
+            """, (normalized_url, title, kb))
+            conn.commit()
         return True
     except Exception as e:
         print(f"  ⚠️  保存失败: {e}")
@@ -135,31 +151,44 @@ def save_article(url: str, title: str, kb: str) -> bool:
 
 
 def get_stats() -> Dict:
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM articles")
-    total = c.fetchone()[0]
-    c.execute("SELECT COUNT(DISTINCT knowledge_base) FROM articles")
-    kb_count = c.fetchone()[0]
-    conn.close()
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM articles")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT knowledge_base) FROM articles")
+        kb_count = c.fetchone()[0]
     return {"total": total, "kb_count": kb_count}
 
 
 # ==================== cua-driver ====================
 
 def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
-    """调用 cua-driver tool。click 等命令返回纯文本而非 JSON，统一处理。"""
+    """
+    调用 cua-driver tool，统一处理三种成功响应与失败：
+
+      - JSON 输出 → 解析为 dict
+      - 非 JSON 文本（如 click 的纯文本回复）→ 包装为 {"raw": ...}
+      - 空/仅空白输出（click/scroll 成功时常如此）→ 返回 {}（视为成功，无 payload）
+      - run_cua 抛 RuntimeError（非零退出码）→ 返回 None（调用方据此判失败）
+
+    历史问题：旧实现把空输出当作"无返回"返回 None，导致 click_element 在
+    cua-driver 静默成功时误判失败，触发不必要的 AX Tree re-fetch。
+    """
     try:
         output = run_cua(["call", tool, json.dumps(params)])
-        if output.strip():
-            try:
-                return json.loads(output)
-            except json.JSONDecodeError:
-                # click 等命令返回纯文本，视为成功
-                return {"raw": output.strip()}
     except RuntimeError as e:
         print(f"  ⚠️  cua-driver call {tool} 失败: {e}")
-    return None
+        return None
+
+    stripped = output.strip()
+    if not stripped:
+        # 空 stdout + exit 0：cua-driver 已成功执行，仅无 stdout 输出（click/scroll 常见）
+        return {}
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        # 非 JSON 文本（如 click 返回的 "clicked"），视为成功并包装
+        return {"raw": stripped}
 
 
 def get_window_state(pid: int, window_id: int) -> Optional[Dict]:
@@ -534,6 +563,21 @@ async def main():
     init_database()
     stats = get_stats()
     print(f"✅ 数据库: {DB_FILE} (已有 {stats['total']} 篇)")
+
+    # URL 规范化自检：normalize_url 改格式后，若旧 DB 未迁移，
+    # url_exists 会因新/旧 URL 不一致而判定新文章 → 大量重复入库。
+    # 此处守卫检测未规范 URL 并终止提取，提示先跑 migrate_normalize_urls.py。
+    from ima_common import verify_urls_canonical
+    non_canonical = verify_urls_canonical()
+    if non_canonical:
+        print(f"❌ 检测到 {len(non_canonical)} 行 URL 未规范（normalize_url 口径变更后需迁移）")
+        print(f"   示例: id={non_canonical[0][0]}")
+        print(f"     当前: {non_canonical[0][1][:80]}")
+        print(f"     规范: {non_canonical[0][2][:80]}")
+        print(f"   请先运行: python3 migrate_normalize_urls.py")
+        print(f"   迁移完成后再执行提取，否则会重复入库。")
+        sys.exit(1)
+    print("✅ URL 规范化自检通过")
 
     # 检查 daemon
     if not is_daemon_running():

@@ -8,6 +8,8 @@ IMA 公共模块 — 共享函数和工具
 import json
 import sqlite3
 import subprocess
+from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 # ==================== 配置 ====================
@@ -15,6 +17,19 @@ from pathlib import Path
 CUA_DRIVER = "/Users/berton/.local/bin/cua-driver"
 IMA_APP_NAME = "ima.copilot"
 DB_FILE = Path(__file__).parent / "ima_articles.db"
+
+
+def now_saved_at() -> str:
+    """
+    返回 obsidian_saved_at 列的统一时间戳格式：ISO 8601，秒精度，T 分隔符。
+
+    所有写入 obsidian_saved_at 的代码（saver.mark_saved、reclaim_clippings）
+    都应使用本函数，保证：
+      - 跨写者格式一致（无 T 与 空格 混存）
+      - 可被 datetime.fromisoformat() 在所有 Python 3.7+ 解析
+      - 字典序与时间序一致（便于 ORDER BY 字符串列）
+    """
+    return datetime.now().isoformat(timespec="seconds")
 
 
 # ==================== cua-driver ====================
@@ -41,38 +56,76 @@ def is_daemon_running() -> bool:
 
 
 def init_database():
-    """初始化数据库：建表、索引，并对旧库补齐缺失列（向后兼容）"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE NOT NULL,
-            title TEXT,
-            knowledge_base TEXT,
-            extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            y_position INTEGER,
-            status TEXT DEFAULT 'success',
-            obsidian_saved INTEGER DEFAULT 0,
-            obsidian_saved_at TEXT,
-            published_date TEXT
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_url ON articles(url)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_kb ON articles(knowledge_base)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
-    # 向后兼容：对已有数据库添加缺失的列
-    for col, type_def in [
-        ("obsidian_saved", "INTEGER DEFAULT 0"),
-        ("obsidian_saved_at", "TEXT"),
-        ("published_date", "TEXT"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE articles ADD COLUMN {col} {type_def}")
-        except sqlite3.OperationalError:
-            pass  # 列已存在
-    conn.commit()
-    conn.close()
+    """初始化数据库：建表、索引，并对旧库补齐缺失列（向后兼容）
+
+    closing 保证 ALTER 抛 OperationalError（如 'database is locked'，见 F8）
+    时连接仍被关闭——避免 raise 跳过 close 造成 fd 泄漏。
+    """
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE NOT NULL,
+                title TEXT,
+                knowledge_base TEXT,
+                extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                y_position INTEGER,
+                status TEXT DEFAULT 'success',
+                obsidian_saved INTEGER DEFAULT 0,
+                obsidian_saved_at TEXT,
+                published_date TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_url ON articles(url)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_kb ON articles(knowledge_base)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
+        # 向后兼容：对已有数据库添加缺失的列
+        for col, type_def in [
+            ("obsidian_saved", "INTEGER DEFAULT 0"),
+            ("obsidian_saved_at", "TEXT"),
+            ("published_date", "TEXT"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE articles ADD COLUMN {col} {type_def}")
+            except sqlite3.OperationalError as e:
+                # 仅吞 "duplicate column name"（列已存在的预期兼容场景）；
+                # 其他 OperationalError（database is locked / disk I/O error / no such table）
+                # 必须传播，否则下游 INSERT/SELECT 会在缺列时报 "no such column"，
+                # 根因被静默掩盖，难以排查。
+                if "duplicate column" in str(e).lower():
+                    continue
+                raise
+        conn.commit()
+
+
+def verify_urls_canonical(db_file=None):
+    """
+    自检 articles 表所有 URL 是否已规范化。
+
+    用途：normalize_url 改格式后，旧 DB 里的 URL 在新口径下"未规范"，
+    下次提取会因 url_exists 匹配不到（旧 URL 与新规范 URL 不同）而
+    重复入库。本函数在提取前自检，返回未规范行列表。
+
+    Returns:
+      List[Tuple[int, str, str]] — (id, current_url, canonical_url)
+      空列表表示所有 URL 已规范。
+    """
+    # 局部导入避免循环依赖（ima_ax_extractor 导入 ima_common）
+    from ima_ax_extractor import normalize_url
+
+    db_path = db_file or DB_FILE
+    non_canonical = []
+    with closing(sqlite3.connect(db_path)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, url FROM articles")
+        for aid, url in c.fetchall():
+            if not url:
+                continue
+            canonical = normalize_url(url)
+            if canonical != url:
+                non_canonical.append((aid, url, canonical))
+    return non_canonical
 
 
 def get_ima_main_window():

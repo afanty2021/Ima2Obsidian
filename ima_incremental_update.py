@@ -572,20 +572,20 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
 def count_unsaved_articles(kb_name: str) -> int:
     """统计该知识库未保存到 Obsidian 的微信文章数（含历史漏存，用于决定是否触发保存重试）"""
     import sqlite3
+    from contextlib import closing
     try:
         from ima_common import DB_FILE
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""
-            SELECT COUNT(*) FROM articles
-            WHERE knowledge_base = ?
-              AND status = 'success'
-              AND url LIKE '%mp.weixin.qq.com%'
-              AND (obsidian_saved = 0 OR obsidian_saved IS NULL)
-        """, (kb_name,))
-        count = c.fetchone()[0]
-        conn.close()
-        return count
+        # closing 保证异常路径也关闭连接，避免 launchd 长跑累积 fd 泄漏
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT COUNT(*) FROM articles
+                WHERE knowledge_base = ?
+                  AND status = 'success'
+                  AND url LIKE '%mp.weixin.qq.com%'
+                  AND (obsidian_saved = 0 OR obsidian_saved IS NULL)
+            """, (kb_name,))
+            return c.fetchone()[0]
     except Exception:
         return 0
 
@@ -655,6 +655,16 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
                     log(f"  {line}", print_too=False)
 
         if result.returncode != 0:
+            # 区分守卫失败与一般提取失败：守卫失败时 stdout 含特定提示，
+            # 此时所有 KB 都会失败，短路避免浪费 IMA 激活/导航开销
+            stdout_text = result.stdout or ""
+            if "URL 规范化自检" in stdout_text or "未规范" in stdout_text:
+                log(f"❌ 提取器 URL 规范化守卫触发，短路剩余 KB")
+                log(f"   请先运行: python3 migrate_normalize_urls.py")
+                if result.stderr:
+                    log(f"错误: {result.stderr}")
+                # 用特殊标记让上层 main 终止后续 KB
+                return {"new": 0, "skipped": 0, "failed": 1, "abort_remaining": True}
             log(f"❌ 提取器执行失败")
             if result.stderr:
                 log(f"错误: {result.stderr}")
@@ -746,6 +756,21 @@ def main():
 
     log("✅ cua-driver daemon 运行中")
 
+    # URL 规范化入口自检：避免 normalize_url 改格式后旧 DB 未迁移导致重复入库
+    # extractor 自身也有此守卫，但提前在 incremental 入口检查可短路所有 KB 处理，
+    # 避免在第一个 KB 才发现并浪费 IMA 激活/导航开销
+    if not args.dry_run:
+        from ima_common import verify_urls_canonical
+        non_canonical = verify_urls_canonical()
+        if non_canonical:
+            log(f"❌ 检测到 {len(non_canonical)} 行 URL 未规范（normalize_url 口径变更后需迁移）")
+            log(f"   示例 id={non_canonical[0][0]}:")
+            log(f"     当前: {non_canonical[0][1][:80]}")
+            log(f"     规范: {non_canonical[0][2][:80]}")
+            log(f"   请先运行: python3 migrate_normalize_urls.py")
+            sys.exit(1)
+        log("✅ URL 规范化自检通过")
+
     # 总计统计
     total_new = 0
     total_skipped = 0
@@ -762,6 +787,11 @@ def main():
         total_new += stats["new"]
         total_skipped += stats["skipped"]
         total_kb_failed += stats["failed"]
+
+        # 守卫短路：提取器检测到 URL 未规范，所有 KB 都会失败，跳过剩余
+        if stats.get("abort_remaining"):
+            log(f"⚠️  因 URL 规范化守卫触发，跳过剩余 {len(kbs) - i} 个知识库")
+            break
 
         # 触发保存：有新文章，或该 KB 有历史漏存（之前保存失败/超时未保存）。
         # 后者让失败文章能在后续运行中自动重试，避免 new=0 时永久漏存。

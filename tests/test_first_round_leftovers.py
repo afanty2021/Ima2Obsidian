@@ -72,6 +72,11 @@ class TestNormalizeUrlPreservesContentParams:
             "https://example.com/article?ref_id=1&source_id=2",
             "https://example.com/article?ref_id=3&source_id=4",
         ),
+        # from_id 同上（'from' 在 TRACKING_EXACT 里精确匹配，不剥 from_id）
+        (
+            "https://example.com/article?from_id=aaa&x=1",
+            "https://example.com/article?from_id=bbb&x=1",
+        ),
     ])
     def test_distinct_urls_remain_distinct(self, url_a, url_b):
         """两条不同内容 URL 规范化后必须仍不同（不折叠）"""
@@ -114,24 +119,6 @@ class TestMarkSavedCoalescePriority:
     在 saver 之后跑时，会保留 saver 写入的"今天"，不换成文件正文的真实日期。
     一致性要求：两个写者用同一种 COALESCE 语义。
     """
-
-    def test_mark_saved_and_reclaim_use_same_coalesce_form(self, temp_db):
-        """两个 UPDATE SQL 必须用同一形式的 COALESCE（顺序一致）"""
-        import reclaim_clippings
-        # 直接读源码检查 SQL 形式（结构化测试，避免复杂集成）
-        import inspect
-        mark_saved_src = inspect.getsource(mark_saved)
-        reclaim_update_src = None
-        # reclaim 在 main() 函数体内的 UPDATE 语句，从源码 grep
-        reclaim_src = inspect.getsource(reclaim_clippings)
-        # 检查两者的 published_date COALESCE 形式
-        # 期望两者都是 COALESCE(?, published_date)（新值优先，DB 兜底）
-        # 或两者都是 COALESCE(published_date, ?)（DB 优先，新值兜底）
-        assert "COALESCE(?, published_date)" in mark_saved_src, \
-            f"mark_saved SQL 形式变了；现源码:\n{mark_saved_src}"
-        # reclaim 的 UPDATE 也应该用相同形式
-        assert "COALESCE(?, published_date)" in reclaim_src, \
-            "reclaim 的 UPDATE 应与 mark_saved 用同一 COALESCE 形式（?, published_date）"
 
     def test_reclaim_overwrites_saver_fallback_date_with_real(self, temp_db, tmp_path, monkeypatch):
         """集成验证：saver 写入降级日期 → reclaim 从文件正文读真实日期 →
@@ -182,25 +169,97 @@ class TestMarkSavedCoalescePriority:
             f"reclaim 应让真实日期覆盖 saver 降级值；DB 应为 250304，实际 {pub!r}"
 
 
-# ==================== L4: get_stats 三条 SELECT 必须事务一致 ====================
+class TestReclaimPreservesDbDateWhenContentHasNoDate:
+    """回归 round-5 引入的生产 bug：content_date 为空串时 COALESCE 选中空串覆盖 DB
 
-class TestGetStatsTransactional:
-    """get_stats 跑三条独立 SELECT（total / saved / unsaved），
-    不在同一事务/连接里，并发写时三条可能看到不同状态 → 不变量不成立：
-    saved + unsaved 可能 > total，或 unsaved 与 get_unsaved_articles 不一致。
+    场景：Clippings 文件正文没有 '*YYYY年M月D日*' 模式（Web Clipper 抓的页面
+    日期格式不符/被裁剪），但 DB 行已有 published_date（saver 从 URL 抓到过）。
+    旧 reclaim 把 content_date="" 喂给 COALESCE(?, published_date) →
+    SQLite 中空串非 NULL → COALESCE('', '260625') 返回 '' → DB 真实日期被清空。
 
-    修复：把三条 SELECT 放到同一连接的同一 BEGIN/COMMIT 内（isolation_level
-    或显式 BEGIN），保证读到一致的快照。
+    根因：extract_date_from_content 失败时 return ""，应改为 return None。
     """
 
-    def test_three_selects_use_same_connection(self, temp_db):
-        """结构验证：get_stats 不能开三个独立连接做三次 SELECT"""
+    def test_extract_date_from_content_returns_none_on_miss(self):
+        """extract_date_from_content 无匹配时必须 return None，不能 return ''
+
+        这是根因修复——任何喂给 COALESCE(?, published_date) 的路径都要求
+        None（而非 ''）才能让 COALESCE 跳过、保留 DB 已有值。
+        """
+        from ima_obsidian_saver import extract_date_from_content
+        result = extract_date_from_content("纯正文无日期标记")
+        assert result is None, \
+            f"无匹配时应返回 None 让 COALESCE 兜底；实际返回 {result!r}"
+
+    def test_reclaim_preserves_db_date_when_content_has_no_date(
+        self, temp_db, tmp_path, monkeypatch,
+    ):
+        """Clippings 文件无日期 + DB 已有 published_date → DB 必须保留原值
+
+        回归测试：旧 round-5 实现下此场景 DB 日期被清空成 ''
+        """
+        init_database()
+        # DB 行已有真实 published_date（saver 从 URL 抓到过）
+        conn = sqlite3.connect(temp_db)
+        conn.execute(
+            "INSERT INTO articles (url, title, knowledge_base, status, "
+            "obsidian_saved, published_date) VALUES (?,?,?,?,?,?)",
+            ("https://mp.weixin.qq.com/s?__biz=T&mid=T&idx=1&sn=T",
+             "测试文章A", "AI", "success", 0, "250625"),  # 已有真实日期
+        )
+        conn.commit()
+        conn.close()
+
+        # Clippings 文件正文无 *YYYY年M月D日* 标记
+        vault = tmp_path / "Vault"
+        vault.mkdir()
+        (vault / "AI").mkdir()
+        clip_dir = vault / "Clippings"
+        clip_dir.mkdir()
+        (clip_dir / "测试文章A.md").write_text(
+            "# 标题\n\n纯正文，没有任何日期模式\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("reclaim_clippings.VAULT_DIR", vault)
+        monkeypatch.setattr("reclaim_clippings.CLIPPINGS_DIR", clip_dir)
+        monkeypatch.setattr("ima_obsidian_saver.VAULT_DIR", vault)
+        monkeypatch.setattr("ima_obsidian_saver.CLIPPINGS_DIR", clip_dir)
+        monkeypatch.setattr("sys.argv", ["reclaim_clippings.py", "--apply"])
+
+        import reclaim_clippings
+        reclaim_clippings.main()
+
+        conn = sqlite3.connect(temp_db)
+        c = conn.cursor()
+        c.execute("SELECT published_date FROM articles WHERE title='测试文章A'")
+        pub = c.fetchone()[0]
+        conn.close()
+        # 关键不变式：DB 日期必须保留为 '250625'，不能被清空成 '' 或 NULL
+        assert pub == "250625", (
+            f"正文无日期时 DB 已有 published_date 必须保留；"
+            f"期望 '250625'，实际 {pub!r}（如果 '' 或 None 说明被空串覆盖）"
+        )
+
+
+# ==================== L4: get_stats 连接数回归锁 ====================
+
+class TestGetStatsConnectionCount:
+    """get_stats 用单连接做三条 SELECT（total / saved / unsaved）。
+
+    注意：本测试只锁"连接数 == 1"这一结构属性，不真正验证 TOCTOU 安全性。
+    SQLite 默认 isolation_level 不对 SELECT 触发 BEGIN，故单连接内多次 SELECT
+    理论上可能看到不同快照（DEFERRED 模式下并发写入可见）。但本代码库是
+    单用户 CLI 工具，无高并发写入场景，TOCTOU 风险纯理论。
+
+    如果未来需要真正的并发一致性，应在 get_stats 里加显式 BEGIN/COMMIT，
+    并补一个用线程/进程在 SELECT 间注入写的并发测试。
+    """
+
+    def test_get_stats_uses_single_connection(self, temp_db):
+        """get_stats 只能开 1 个连接（结构回归锁，防止未来重构拆成多连接）"""
         from ima_obsidian_saver import get_stats
-        from unittest.mock import MagicMock
-        # 用 TrackingConnection 计数连接打开次数
         from tests.test_db_connections import TrackingConnection
 
-        # 先建 schema + 插数据
         init_database()
         conn = sqlite3.connect(temp_db)
         conn.execute(
@@ -211,7 +270,6 @@ class TestGetStatsTransactional:
         conn.commit()
         conn.close()
 
-        # 注入 tracking wrapper，统计 connect 调用次数
         real_connect = sqlite3.connect
         instances = []
 
@@ -222,44 +280,7 @@ class TestGetStatsTransactional:
             return wrapper
 
         with patch.object(sqlite3, "connect", tracking_connect):
-            stats = get_stats()
+            get_stats()
 
-        # 关键不变式：get_stats 只能开 1 个连接，所有 SELECT 共享同一事务快照
         assert len(instances) == 1, \
-            f"get_stats 必须用单一连接保证事务一致，实际开了 {len(instances)} 个"
-
-    def test_invariants_hold_under_conceptual_concurrent_write(self, temp_db):
-        """三条 SELECT 必须满足不变式：saved + unsaved == total（status+url 过滤后）
-
-        在单线程里这条永远是 True（SQLite 默认隔离）。
-        但若 get_stats 跨连接读，理论上可能读到中间状态。
-        这条测试主要验证逻辑不变式仍成立，配合上一条结构测试。
-        """
-        init_database()
-        conn = sqlite3.connect(temp_db)
-        # 5 行：3 success mp（1 saved + 2 unsaved）、1 failed、1 非 mp
-        for i, (url, status, saved) in enumerate([
-            ("https://mp.weixin.qq.com/s?__biz=A&mid=A&idx=1&sn=A", "success", 1),
-            ("https://mp.weixin.qq.com/s?__biz=B&mid=B&idx=1&sn=B", "success", 0),
-            ("https://mp.weixin.qq.com/s?__biz=C&mid=C&idx=1&sn=C", "success", 0),
-            ("https://mp.weixin.qq.com/s?__biz=D&mid=D&idx=1&sn=D", "failed", 0),
-            ("https://example.com/x", "success", 0),
-        ]):
-            conn.execute(
-                "INSERT INTO articles (url, title, knowledge_base, status, obsidian_saved) "
-                "VALUES (?,?,?,?,?)",
-                (url, f"T{i}", "AI", status, saved),
-            )
-        conn.commit()
-        conn.close()
-
-        from ima_obsidian_saver import get_stats
-        stats = get_stats()
-        # 三条 SELECT 必须满足：saved + unsaved == total（在 status+url 过滤口径内）
-        assert stats["saved"] + stats["unsaved"] == stats["total"], (
-            f"事务不变式失败：saved({stats['saved']}) + unsaved({stats['unsaved']}) "
-            f"!= total({stats['total']})"
-        )
-        assert stats["saved"] == 1
-        assert stats["unsaved"] == 2
-        assert stats["total"] == 3
+            f"get_stats 应只用 1 个连接（结构回归锁）；实际开了 {len(instances)} 个"

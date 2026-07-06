@@ -36,6 +36,7 @@ import time
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import requests
 
@@ -129,8 +130,17 @@ def extract_publish_date(url: str) -> str:
     return datetime.now().strftime("%y%m%d")
 
 
-def extract_date_from_content(text: str) -> str:
-    """从 Web Clipper 保存的文章正文提取发布日期（如 *2026年6月25日 10:00*），返回 YYMMDD 或空串"""
+def extract_date_from_content(text: str) -> Optional[str]:
+    """从 Web Clipper 保存的文章正文提取发布日期（如 *2026年6月25日 10:00*）
+
+    Returns:
+        YYMMDD 字符串；正文无匹配模式时返回 None（不是空串）。
+
+        契约要求：调用方把返回值喂给 SQL COALESCE(?, published_date) 时，
+        必须传 None（而非 ""）才能让 COALESCE 跳过保留 DB 已有值——
+        SQLite 中空串非 NULL，COALESCE('', 'fallback') 会选中空串覆盖 DB。
+        本函数的历史 bug 是返回 "" 导致 reclaim 把 DB 已有真实日期清空。
+    """
     m = re.search(r'\*(\d{4})年(\d{1,2})月(\d{1,2})日', text)
     if m:
         try:
@@ -138,7 +148,7 @@ def extract_date_from_content(text: str) -> str:
             return dt.strftime("%y%m%d")
         except ValueError:
             pass
-    return ""
+    return None
 
 
 def sanitize_filename(title: str) -> str:

@@ -62,3 +62,24 @@ def test_mark_saved_idempotent_on_retry(seeded_db):
     row = fetch_row(seeded_db, 2)
     assert row[0] == 1
     assert row[2] == "260101", "重试不应清空 published_date"
+
+
+def test_mark_saved_overwrites_fallback_date_with_real(seeded_db):
+    """saver 重跑同篇时，真实日期应覆盖上一次的降级日期
+
+    场景：saver 第一次跑时 extract_publish_date 正则全 miss，降级为"今天"
+    写入 DB；后因 obsidian_saved 被重置（手动编辑/bug）触发 saver 重跑，
+    第二次 extract_publish_date 命中正则得到真实日期 → mark_saved 应让
+    真实日期覆盖降级值。这是 COALESCE(?, published_date) 在 DB 已有非空值
+    时的覆盖契约——传入非 None 必须覆盖。
+    """
+    # 第一次：降级日期写入
+    mark_saved(2, published_date="260701")  # 降级为今天
+    assert fetch_row(seeded_db, 2)[2] == "260701"
+
+    # 第二次：真实日期覆盖
+    mark_saved(2, published_date="250304")  # 真实日期
+    row = fetch_row(seeded_db, 2)
+    assert row[2] == "250304", (
+        f"saver 重跑时真实日期应覆盖降级值；期望 250304，实际 {row[2]!r}"
+    )

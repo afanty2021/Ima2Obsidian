@@ -72,10 +72,19 @@ class TestNormalizeUrlPreservesContentParams:
             "https://example.com/article?ref_id=1&source_id=2",
             "https://example.com/article?ref_id=3&source_id=4",
         ),
-        # from_id 同上（'from' 在 TRACKING_EXACT 里精确匹配，不剥 from_id）
+        # from_id 同上（'from' 在 TRACKING_EXACT 精确匹配，不剥 from_id）
         (
             "https://example.com/article?from_id=aaa&x=1",
             "https://example.com/article?from_id=bbb&x=1",
+        ),
+        # scene_id / share_id 同理（'scene'/'share' 精确匹配，不剥 _id 变体）
+        (
+            "https://example.com/article?scene_id=111",
+            "https://example.com/article?scene_id=222",
+        ),
+        (
+            "https://example.com/article?share_id=aaa",
+            "https://example.com/article?share_id=bbb",
         ),
     ])
     def test_distinct_urls_remain_distinct(self, url_a, url_b):

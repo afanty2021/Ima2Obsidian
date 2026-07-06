@@ -79,50 +79,61 @@ def migrate_urls(db_file=None):
         #    去重时必须先把 obsidian_saved/obsidian_saved_at/published_date 合并到
         #    保留行，再 DELETE 重复行。否则可能把"已保存"行删掉、留下未规范行的
         #    "未保存"状态 → vault 里 .md 已存在但 DB 标 unsaved → 永久漏存。
+        #    整个 for 循环在 try 内：'database is locked' 等异常命中 SELECT/UPDATE/DELETE
+        #    任一语句时，closing 自动回滚整批 UPDATE/DELETE，避免半完成状态。
         print("4. 开始迁移...")
         success_count = 0
+        merged_count = 0  # 合并去重的行数（不是错误，单独维度）
         error_count = 0
 
-        for m in migrations:
-            try:
-                c.execute("""
-                    UPDATE articles
-                    SET url = ?
-                    WHERE id = ?
-                """, (m['new_url'], m['id']))
-                success_count += 1
-            except sqlite3.IntegrityError:
-                # 规范化后 URL 与已有行冲突：先把当前行的元数据合并到保留行
-                # （保留行 = 已有 url=m['new_url'] 的行），再 DELETE 当前行
-                c.execute(
-                    "SELECT obsidian_saved, obsidian_saved_at, published_date "
-                    "FROM articles WHERE id = ?",
-                    (m['id'],),
-                )
-                del_row = c.fetchone()
-                if del_row:
-                    del_saved, del_saved_at, del_pub = del_row
-                    # 合并到保留行：
-                    #   obsidian_saved: 1 wins（任一为 1 则保留行为 1）
-                    #   obsidian_saved_at: 保留行优先（COALESCE(keeper, victim)）
-                    #   published_date: 保留行优先
+        try:
+            for m in migrations:
+                try:
+                    c.execute("""
+                        UPDATE articles
+                        SET url = ?
+                        WHERE id = ?
+                    """, (m['new_url'], m['id']))
+                    success_count += 1
+                except sqlite3.IntegrityError:
+                    # 规范化后 URL 与已有行冲突：先把当前行的元数据合并到保留行
+                    # （保留行 = 已有 url=m['new_url'] 的行），再 DELETE 当前行
                     c.execute(
-                        "UPDATE articles SET "
-                        "obsidian_saved = MAX(COALESCE(?, 0), COALESCE(obsidian_saved, 0)), "
-                        "obsidian_saved_at = COALESCE(obsidian_saved_at, ?), "
-                        "published_date = COALESCE(published_date, ?) "
-                        "WHERE url = ? AND id != ?",
-                        (del_saved, del_saved_at, del_pub, m['new_url'], m['id']),
+                        "SELECT obsidian_saved, obsidian_saved_at, published_date "
+                        "FROM articles WHERE id = ?",
+                        (m['id'],),
                     )
-                c.execute("DELETE FROM articles WHERE id = ?", (m['id'],))
-                print(f"   ℹ️  ID {m['id']} 规范化后与保留行重复，已合并元数据并删除")
-                error_count += 1
-            except Exception as e:
-                print(f"   ❌ 迁移失败 ID {m['id']}: {e}")
-                error_count += 1
+                    del_row = c.fetchone()
+                    if del_row:
+                        del_saved, del_saved_at, del_pub = del_row
+                        # 合并到保留行：
+                        #   obsidian_saved: 1 wins（任一为 1 则保留行为 1）
+                        #   obsidian_saved_at: 保留行优先（COALESCE(keeper, victim)）
+                        #   published_date: 保留行优先
+                        c.execute(
+                            "UPDATE articles SET "
+                            "obsidian_saved = MAX(COALESCE(?, 0), COALESCE(obsidian_saved, 0)), "
+                            "obsidian_saved_at = COALESCE(obsidian_saved_at, ?), "
+                            "published_date = COALESCE(published_date, ?) "
+                            "WHERE url = ? AND id != ?",
+                            (del_saved, del_saved_at, del_pub, m['new_url'], m['id']),
+                        )
+                    c.execute("DELETE FROM articles WHERE id = ?", (m['id'],))
+                    merged_count += 1
+                    print(f"   ℹ️  ID {m['id']} 规范化后与保留行重复，已合并元数据并删除")
+                # 注意：不再有 except Exception — 'database is locked' 等其他 sqlite3.Error
+                # 必须穿透到外层 except sqlite3.Error，触发 rollback 让本次迁移原子失败，
+                # 避免半完成状态。其他真异常（KeyError 等）也照常穿透、由调用栈处理。
+        except sqlite3.Error as e:
+            # 锁冲突 / 磁盘 I/O 等：closing 会自动 rollback，本次迁移失败但不会留半完成状态
+            print(f"   ❌ 迁移中断（{e}）；已成功的 UPDATE/DELETE 已回滚，请重试")
+            conn.rollback()
+            raise
 
         conn.commit()
         print(f"   ✅ 成功: {success_count} 条")
+        if merged_count > 0:
+            print(f"   🔀 合并去重: {merged_count} 条（不算失败）")
         if error_count > 0:
             print(f"   ❌ 失败: {error_count} 条")
         print()

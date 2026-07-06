@@ -72,6 +72,9 @@ class TrackingConnection:
             raise exc
         return self._real.commit()
 
+    def rollback(self):
+        return self._real.rollback()
+
     def execute(self, *args, **kwargs):
         return self._real.execute(*args, **kwargs)
 

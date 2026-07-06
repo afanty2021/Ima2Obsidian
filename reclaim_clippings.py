@@ -40,17 +40,21 @@ def mtime_yymmd(p: Path) -> str:
     return datetime.fromtimestamp(p.stat().st_mtime).strftime("%y%m%d")
 
 
-def _safe_rename_back(dst: Path, src: Path):
-    """把文件从 dst 移回 src（回滚用），失败时打印 dead-letter 提示。
+def _safe_rename_back(dst: Path, src: Path) -> list:
+    """把文件从 dst 移回 src（回滚用），失败时打印 dead-letter 提示并返回失败元组。
 
     dst: 当前所在位置（如 vault/AI/260102 文章.md）
     src: 要移回的原位置（如 vault/Clippings/文章.md）
 
     回滚失败通常意味着文件系统层面的问题（磁盘满 / 权限丢失 / 路径不存在），
     必须明确打印两个路径让运维介入；静默吞掉会导致文件位置不可知且永久漏存。
+
+    Returns:
+      [] 成功；[(dst, src, err_str), ...] 失败（供调用方汇总 dead-letter）
     """
     try:
         dst.rename(src)
+        return []
     except OSError as rollback_err:
         print(
             f"  ❌ 回滚失败！文件位置不可知，需要手动恢复：\n"
@@ -58,6 +62,7 @@ def _safe_rename_back(dst: Path, src: Path):
             f"     目标位置: {src}\n"
             f"     错误    : {rollback_err}"
         )
+        return [(dst, src, str(rollback_err))]
 
 
 def main():
@@ -144,46 +149,62 @@ def main():
             print(f"  {flag} {f.stem[:38]!s:40} → {kb}/{target_name[:46]}")
 
         # 4. 执行（仅 --apply）
-        #    rename 与 UPDATE 必须保持一致。三类失败需要回滚：
+        #    rename 与 UPDATE 必须保持一致。四类失败需要回滚：
         #      (a) UPDATE 单条失败 → 回滚该条 rename
         #      (b) commit() 失败 → SQLite 自动回滚 UPDATE，但 rename 需手动全量回滚
-        #      (c) 回滚 rename 也失败（磁盘满 / 权限）→ dead-letter，明确打印路径让运维介入
+        #      (c) 任何其他异常（如运维 Ctrl+C 即 KeyboardInterrupt）穿透循环
+        #          → 已 rename 的 renamed_pairs 必须全量回滚，否则文件滞留 KB
+        #      (d) 回滚 rename 也失败（磁盘满 / 权限）→ dead-letter，打印 src/dst/错误
         #    否则文件滞留 KB 而 DB 仍 unsaved → 下次 reclaim 因 conflict 分支跳过 → 永久漏存
         moved, marked = 0, 0
-        renamed_pairs = []  # [(src_path, dst_path), ...] 已成功的 rename，供 commit 失败回滚
+        rollback_failures = []  # 回滚 rename 失败的 (src, dst, err)，供 dead-letter 汇总
+        renamed_pairs = []  # [(src_path, dst_path), ...] 已成功的 rename，供全量回滚
+        committed = False
         if args.apply:
-            for f, target, aid, date_str in matched:
-                try:
-                    f.rename(target)
-                except OSError as e:
-                    print(f"  ⚠️ 移动失败 {f.name}: {e}")
-                    continue
-                renamed_pairs.append((f, target))
-
-                try:
-                    c.execute(
-                        "UPDATE articles SET obsidian_saved=1, obsidian_saved_at=?, "
-                        "published_date=COALESCE(published_date,?) WHERE id=?",
-                        (now_saved_at(), date_str, aid),
-                    )
-                except sqlite3.Error as e:
-                    # (a) UPDATE 单条失败：回滚该条 rename
-                    print(f"  ⚠️ UPDATE 失败 {f.name}: {e}，回滚文件到 Clippings")
-                    renamed_pairs.pop()  # 这条没保住，从已成功列表移除
-                    _safe_rename_back(target, f)
-                    continue
-                moved += 1
-                marked += 1
-
-            # commit 阶段：失败则全量回滚
             try:
-                conn.commit()
-            except sqlite3.Error as e:
-                print(f"  ❌ commit 失败：{e}，开始全量回滚 {len(renamed_pairs)} 个文件到 Clippings")
-                for src, dst in renamed_pairs:
-                    _safe_rename_back(dst, src)
-                moved = 0
-                marked = 0
+                for f, target, aid, date_str in matched:
+                    try:
+                        f.rename(target)
+                    except OSError as e:
+                        print(f"  ⚠️ 移动失败 {f.name}: {e}")
+                        continue
+                    renamed_pairs.append((f, target))
+
+                    try:
+                        c.execute(
+                            "UPDATE articles SET obsidian_saved=1, obsidian_saved_at=?, "
+                            "published_date=COALESCE(published_date,?) WHERE id=?",
+                            (now_saved_at(), date_str, aid),
+                        )
+                    except sqlite3.Error as e:
+                        # (a) UPDATE 单条失败：回滚该条 rename
+                        print(f"  ⚠️ UPDATE 失败 {f.name}: {e}，回滚文件到 Clippings")
+                        renamed_pairs.pop()  # 这条没保住，从已成功列表移除
+                        rollback_failures.extend(_safe_rename_back(target, f))
+                        continue
+                    moved += 1
+                    marked += 1
+
+                # commit 阶段：失败则全量回滚
+                try:
+                    conn.commit()
+                    committed = True
+                except sqlite3.Error as e:
+                    print(f"  ❌ commit 失败：{e}，开始全量回滚 {len(renamed_pairs)} 个文件到 Clippings")
+                    for src, dst in renamed_pairs:
+                        rollback_failures.extend(_safe_rename_back(dst, src))
+                    moved = 0
+                    marked = 0
+            except BaseException as e:
+                # (c) 任何未预期异常（最现实：Ctrl+C 即 KeyboardInterrupt）穿透 for/commit
+                #     已 rename 的必须全量回滚，避免文件滞留 KB 文件夹
+                print(f"  ❌ reclaim 中断（{type(e).__name__}: {e}），回滚已 rename 文件")
+                if not committed:
+                    for src, dst in renamed_pairs:
+                        rollback_failures.extend(_safe_rename_back(dst, src))
+                    moved = 0
+                    marked = 0
+                raise
 
     # 5. 汇总
     print("=" * 60)
@@ -193,6 +214,14 @@ def main():
     print(f"目标已存在，跳过避免覆盖: {len(conflict)}")
     if args.apply:
         print(f"实际移动文件: {moved} | 标记已保存: {marked}")
+        # dead-letter 汇总：commit/异常回滚时若有 rename 也失败，必须明确提示
+        # （这些文件位置不可知，且下次 reclaim 因 conflict 跳过 → 永久漏存）
+        if rollback_failures:
+            print(f"  ⚠️  {len(rollback_failures)} 个文件回滚失败（位置不可知，需手动恢复）：")
+            for dst, src, err in rollback_failures:
+                print(f"     - 当前: {dst}")
+                print(f"       目标: {src}")
+                print(f"       错误: {err}")
 
 
 if __name__ == "__main__":

@@ -655,16 +655,6 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
                     log(f"  {line}", print_too=False)
 
         if result.returncode != 0:
-            # 区分守卫失败与一般提取失败：守卫失败时 stdout 含特定提示，
-            # 此时所有 KB 都会失败，短路避免浪费 IMA 激活/导航开销
-            stdout_text = result.stdout or ""
-            if "URL 规范化自检" in stdout_text or "未规范" in stdout_text:
-                log(f"❌ 提取器 URL 规范化守卫触发，短路剩余 KB")
-                log(f"   请先运行: python3 migrate_normalize_urls.py")
-                if result.stderr:
-                    log(f"错误: {result.stderr}")
-                # 用特殊标记让上层 main 终止后续 KB
-                return {"new": 0, "skipped": 0, "failed": 1, "abort_remaining": True}
             log(f"❌ 提取器执行失败")
             if result.stderr:
                 log(f"错误: {result.stderr}")
@@ -756,11 +746,16 @@ def main():
 
     log("✅ cua-driver daemon 运行中")
 
-    # URL 规范化入口自检：避免 normalize_url 改格式后旧 DB 未迁移导致重复入库
-    # extractor 自身也有此守卫，但提前在 incremental 入口检查可短路所有 KB 处理，
-    # 避免在第一个 KB 才发现并浪费 IMA 激活/导航开销
+    # URL 规范化入口自检：避免 normalize_url 改格式后旧 DB 未迁移导致重复入库。
+    # 必须先 init_database 自建 schema（fresh DB / 首次安装 / DB 被删场景），
+    # 否则 verify_urls_canonical 在空 DB 上抛 'no such table: articles'。
+    # 此处守卫是唯一的"未规范 DB 短路"机制——update_knowledge_base 内不再做
+    # 基于 stdout 子串的判定（守卫-通过行 '✅ URL 规范化自检通过' 含相同子串，
+    # 会让 extractor 后续任何 exit 1（daemon/窗口/AX 失败）被误判为守卫触发，
+    # 静默跳过剩余 KB）。
     if not args.dry_run:
-        from ima_common import verify_urls_canonical
+        from ima_common import init_database, verify_urls_canonical
+        init_database()
         non_canonical = verify_urls_canonical()
         if non_canonical:
             log(f"❌ 检测到 {len(non_canonical)} 行 URL 未规范（normalize_url 口径变更后需迁移）")
@@ -787,11 +782,6 @@ def main():
         total_new += stats["new"]
         total_skipped += stats["skipped"]
         total_kb_failed += stats["failed"]
-
-        # 守卫短路：提取器检测到 URL 未规范，所有 KB 都会失败，跳过剩余
-        if stats.get("abort_remaining"):
-            log(f"⚠️  因 URL 规范化守卫触发，跳过剩余 {len(kbs) - i} 个知识库")
-            break
 
         # 触发保存：有新文章，或该 KB 有历史漏存（之前保存失败/超时未保存）。
         # 后者让失败文章能在后续运行中自动重试，避免 new=0 时永久漏存。

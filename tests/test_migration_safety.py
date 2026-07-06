@@ -235,6 +235,91 @@ class TestMigrateMetadataPreservation:
         assert saved_at == "2025-06-01T00:00:00", f"保留行元数据应优先，实际 {saved_at!r}"
         assert pub == "250601", f"保留行 published_date 应优先，实际 {pub!r}"
 
+    def test_migrate_reports_merged_separately_not_as_error(self, temp_db, capsys):
+        """成功的合并去重不应被算作 error_count（避免汇总误导运维）
+
+        回归 #6：旧实现 merged 行 error_count += 1，汇总打 '失败: 1 条'，
+        让运维以为有真失败。应单列 merged_count。
+        """
+        init_database()
+        conn = sqlite3.connect(temp_db)
+        conn.execute(
+            "INSERT INTO articles (url, title, status, obsidian_saved, published_date) "
+            "VALUES (?,?,?,?,?)",
+            ("https://mp.weixin.qq.com/s?sn=S&idx=1&mid=M&__biz=B",
+             "T", "success", 1, "250101"),
+        )
+        conn.execute(
+            "INSERT INTO articles (url, title, status, obsidian_saved, published_date) "
+            "VALUES (?,?,?,?,?)",
+            ("https://mp.weixin.qq.com/s?__biz=B&mid=M&idx=1&sn=S",
+             "T-dup", "success", 0, None),
+        )
+        conn.commit()
+        conn.close()
+
+        from migrate_normalize_urls import migrate_urls
+        migrate_urls()
+        out = capsys.readouterr().out
+
+        # 必须有合并计数；不应报告失败
+        assert "合并去重: 1" in out, f"应单列合并计数，实际输出: {out!r}"
+        # 关键不变式：成功的合并去重不应被算作失败
+        assert "失败: 0 条" in out or "失败:" not in out, \
+            f"合并成功不应计入失败，实际输出: {out!r}"
+
+    def test_migrate_locked_db_rolls_back_cleanly(self, temp_db, capsys, monkeypatch):
+        """'database is locked' 命中迁移中任一语句时，整批 UPDATE/DELETE 必须回滚
+
+        回归 #3：旧实现碰撞处理 UPDATE/DELETE 没有 try，'database is locked'
+        直接穿透 for 循环、跳过 commit，closing 回滚整批——但日志只打顶层 traceback，
+        没明确告诉运维"已回滚，请重试"。
+        """
+        init_database()
+        # 插若干行需要迁移的旧格式 URL
+        conn = sqlite3.connect(temp_db)
+        for i in range(5):
+            conn.execute(
+                "INSERT INTO articles (url, title, status) VALUES (?,?,?)",
+                (f"https://mp.weixin.qq.com/s?sn=S{i}&idx=1&mid=M{i}&__biz=B{i}",
+                 f"T{i}", "success"),
+            )
+        conn.commit()
+        conn.close()
+
+        # 用 TrackingConnection 让 UPDATE 抛 'database is locked'
+        from tests.test_db_connections import TrackingConnection
+        real_connect = sqlite3.connect
+
+        def faulty_connect(*args, **kwargs):
+            real = real_connect(*args, **kwargs)
+            wrapper = TrackingConnection(real)
+            wrapper.set_failure_on_sql("UPDATE", sqlite3.OperationalError("database is locked"))
+            return wrapper
+
+        with monkeypatch.context() as m:
+            m.setattr(sqlite3, "connect", faulty_connect)
+            from migrate_normalize_urls import migrate_urls
+            with pytest.raises(sqlite3.OperationalError):
+                migrate_urls()
+
+        out = capsys.readouterr().out
+        # 必须明确告知运维"已回滚"
+        assert "已回滚" in out or "回滚" in out, \
+            f"locked DB 中断时应明确提示已回滚，实际: {out!r}"
+
+        # 验证 DB 状态：所有原始 URL 仍存在（未半完成）
+        conn = sqlite3.connect(temp_db)
+        c = conn.cursor()
+        c.execute("SELECT url FROM articles ORDER BY url")
+        urls = [r[0] for r in c.fetchall()]
+        conn.close()
+        # 5 行原始数据应全部保留（无 UPDATE 成功）
+        assert len(urls) == 5, f"回滚后应保留全部 5 行，实际: {len(urls)}"
+        # 所有 URL 应保持原状（未规范），便于重试
+        for u in urls:
+            assert "sn=S" in u, f"URL 应保持原状（未规范），实际: {u}"
+
 
 class TestExtractorGuard:
     """extractor 启动时必须自检 URL 规范化，未迁移则非零退出（避免重复入库）"""

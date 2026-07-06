@@ -191,6 +191,18 @@ class TestReclaimPreservesDbDateWhenContentHasNoDate:
         assert result is None, \
             f"无匹配时应返回 None 让 COALESCE 兜底；实际返回 {result!r}"
 
+    def test_extract_date_from_content_returns_none_on_value_error(self):
+        """正则匹配但 datetime() 抛 ValueError（如 *2026年13月45日*）时也必须 return None
+
+        覆盖第二条失败出口：try/except ValueError 分支。
+        若有人误改成 return '' 或删 try 让 ValueError 穿透崩溃，本测试拦住。
+        """
+        from ima_obsidian_saver import extract_date_from_content
+        # 月=13、日=45 触发 datetime() ValueError
+        result = extract_date_from_content("正文\n*2026年13月45日 10:00*\n")
+        assert result is None, \
+            f"ValueError 分支应返回 None；实际 {result!r}"
+
     def test_reclaim_preserves_db_date_when_content_has_no_date(
         self, temp_db, tmp_path, monkeypatch,
     ):
@@ -231,13 +243,19 @@ class TestReclaimPreservesDbDateWhenContentHasNoDate:
 
         conn = sqlite3.connect(temp_db)
         c = conn.cursor()
-        c.execute("SELECT published_date FROM articles WHERE title='测试文章A'")
-        pub = c.fetchone()[0]
+        c.execute("SELECT published_date, obsidian_saved FROM articles WHERE title='测试文章A'")
+        pub, saved = c.fetchone()
         conn.close()
-        # 关键不变式：DB 日期必须保留为 '250625'，不能被清空成 '' 或 NULL
+        # 关键不变式 1：DB 日期必须保留为 '250625'，不能被清空成 '' 或 NULL
         assert pub == "250625", (
             f"正文无日期时 DB 已有 published_date 必须保留；"
             f"期望 '250625'，实际 {pub!r}（如果 '' 或 None 说明被空串覆盖）"
+        )
+        # 关键不变式 2：reclaim 必须确实跑了（obsidian_saved=1），
+        # 否则该测试无法区分"修复生效"与"reclaim 因标题匹配失败没碰 DB"
+        assert saved == 1, (
+            f"reclaim 应标记 obsidian_saved=1；实际 {saved}（若为 0 说明 reclaim "
+            f"没匹配到该文章，DB 未被触碰，'保留原值' 只是没改而非修复生效）"
         )
 
 
@@ -280,7 +298,11 @@ class TestGetStatsConnectionCount:
             return wrapper
 
         with patch.object(sqlite3, "connect", tracking_connect):
-            get_stats()
+            stats = get_stats()
 
+        # 结构回归锁 1：只用 1 个连接（防未来重构拆成多连接）
         assert len(instances) == 1, \
             f"get_stats 应只用 1 个连接（结构回归锁）；实际开了 {len(instances)} 个"
+        # 结构回归锁 2：返回值正确（零成本消除"调了不验证"的被动孪生）
+        assert stats == {"total": 1, "saved": 0, "unsaved": 1}, \
+            f"get_stats 返回值应为 1/0/1；实际 {stats}"

@@ -322,8 +322,9 @@ def cmd_w_close(article_url: Optional[str] = None, max_retries: int = 2) -> bool
     后台 keystroke，校验失败再激活 IMA 重试。
 
     校验判据：传入 article_url 时，关闭后 extract_url_ax() 不再返回该 URL 即视为
-    已关闭（实测 IMA 关闭文章标签后 AXDocument 立即变 None）。未传时退化为不校验，
-    保持与旧行为兼容（仅发一次 keystroke）。
+    已关闭（实测 IMA 关闭文章标签后 AXDocument 立即变 None）。未传时用"仍有任意
+    文章标签"判据（extract_url_ax() 非 None），保证 URL 提取失败时也校验+激活
+    重试，避免标签堆积。
     """
     def send_cmd_w():
         subprocess.run(
@@ -334,10 +335,10 @@ def cmd_w_close(article_url: Optional[str] = None, max_retries: int = 2) -> bool
         )
 
     def still_open() -> bool:
-        if not article_url:
-            return False  # 无判据不校验，假定已关
         time.sleep(WAIT_AFTER_CLOSE)
-        return extract_url_ax() == article_url
+        if article_url:
+            return extract_url_ax() == article_url   # 已知 URL：精确比对
+        return extract_url_ax() is not None           # 未知 URL：仍有任意文章标签 → 未关
 
     # 第 1 次：后台 keystroke（不激活，减少对用户的干扰）
     send_cmd_w()

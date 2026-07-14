@@ -45,7 +45,7 @@ from ima_common import DB_FILE, init_database, now_saved_at
 
 # ==================== 配置 ====================
 
-VAULT_DIR = Path("/Users/berton/Documents/Obsidian Vault")
+VAULT_DIR = Path("/Users/berton/Obsidian Vault")
 CLIPPINGS_DIR = VAULT_DIR / "Clippings"
 
 # 浏览器快捷键映射
@@ -583,6 +583,18 @@ def main():
     print("\n" + "=" * 60)
     print("IMA 微信文章 → Obsidian 自动保存器")
     print("=" * 60)
+
+    # fail-loud: 启动即校验 Vault 可读。glob() 遇 PermissionError 会静默返回空，
+    # 无此校验时 ~/Documents 的 TCC 权限丢失会伪装成"每篇未找到文件"（曾静默故障一周）。
+    try:
+        next(VAULT_DIR.iterdir())
+    except PermissionError:
+        print(f"\n❌ 无权限读取 Obsidian Vault: {VAULT_DIR}", file=sys.stderr)
+        print("   请在「系统设置 > 隐私与安全性 > 完全磁盘访问」中授权 /usr/bin/python3。", file=sys.stderr)
+        print("   （~/Documents 受 TCC 保护；glob 静默吞权限错，致认领永远空、每篇误判未找到）", file=sys.stderr)
+        sys.exit(1)
+    except StopIteration:
+        pass  # Vault 空但可读，放行
 
     init_database()
     stats = get_stats(args.kb)

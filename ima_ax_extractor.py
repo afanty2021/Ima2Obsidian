@@ -314,15 +314,47 @@ return ""
 
 
 
-def cmd_w_close():
-    """Cmd+W 关闭当前文章标签页（后台方式，不激活应用）"""
-    # 直接向 IMA 进程发送 keystroke，无需激活应用
-    subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to tell process "ima.copilot" to keystroke "w" using command down'],
-        capture_output=True, timeout=5
-    )
-    time.sleep(0.3)
+def cmd_w_close(article_url: Optional[str] = None, max_retries: int = 2) -> bool:
+    """Cmd+W 关闭当前文章标签页，校验+重试，返回是否确认关闭。
+
+    keystroke 依赖 ima.copilot 在前台焦点；提取流程多为 cua-driver 后台点击打开
+    文章（不激活 IMA），Cmd+W 常因焦点不在 IMA 而失效，导致标签页堆积。故先尝试
+    后台 keystroke，校验失败再激活 IMA 重试。
+
+    校验判据：传入 article_url 时，关闭后 extract_url_ax() 不再返回该 URL 即视为
+    已关闭（实测 IMA 关闭文章标签后 AXDocument 立即变 None）。未传时退化为不校验，
+    保持与旧行为兼容（仅发一次 keystroke）。
+    """
+    def send_cmd_w():
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to tell process "ima.copilot" '
+             'to keystroke "w" using command down'],
+            capture_output=True, timeout=5
+        )
+
+    def still_open() -> bool:
+        if not article_url:
+            return False  # 无判据不校验，假定已关
+        time.sleep(WAIT_AFTER_CLOSE)
+        return extract_url_ax() == article_url
+
+    # 第 1 次：后台 keystroke（不激活，减少对用户的干扰）
+    send_cmd_w()
+    if not still_open():
+        return True
+
+    # 重试：激活 IMA 确保焦点落在 IMA，再发 Cmd+W
+    for attempt in range(1, max_retries + 1):
+        print(f"    ⚠️  标签页未关闭，激活 IMA 重试 ({attempt}/{max_retries})...")
+        activate_ima()
+        send_cmd_w()
+        if not still_open():
+            print(f"    ✓ 标签页已关闭（重试 {attempt}）")
+            return True
+
+    print(f"    ❌ 标签页关闭失败，请手动检查 IMA")
+    return False
 
 
 # ==================== 文章识别 ====================
@@ -488,45 +520,44 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             # 等待加载
             await asyncio.sleep(WAIT_CLICK_LOAD)
 
-            # 提取 URL
-            url = extract_url_ax(pid, window_id)
+            article_url: Optional[str] = None
+            try:
+                # 提取 URL
+                url = extract_url_ax(pid, window_id)
 
-            if not url:
-                print("    ⚠️  未提取到 URL")
-                total_failed += 1
-                consecutive_seen = 0  # 失败时重置计数器
-                cmd_w_close()
+                if not url:
+                    print("    ⚠️  未提取到 URL")
+                    total_failed += 1
+                    consecutive_seen = 0  # 失败时重置计数器
+                    continue  # finally 负责关闭标签页
+
+                print(f"    ✅ URL: {url[:80]}...")
+                article_url = url
+
+                if url_exists(url):
+                    print("    ℹ️  已存在，跳过")
+                    total_skipped += 1
+                    page_skipped += 1
+                    consecutive_seen += 1
+
+                    if consecutive_seen >= MAX_CONSECUTIVE_SEEN:
+                        print(f"\n  ⚠️  连续 {consecutive_seen} 篇已存在，可能已全部提取")
+                        should_stop = True
+                        break  # finally 负责关闭标签页
+                else:
+                    title_extracted = extract_title_ax()
+                    final_title = title_extracted or title
+                    print(f"    ✅ 标题: {final_title[:60]}...")
+
+                    save_article(url, final_title, kb_name)
+                    total_new += 1
+                    page_new += 1
+                    consecutive_seen = 0
+                    print(f"    ✅ 新文章已保存 (总计: {total_new})")
+            finally:
+                # 无论成功/异常/continue/break，都关闭文章标签页（异常路径不再漏关）
+                cmd_w_close(article_url=article_url)
                 await asyncio.sleep(WAIT_AFTER_CLOSE)
-                continue
-
-            print(f"    ✅ URL: {url[:80]}...")
-
-            if url_exists(url):
-                print("    ℹ️  已存在，跳过")
-                total_skipped += 1
-                page_skipped += 1
-                consecutive_seen += 1
-
-                if consecutive_seen >= MAX_CONSECUTIVE_SEEN:
-                    print(f"\n  ⚠️  连续 {consecutive_seen} 篇已存在，可能已全部提取")
-                    cmd_w_close()
-                    await asyncio.sleep(WAIT_AFTER_CLOSE)
-                    should_stop = True
-                    break
-            else:
-                title_extracted = extract_title_ax()
-                final_title = title_extracted or title
-                print(f"    ✅ 标题: {final_title[:60]}...")
-
-                save_article(url, final_title, kb_name)
-                total_new += 1
-                page_new += 1
-                consecutive_seen = 0
-                print(f"    ✅ 新文章已保存 (总计: {total_new})")
-
-            # 关闭文章标签页，返回列表
-            cmd_w_close()
-            await asyncio.sleep(WAIT_AFTER_CLOSE)
 
         if should_stop:
             break

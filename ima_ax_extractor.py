@@ -505,7 +505,9 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             # 不要在此调用 get_window_state！
             # element_index 缓存会在下次 get_window_state 时被替换，
             # 必须用本次页面解析时的缓存来点击。
-            # cua-driver 支持后台点击，无需激活 IMA（减少干扰用户）
+            # 前台点击：launchd 后台 cua-driver AXPress 点击文章常不生效（IMA 非前台时不打开），
+            # 致 extract_url_ax 读不到 AXDocument。激活 IMA 到前台再点击（定时任务无人值守，可接受干扰）。
+            activate_ima()
 
             # 点击文章（使用当前缓存中的 element_index）
             print(f"    点击文章 (element {elem_idx})...")

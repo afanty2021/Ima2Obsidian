@@ -140,6 +140,20 @@ def launch_ima():
     return False
 
 
+def restart_ima():
+    """重启 IMA 重置窗口位置（窗口 off-screen 时调用）。
+
+    Electron 窗口偶发被移到屏幕外（is_on_screen=False），cua-driver 读不到窗口 AX 内容
+    致导航全失败。osascript/pyobjc/cua-driver drag 均无法程序化移回（标题栏屏幕外
+    drag 拖不到、AXUIElementCreateApplication 看不到 Electron 窗口），重启 IMA 可重置
+    到屏幕内（实测 IMA 不记异常位置 y<0，重启后 y≥0）。"""
+    log("  重启 IMA 重置窗口位置...")
+    subprocess.run(["osascript", "-e", 'tell application "ima.copilot" to quit'],
+                   capture_output=True, timeout=5)
+    time.sleep(4)
+    return launch_ima()
+
+
 def wait_for_ax_ready(min_elements: int = 5, timeout: int = 30) -> bool:
     """
     硬等待 IMA 窗口 AX 树就绪（AXStaticText 元素数超过阈值）
@@ -257,8 +271,15 @@ def activate_ima():
 
     wake_screen()
 
+    # app activate + AX set frontmost 双管齐下：launchd 后台 osascript 'activate' 对
+    # Electron app(ima.copilot) 间歇失效（AX 树仅菜单栏/0 元素），追加 AX 底层设前台。
     subprocess.run(
         ["osascript", "-e", 'tell application "ima.copilot" to activate'],
+        capture_output=True, timeout=5
+    )
+    subprocess.run(
+        ["osascript", "-e",
+         'tell application "System Events" to tell process "ima.copilot" to set frontmost to true'],
         capture_output=True, timeout=5
     )
     time.sleep(2)
@@ -280,6 +301,20 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
         log("❌ 未找到 IMA 窗口，无法导航")
         return False
 
+    # 检测窗口 off-screen（屏幕外）→ 重启 IMA 重置位置。
+    # cua-driver 读 off-screen 窗口 AX 树为空（仅菜单栏），导航必失败；程序化移 Electron
+    # 窗口受阻（标题栏屏幕外 drag 拖不到），重启 IMA 可重置（实测不记异常位置）。
+    bounds = window.get("bounds", {})
+    if not window.get("is_on_screen", True) or bounds.get("y", 0) < -50:
+        log(f"⚠️  IMA 窗口在屏幕外 (bounds={bounds}, is_on_screen={window.get('is_on_screen')})，重启 IMA 重置...")
+        if restart_ima():
+            window = get_ima_main_window()
+            if not window:
+                log("❌ 重启后仍未找到 IMA 窗口")
+                return False
+        else:
+            log("⚠️  重启 IMA 失败，继续尝试原窗口")
+
     pid = window["pid"]
     window_id = window["window_id"]
 
@@ -289,9 +324,14 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
     for attempt in range(1, max_attempts + 1):
         log(f"导航尝试 {attempt}/{max_attempts}...")
 
-        # 激活窗口确保 AX Tree 完整
+        # 激活窗口确保 AX Tree 完整（activate + AX set frontmost，应对 launchd 后台 activate 间歇失效）
         subprocess.run(
             ["osascript", "-e", 'tell application "ima.copilot" to activate'],
+            capture_output=True, timeout=5
+        )
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to tell process "ima.copilot" to set frontmost to true'],
             capture_output=True, timeout=5
         )
         time.sleep(2)
@@ -322,6 +362,23 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
                 if m:
                     sidebar_elem = int(m.group(1))
                     break
+
+        # 对话页适配：重启 IMA 后可能在默认对话页（侧边栏"问问ima"/"我的copilot"特征，
+        # 无 KB 列表），点击顶部导航"知识库"按钮(AXButton 含"知识库")到 KB 列表页，再找目标 KB。
+        if '问问ima' in md or '我的copilot' in md:
+            nav_btn = None
+            for nav_line in md.split("\n"):
+                if 'AXButton' in nav_line and '知识库' in nav_line:
+                    m_nav = re.search(r'\[(\d+)\]', nav_line)
+                    if m_nav:
+                        nav_btn = int(m_nav.group(1))
+                        break
+            if nav_btn is not None:
+                log(f"  检测到对话页，点击'知识库'导航按钮 (element {nav_btn}) 到列表页...")
+                run_cua(["call", "click", json.dumps({"pid": pid, "window_id": window_id, "element_index": nav_btn})])
+                time.sleep(3)
+                state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
+                md = json.loads(state_result).get("tree_markdown", "")
 
         # 在全文查找知识库名称的 element_index
         # 匹配多种 AX 类型：AXStaticText, AXButton, AXLink 等

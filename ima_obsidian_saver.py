@@ -42,8 +42,10 @@ import warnings
 
 # 系统 Python 3.9 + LibreSSL 与 urllib3 v2 不兼容会触发 NotOpenSSLWarning，
 # 污染 stderr 被 incremental_update 误冠 "错误:" 前缀。须在 import requests
-# （触发 urllib3 首次导入并 warn）之前注册过滤。message 为正则子串匹配，
-# 不依赖 urllib3 版本，对新旧版本均安全。
+# （触发 urllib3 首次导入并 warn）之前注册过滤。
+# 注意：warnings.filterwarnings 的 message 是正则，用 re.match（行首锚定）匹配，
+# 不是子串 search——故这里给的是告警文本的完整前缀。当前 urllib3 措辞命中、
+# 全新子进程下有效（已实证 launchd 下被抑制）；若 urllib3 改写告警措辞需同步更新。
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import requests
@@ -167,14 +169,17 @@ def sanitize_filename(title: str) -> str:
     # macOS/APFS 文件名上限为 255 *字节*（非字符）。中文 UTF-8 占 3 字节/字，
     # 旧的字符截断 [:100] 对纯中文标题仍超限（100 中文字 ≈ 300 字节），导致
     # Web Clipper 落盘失败或被系统截断、重命名匹配不上 → 长标题文章变僵尸。
-    # 文件名固定开销 "YYMMDD " + ".md" = 11 字节，留余量取 240 字节。
+    # 文件名固定开销 "YYMMDD "(7) + ".md"(3) = 10 字节，留余量取 240 字节。
     MAX_BYTES = 240
     encoded = cleaned.encode('utf-8')
     if len(encoded) > MAX_BYTES:
         encoded = encoded[:MAX_BYTES]
         # 截断可能落在多字节字符中间，丢弃残缺尾部字节
         cleaned = encoded.decode('utf-8', errors='ignore')
-    return cleaned
+    # 字节截断可能把末尾恰好落在空格上（上面的 strip 在截断之前执行），
+    # 再 strip 一次避免 "260722 标题 .md"（.md 前尾随空格）引发 Finder 隐藏 /
+    # Obsidian·iCloud 跨平台同步隐患。
+    return cleaned.strip()
 
 
 # ==================== 数据库 ====================
@@ -370,6 +375,24 @@ def trigger_clipper_and_save(mods: list):
 
 # ==================== Vault 文件重命名 ====================
 
+def _non_conflicting_path(target: Path, source: Path) -> Path:
+    """若 target 已存在且非 source 自身，追加 ' 2'/' 3' 序号后缀避免覆盖。
+
+    Path.rename 在 POSIX 上原子覆盖目标；无守卫时两篇 sanitize 后同名的文章，
+    第二篇会静默覆盖第一篇已落盘的 .md（永久丢数据）。此函数把目标改到不冲突路径，
+    对齐 reclaim_clippings 的冲突处理哲学。
+    """
+    if not target.exists() or target.resolve() == source.resolve():
+        return target
+    stem, suffix = target.stem, target.suffix
+    n = 2
+    while True:
+        cand = target.with_name(f"{stem} {n}{suffix}")
+        if not cand.exists() or cand.resolve() == source.resolve():
+            return cand
+        n += 1
+
+
 def find_and_rename_in_vault(
     title: str,
     date_str: str,
@@ -444,6 +467,8 @@ def find_and_rename_in_vault(
             pass
         if target_folder:
             if md_file != final_target_path:
+                final_target_path = _non_conflicting_path(final_target_path, md_file)
+                target_name = final_target_path.name
                 md_file.rename(final_target_path)
                 print(f"    移动: {stem[:40]}... → {target_folder}/{target_name[:50]}...")
         else:
@@ -472,6 +497,8 @@ def find_and_rename_in_vault(
             pass
         if target_folder:
             if newest != final_target_path:
+                final_target_path = _non_conflicting_path(final_target_path, newest)
+                target_name = final_target_path.name
                 newest.rename(final_target_path)
                 print(f"    移动(新文件): {newest.stem[:40]}... → {target_folder}/{target_name[:50]}...")
         else:

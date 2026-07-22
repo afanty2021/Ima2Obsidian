@@ -115,10 +115,17 @@ def main():
             for key, idx in ((stem_norm, by_norm), (sanitize_filename(f.stem), by_sani)):
                 cands = idx.get(key)
                 if cands:
-                    # 取尚未被认领的那篇
-                    row = next((r for r in cands if r[0] not in claimed_article_ids), None)
-                    if row:
+                    available = [r for r in cands if r[0] not in claimed_article_ids]
+                    if not available:
+                        continue
+                    # by_sani 依赖 sanitize_filename（CJK 截到 80 字）。多个未认领意味着
+                    # 不同长标题共享截断前缀 → 歧义，不盲取首个，以免把 B 的 clipping
+                    # 记到 A 名下（字节截断引入的回归）。by_norm 用 normalize_stem（不截断），
+                    # 其多文章只发生在真同标题，保留取首个的既有行为。
+                    if idx is by_sani and len(available) > 1:
                         break
+                    row = available[0]
+                    break
 
             if not row:
                 no_match.append(f)
@@ -139,7 +146,7 @@ def main():
                 content = ""
             content_date = extract_date_from_content(content)
             date_str = content_date or mtime_yymmd(f)  # 文件命名用（任意可用日期）
-            target_name = f"{date_str} {sanitize_filename(title)}.md"
+            target_name = f"{date_str} {sanitize_filename(title or '')}.md"
             target = folder / target_name
 
             if target.exists() and target.resolve() != f.resolve():

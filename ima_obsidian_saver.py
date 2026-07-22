@@ -398,7 +398,8 @@ def _non_conflicting_path(target: Path, source: Path) -> Path:
         # stem 给 " N<suffix>" 留余量后重试（触发需数千同名冲突，属防御性兜底）。
         if len(cand.name.encode("utf-8")) > 255:
             stem = stem.encode("utf-8")[:240].decode("utf-8", errors="ignore")
-            n = 2  # stem 缩短后从序号 2 重新找，避免 n 冻结导致的理论死循环
+            n = 2  # stem 缩短后从序号 2 重新找，避免 n 冻结导致的理论死循环（物理不可触发：
+                   # 240B stem 需 ~10^12 同名冲突才会使后缀再超限，属防御性兜底，无单测覆盖）
             continue
         if not cand.exists() or cand.resolve() == source.resolve():
             return cand

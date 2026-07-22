@@ -190,7 +190,11 @@ def test_reclaim_by_norm_numeric_pair_both_reclaimed(tmp_path, monkeypatch):
 
 
 def test_reclaim_by_sani_truncation_collision_skips(tmp_path, monkeypatch):
-    """#4: 两篇长标题 sanitize 截到同一前缀 → by_sani cands>1 真碰撞 → break no_match（不错配）。"""
+    """#4: 两篇长标题 sanitize 截到同一前缀 → by_sani cands>1 真碰撞 → break no_match（不错配）。
+
+    注：此测试防 by_sani 'break 改取首个' 的盲取回归，但不区分 len(available)>1 与 len(cands)>1——
+    单幸存者错配（cands==2、一候选已认领剩 available==1）物理不可构造：长标题 clip 文件名同样被
+    截断/去重到共享前缀，处理时 cands 恒≥2，无法先认领一篇再造单幸存者。属固有限制，无法单测。"""
     prefix = "中" * 80  # 240 字节
     articles = [(1, prefix + "甲后缀"), (2, prefix + "乙后缀")]
     clippings, db, mod = _setup_reclaim(tmp_path, monkeypatch, articles)

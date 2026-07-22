@@ -125,7 +125,13 @@ def main():
                         break
                     continue
                 # 单候选：键唯一即无碰撞兄弟，匹配可靠（含 by_sani 下的长标题——其键唯一，
-                # 不存在另一篇 sanitize 到同前缀的幸存者，故不按标题字节长度盲跳）
+                # 不存在另一篇 sanitize 到同前缀的幸存者，故不按标题字节长度盲跳）。
+                # 已知精度边（低危、可接受取舍）：
+                #   (a) latent——normalize_stem 保留而 sanitize_filename 替换的字符（/\:*?"<>|）
+                #       分歧时，by_norm 单候选已认领而 continue 落到 by_sani 可能记到另一篇；
+                #       当前仅由 Web Clipper 预清洗这些字符兜住，不可达。
+                #   (b) by_sani 单候选长标题，若 vault 存在同名残留短文件（非本篇 clip），可能被
+                #       误标 saved——键对 DB 唯一故判据成立，属 recall/精度取舍。
                 if cands[0][0] in claimed_article_ids:
                     continue  # 唯一候选已认领 → 试下一索引
                 row = cands[0]
@@ -153,7 +159,12 @@ def main():
             target_name = f"{date_str} {sanitize_filename(title or '')}.md"
             target = folder / target_name
 
-            if target.exists() and target.resolve() != f.resolve():
+            # target 在 VAULT_DIR/<kb>、f 在 CLIPPINGS_DIR，二者 resolve() 永不等，故原
+            # `and target.resolve() != f.resolve()` 为恒真死代码，已移除——此处等价于"target
+            # 已存在即 conflict 跳过"。与 saver 加序号保留两文件的策略相反（reclaim 保守留孤儿，
+            # 避免回收路径覆盖已落盘内容）；同日同 sanitize 标题的第二篇会落 conflict 留 Clippings
+            # （已知 recall 取舍；若需统一加序号策略需触动下方 rename+UPDATE 回滚事务，另议）。
+            if target.exists():
                 conflict.append((f, target))
                 continue
 

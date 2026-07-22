@@ -38,6 +38,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import warnings
+
+# 系统 Python 3.9 + LibreSSL 与 urllib3 v2 不兼容会触发 NotOpenSSLWarning，
+# 污染 stderr 被 incremental_update 误冠 "错误:" 前缀。须在 import requests
+# （触发 urllib3 首次导入并 warn）之前注册过滤。message 为正则子串匹配，
+# 不依赖 urllib3 版本，对新旧版本均安全。
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
+
 import requests
 
 from ima_common import DB_FILE, init_database, now_saved_at
@@ -152,13 +160,20 @@ def extract_date_from_content(text: str) -> Optional[str]:
 
 
 def sanitize_filename(title: str) -> str:
-    """清理文件名中的非法字符"""
+    """清理文件名中的非法字符，并按字节截断以遵守 macOS 255 字节限制"""
     # 移除或替换不适合文件名的字符
     cleaned = re.sub(r'[/\\:*?"<>|]', '-', title)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    # 截断过长标题
-    if len(cleaned) > 100:
-        cleaned = cleaned[:100]
+    # macOS/APFS 文件名上限为 255 *字节*（非字符）。中文 UTF-8 占 3 字节/字，
+    # 旧的字符截断 [:100] 对纯中文标题仍超限（100 中文字 ≈ 300 字节），导致
+    # Web Clipper 落盘失败或被系统截断、重命名匹配不上 → 长标题文章变僵尸。
+    # 文件名固定开销 "YYMMDD " + ".md" = 11 字节，留余量取 240 字节。
+    MAX_BYTES = 240
+    encoded = cleaned.encode('utf-8')
+    if len(encoded) > MAX_BYTES:
+        encoded = encoded[:MAX_BYTES]
+        # 截断可能落在多字节字符中间，丢弃残缺尾部字节
+        cleaned = encoded.decode('utf-8', errors='ignore')
     return cleaned
 
 

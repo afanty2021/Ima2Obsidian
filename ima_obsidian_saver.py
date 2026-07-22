@@ -163,6 +163,7 @@ def extract_date_from_content(text: str) -> Optional[str]:
 
 def sanitize_filename(title: str) -> str:
     """清理文件名中的非法字符，并按字节截断以遵守 macOS 255 字节限制"""
+    title = title or ""  # None 安全：re.sub 对 None 抛 TypeError（调用方未必都守卫）
     # 移除或替换不适合文件名的字符
     cleaned = re.sub(r'[/\\:*?"<>|]', '-', title)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
@@ -397,6 +398,7 @@ def _non_conflicting_path(target: Path, source: Path) -> Path:
         # stem 给 " N<suffix>" 留余量后重试（触发需数千同名冲突，属防御性兜底）。
         if len(cand.name.encode("utf-8")) > 255:
             stem = stem.encode("utf-8")[:240].decode("utf-8", errors="ignore")
+            n = 2  # stem 缩短后从序号 2 重新找，避免 n 冻结导致的理论死循环
             continue
         if not cand.exists() or cand.resolve() == source.resolve():
             return cand

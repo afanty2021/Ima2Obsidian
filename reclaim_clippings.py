@@ -116,22 +116,19 @@ def main():
                 cands = idx.get(key)
                 if not cands:
                     continue  # 本索引无该键 → 试下一索引
-                available = [r for r in cands if r[0] not in claimed_article_ids]
-                if len(available) > 1:
-                    # 歧义：by_norm 因 normalize_stem 剥尾部 ' <数字>' 使 "X 1"/"X 2" 同键；
-                    # by_sani 因 sanitize 截断使长标题共享前缀。多个未认领都不盲取首个，
-                    # 以免把 clipping 记到错误文章名下 → 落 no_match。
-                    break
-                if not available:
-                    continue  # 候选均已认领 → 试下一索引
-                row = available[0]
-                if idx is by_sani:
-                    # by_sani 是弱兜底。sanitize 对 >240B 标题截断，使多篇长标题共享前缀键；
-                    # 单候选若本身是被截断的长标题，仍可能是"幸存者"错配。故仅采信未被截断
-                    # （≤240B）的候选——长标题应已由 by_norm（normalize_stem 不截断）精确命中。
-                    if len((row[1] or "").encode("utf-8")) > 240:
-                        row = None
-                        continue
+                if len(cands) > 1:
+                    # 多个 DB 文章映射到同一键 = 歧义：
+                    #   by_norm：normalize_stem 剥尾部 ' <数字>' 使 "X 1"/"X 2" 同键——但 by_sani
+                    #     用 sanitize_filename（保留 ' 1' 后缀）能精确消歧 → continue 落到 by_sani；
+                    #   by_sani：sanitize 截断使长标题共享前缀键，已是末索引无更精确兜底 → break 落 no_match。
+                    if idx is by_sani:
+                        break
+                    continue
+                # 单候选：键唯一即无碰撞兄弟，匹配可靠（含 by_sani 下的长标题——其键唯一，
+                # 不存在另一篇 sanitize 到同前缀的幸存者，故不按标题字节长度盲跳）
+                if cands[0][0] in claimed_article_ids:
+                    continue  # 唯一候选已认领 → 试下一索引
+                row = cands[0]
                 break
 
             if not row:

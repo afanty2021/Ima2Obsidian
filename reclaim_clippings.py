@@ -114,18 +114,25 @@ def main():
             row = None
             for key, idx in ((stem_norm, by_norm), (sanitize_filename(f.stem), by_sani)):
                 cands = idx.get(key)
-                if cands:
-                    available = [r for r in cands if r[0] not in claimed_article_ids]
-                    if not available:
-                        continue
-                    # by_sani 依赖 sanitize_filename（CJK 截到 80 字）。多个未认领意味着
-                    # 不同长标题共享截断前缀 → 歧义，不盲取首个，以免把 B 的 clipping
-                    # 记到 A 名下（字节截断引入的回归）。by_norm 用 normalize_stem（不截断），
-                    # 其多文章只发生在真同标题，保留取首个的既有行为。
-                    if idx is by_sani and len(available) > 1:
-                        break
-                    row = available[0]
+                if not cands:
+                    continue  # 本索引无该键 → 试下一索引
+                available = [r for r in cands if r[0] not in claimed_article_ids]
+                if len(available) > 1:
+                    # 歧义：by_norm 因 normalize_stem 剥尾部 ' <数字>' 使 "X 1"/"X 2" 同键；
+                    # by_sani 因 sanitize 截断使长标题共享前缀。多个未认领都不盲取首个，
+                    # 以免把 clipping 记到错误文章名下 → 落 no_match。
                     break
+                if not available:
+                    continue  # 候选均已认领 → 试下一索引
+                row = available[0]
+                if idx is by_sani:
+                    # by_sani 是弱兜底。sanitize 对 >240B 标题截断，使多篇长标题共享前缀键；
+                    # 单候选若本身是被截断的长标题，仍可能是"幸存者"错配。故仅采信未被截断
+                    # （≤240B）的候选——长标题应已由 by_norm（normalize_stem 不截断）精确命中。
+                    if len((row[1] or "").encode("utf-8")) > 240:
+                        row = None
+                        continue
+                break
 
             if not row:
                 no_match.append(f)

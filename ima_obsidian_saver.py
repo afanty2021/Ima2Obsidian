@@ -380,7 +380,11 @@ def _non_conflicting_path(target: Path, source: Path) -> Path:
 
     Path.rename 在 POSIX 上原子覆盖目标；无守卫时两篇 sanitize 后同名的文章，
     第二篇会静默覆盖第一篇已落盘的 .md（永久丢数据）。此函数把目标改到不冲突路径，
-    对齐 reclaim_clippings 的冲突处理哲学。
+    追加序号保留两文件。
+
+    注意：与 reclaim_clippings 的冲突策略相反——reclaim 命中冲突直接跳过、把孤儿
+    留在 Clippings；本函数追加序号保留两文件（saver 场景下两篇都是刚 clip 的有效内容，
+    不能丢）。两者对同一 exists()+resolve() 条件采取不同动作，并非"对齐"。
     """
     if not target.exists() or target.resolve() == source.resolve():
         return target
@@ -388,6 +392,12 @@ def _non_conflicting_path(target: Path, source: Path) -> Path:
     n = 2
     while True:
         cand = target.with_name(f"{stem} {n}{suffix}")
+        # macOS 文件名 255 字节上限：序号递增使名字变长，超限时 Path.exists() 会把
+        # ENAMETOOLONG 静默当"可用"返回非法路径 → 随后 rename 崩。超限即按字节截断
+        # stem 给 " N<suffix>" 留余量后重试（触发需数千同名冲突，属防御性兜底）。
+        if len(cand.name.encode("utf-8")) > 255:
+            stem = stem.encode("utf-8")[:240].decode("utf-8", errors="ignore")
+            continue
         if not cand.exists() or cand.resolve() == source.resolve():
             return cand
         n += 1
@@ -457,7 +467,7 @@ def find_and_rename_in_vault(
         stem = md_file.stem
         # 从文件内容提取真实发布日期（Web Clipper 保留 *YYYY年M月D日*），覆盖降级值
         try:
-            file_date = extract_date_from_content(md_file.read_text(encoding="utf-8"))
+            file_date = extract_date_from_content(md_file.read_text(encoding="utf-8", errors="ignore"))
             if file_date and file_date != date_str:
                 date_str = file_date
                 target_name = f"{date_str} {sanitize_filename(title)}.md"
@@ -472,8 +482,9 @@ def find_and_rename_in_vault(
                 md_file.rename(final_target_path)
                 print(f"    移动: {stem[:40]}... → {target_folder}/{target_name[:50]}...")
         else:
-            new_path = md_file.parent / target_name
+            new_path = _non_conflicting_path(md_file.parent / target_name, md_file)
             if md_file != new_path:
+                target_name = new_path.name
                 md_file.rename(new_path)
                 print(f"    重命名: {stem[:40]}... → {target_name[:50]}...")
         return True, date_str
@@ -487,7 +498,7 @@ def find_and_rename_in_vault(
         newest = new_files[0][0]
         # 从文件内容提取真实发布日期（Web Clipper 保留 *YYYY年M月D日*），覆盖降级值
         try:
-            file_date = extract_date_from_content(newest.read_text(encoding="utf-8"))
+            file_date = extract_date_from_content(newest.read_text(encoding="utf-8", errors="ignore"))
             if file_date and file_date != date_str:
                 date_str = file_date
                 target_name = f"{date_str} {sanitize_filename(title)}.md"
@@ -502,8 +513,9 @@ def find_and_rename_in_vault(
                 newest.rename(final_target_path)
                 print(f"    移动(新文件): {newest.stem[:40]}... → {target_folder}/{target_name[:50]}...")
         else:
-            new_path = newest.parent / target_name
+            new_path = _non_conflicting_path(newest.parent / target_name, newest)
             if newest != new_path:
+                target_name = new_path.name
                 newest.rename(new_path)
                 print(f"    重命名(新文件): {newest.stem[:40]}... → {target_name[:50]}...")
         return True, date_str

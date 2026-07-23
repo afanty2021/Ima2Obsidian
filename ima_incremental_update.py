@@ -301,19 +301,23 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
         log("❌ 未找到 IMA 窗口，无法导航")
         return False
 
-    # 检测窗口 off-screen（屏幕外）→ 重启 IMA 重置位置。
-    # cua-driver 读 off-screen 窗口 AX 树为空（仅菜单栏），导航必失败；程序化移 Electron
-    # 窗口受阻（标题栏屏幕外 drag 拖不到），重启 IMA 可重置（实测不记异常位置）。
+    # 检测窗口不在屏幕（is_on_screen=False：在别的 Space/隐藏）→ bring_to_front 拉到当前屏幕前台。
+    # cua-driver 读非屏幕窗口 AX 树为空（仅菜单栏，AXStaticText=0），导航必失败。
+    # 旧逻辑 restart_ima：重启不解决 is_on_screen=False（窗口仍在别的 Space），且回到默认对话页丢状态。
+    # bring_to_front 用 NSRunningApplication.activate（归因已授权的 com.trycua.driver），
+    # 拉窗口到前台 + 保持页面状态。实测：is_on_screen=False 时 AXStaticText 0→92。
     bounds = window.get("bounds", {})
     if not window.get("is_on_screen", True) or bounds.get("y", 0) < -50:
-        log(f"⚠️  IMA 窗口在屏幕外 (bounds={bounds}, is_on_screen={window.get('is_on_screen')})，重启 IMA 重置...")
-        if restart_ima():
+        log(f"⚠️  IMA 窗口不在屏幕 (bounds={bounds}, is_on_screen={window.get('is_on_screen')})，bring_to_front 拉到前台...")
+        try:
+            run_cua(["call", "bring_to_front", json.dumps({"pid": window["pid"]})])
+            time.sleep(2)
             window = get_ima_main_window()
             if not window:
-                log("❌ 重启后仍未找到 IMA 窗口")
+                log("❌ bring_to_front 后仍未找到 IMA 窗口")
                 return False
-        else:
-            log("⚠️  重启 IMA 失败，继续尝试原窗口")
+        except Exception as e:
+            log(f"⚠️  bring_to_front 失败: {e}，继续尝试原窗口")
 
     pid = window["pid"]
     window_id = window["window_id"]

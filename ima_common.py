@@ -130,7 +130,13 @@ def verify_urls_canonical(db_file=None):
 
 def get_ima_main_window():
     """
-    获取 IMA 主窗口信息
+    获取 IMA 主窗口（KB 列表窗口），排除文章标签页独立窗口。
+
+    IMA 改版后文章在独立标签页窗口打开（含浏览器地址栏"地址和搜索栏"），与 KB 列表
+    主窗口面积相近甚至更大。旧逻辑只按面积 max 会误选面积更大的文章窗口，导致
+    navigate_to_kb 在文章窗口里找不到知识库元素 → 0 产出。故需逐一 get_window_state
+    排除含地址栏者，再按面积选最大。get_window_state 失败则保留该候选（宁可不排除
+    也不误删主窗口）；若全部被排除（异常）则回退到原始候选，避免返回 None 卡死。
 
     返回: 窗口信息字典 {pid, window_id, bounds, ...} 或 None
     """
@@ -151,8 +157,28 @@ def get_ima_main_window():
     if not ima_windows:
         return None
 
-    # 选最大的窗口（主窗口）
-    return max(ima_windows, key=lambda w: w["bounds"].get("width", 0) * w["bounds"].get("height", 0))
+    # 排除文章标签页独立窗口（含浏览器地址栏）；state 读失败则保留候选
+    candidates = [w for w in ima_windows if not _is_article_tab_window(w)]
+    if not candidates:
+        candidates = ima_windows  # 全被识别为文章窗口（异常），回退避免返回 None
+
+    # 选面积最大的窗口（主窗口）
+    return max(candidates, key=lambda w: w["bounds"].get("width", 0) * w["bounds"].get("height", 0))
+
+
+def _is_article_tab_window(window: dict) -> bool:
+    """判断是否为文章标签页独立窗口（AX 树含浏览器地址栏"地址和搜索栏"）。
+
+    get_window_state 失败返回 False（不排除：宁保留主窗口候选也不误删）。
+    """
+    try:
+        st = json.loads(run_cua([
+            "call", "get_window_state",
+            json.dumps({"pid": window["pid"], "window_id": window["window_id"]}),
+        ]))
+        return "地址和搜索栏" in st.get("tree_markdown", "")
+    except Exception:
+        return False
 
 
 # ==================== AppleScript ====================

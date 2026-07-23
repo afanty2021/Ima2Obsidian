@@ -237,42 +237,63 @@ def activate_ima():
 
 
 def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
-    """从 AXDocument 属性提取当前文章 URL，带重试应对冷启动时序
+    """用 cua-driver 读标签页窗口地址栏 AXTextField 的文章 URL。
 
-    Electron（IMA）窗口的 AXDocument 是完整文章 URL（mp.weixin.qq.com/s?...）的
-    唯一可靠来源（地址栏 AXTextField 只显示域名）。冷启动后点击文章，AXDocument
-    可能延迟设置，故读取失败时等待重试。失败返回 None，不 fallback 到正文链接
-    （避免错误数据）。pid/window_id 保留兼容调用点，System Events 自行遍历窗口。
+    launchd 后台 osascript（System Events 读 AXDocument）无 Accessibility 权限（-25211），
+    故改用 cua-driver（com.trycua.driver，已授权 Accessibility）。
+    新版 IMA：文章在独立标签页窗口打开，地址栏 AXTextField 含完整 URL。
+    流程：bring_to_front 前台化 → 遍历 IMA 大窗口 get_window_state → 找含 http 的 AXTextField。
+    pid/window_id 保留兼容调用点。失败返回 None，不 fallback 到正文链接（避免错误数据）。
     """
-    script = '''
-tell application "System Events"
-    tell process "ima.copilot"
-        set wCount to count of windows
-        repeat with i from 1 to wCount
-            try
-                set docUrl to value of attribute "AXDocument" of window i
-                if docUrl is not missing value and docUrl starts with "http" then
-                    return docUrl
-                end if
-            end try
-        end repeat
-    end tell
-end tell
-return ""
-'''
+    import re
+    # 前台化 IMA（标签页窗口需前台，cua-driver 才能读到地址栏 AX）
+    try:
+        mw = get_ima_main_window()
+        if mw and mw.get("pid"):
+            run_cua(["call", "bring_to_front", json.dumps({"pid": mw["pid"]})])
+            time.sleep(1.0)
+    except Exception as e:
+        print(f"  ⚠️  extract_url_ax bring_to_front 失败: {e}")
+    # 地址栏 AXTextField 失焦只显示域名，聚焦(click)后才显示完整 URL。
+    # 遍历找标签页窗口(含"地址和搜索栏") → click 地址栏聚焦 → 重读完整 URL。
     for attempt in range(3):
         try:
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5
-            )
-            url = result.stdout.strip()
-            if url and url.startswith("http") and "chrome://" not in url:
-                return url
-        except Exception:
-            pass
-        if attempt < 2:
-            time.sleep(2)  # AXDocument 冷启动延迟，等待重试
+            wins = json.loads(run_cua(["list_windows"]))["windows"]
+        except Exception as e:
+            print(f"  ⚠️  extract_url_ax list_windows 失败: {e}")
+            return None
+        for w in wins:
+            if "ima" not in w.get("app_name", "").lower():
+                continue
+            if w.get("bounds", {}).get("height", 0) <= 200:
+                continue
+            try:
+                st = json.loads(run_cua(["call", "get_window_state", json.dumps({"pid": w["pid"], "window_id": w["window_id"]})]))
+            except Exception:
+                continue
+            md = st.get("tree_markdown", "")
+            if "地址和搜索栏" not in md:
+                continue  # 非标签页窗口（如 KB 列表主窗口）
+            m_addr = re.search(r'\[(\d+)\] AXTextField.*地址和搜索栏', md)
+            if not m_addr:
+                continue
+            # click 地址栏聚焦
+            try:
+                run_cua(["call", "click", json.dumps({"pid": w["pid"], "window_id": w["window_id"], "element_index": int(m_addr.group(1))})])
+                time.sleep(1.0)
+            except Exception:
+                continue
+            # 重读：聚焦后 AXTextField = 完整 URL
+            try:
+                st2 = json.loads(run_cua(["call", "get_window_state", json.dumps({"pid": w["pid"], "window_id": w["window_id"]})]))
+            except Exception:
+                continue
+            for line in st2.get("tree_markdown", "").split("\n"):
+                if "AXTextField" in line:
+                    m_url = re.search(r'AXTextField\s*=\s*"(https?://[^"]+)"', line)
+                    if m_url and "chrome://" not in m_url.group(1):
+                        return m_url.group(1)
+        time.sleep(1.5)
     return None
 
 

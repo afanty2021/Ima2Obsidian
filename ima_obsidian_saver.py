@@ -27,6 +27,7 @@ IMA 微信文章 → Obsidian 自动保存器
 
 import argparse
 import glob
+import json
 import os
 import re
 import sqlite3
@@ -374,6 +375,90 @@ def trigger_clipper_and_save(mods: list):
     send_keystroke("return", [])
 
 
+# ==================== 微信验证页检测 ====================
+
+# 微信「当前环境异常」风控验证页特征词。saver 自动访问会间歇触发该页，导致 quick_clip
+# 打在验证页上无文章内容 → 0 落盘（见 Plans/snoopy-pondering-biscuit.md）。
+# Chrome execute JS 已开启，故在 quick_clip 前用 JS 检测 + 自动点「确认」。
+VERIFY_KEYWORDS = ("当前环境异常", "验证后才能正常访问", "环境异常", "完成验证")
+
+
+def execute_chrome_js(js: str, browser_app: str = "Google Chrome") -> Optional[str]:
+    """通过 AppleScript 在 Chrome 当前标签页执行 JS，返回求值结果字符串。
+
+    照 close_tab 的错误处理：text=True + returncode 检查 + 超时/异常仅警告不 raise。
+    引号约定：JS 被拼进 osascript 双引号字符串，JS 内部一律用单引号，不得含未转义
+    双引号或反斜杠（否则 osascript 语法错）。osascript 字符串内亦不得有非 ASCII 注释。
+    """
+    script = f'tell application "{browser_app}" to execute active tab of front window javascript "{js}"'
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return r.stdout.strip()
+        print(f"    ⚠️ execute_chrome_js 失败: {(r.stderr or r.stdout).strip()}")
+    except subprocess.TimeoutExpired:
+        print("    ⚠️ execute_chrome_js 超时")
+    except Exception as e:
+        print(f"    ⚠️ execute_chrome_js 异常: {e}")
+    return None
+
+
+def read_page_snapshot(browser_app: str = "Google Chrome") -> Optional[dict]:
+    """读当前页 title + 正文前 800 字，供验证页检测与自取证。失败返回 None。"""
+    js = "JSON.stringify({title:document.title,text:(document.body&&document.body.innerText||'').slice(0,800)})"
+    raw = execute_chrome_js(js, browser_app)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def is_verify_page(snapshot: Optional[dict]) -> bool:
+    """判断页面快照是否为微信风控验证页（纯函数）。"""
+    if not snapshot:
+        return False
+    text = (snapshot.get("text") or "") + (snapshot.get("title") or "")
+    return any(k in text for k in VERIFY_KEYWORDS)
+
+
+def click_confirm(browser_app: str = "Google Chrome") -> bool:
+    """在当前页查找「确认/继续访问/继续/确定」可点击元素并点击，返回是否点到。
+
+    多 selector 容错：验证页「确认」按钮真实 DOM 未知（间歇触发无法当场取证），故遍历
+    常见可点击元素按文本匹配。execute_chrome_js 返回 '1' 表示点到。
+    """
+    js = ("var b=[...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')];"
+          "var k=['确认','继续访问','继续','确定','去验证'];"
+          "for(var e of b){var t=(e.textContent||e.value||'').trim();"
+          "if(k.some(function(x){return t.indexOf(x)>=0})){e.click();return '1'}} '0'")
+    return execute_chrome_js(js, browser_app) == "1"
+
+
+def handle_verify_page(browser_app: str = "Google Chrome") -> bool:
+    """检测并处理微信验证页。返回是否遇到过验证页（True=遇到过，False=非验证页）。
+
+    在 quick_clip 前调用：非验证页直接放行；验证页则自动点「确认」，最多 2 轮（应对二次
+    确认）。点不掉则放弃——quick_clip 会在验证页失败，save_one_article 返回 False，
+    obsidian_saved 保持 0，下次 get_unsaved_articles 自动重试，不丢数据。
+    每次命中打印 title+text 片段用于自取证（迭代 VERIFY_KEYWORDS / click_confirm）。
+    """
+    encountered = False
+    for attempt in range(2):
+        snap = read_page_snapshot(browser_app)
+        if not snap or not is_verify_page(snap):
+            return encountered  # 非验证页：首次则 False；点确认后离开则 True
+        encountered = True
+        print(f"    ⚠️ 检测到微信验证页，尝试自动确认（轮 {attempt + 1}/2）")
+        print(f"       [自取证] title={snap.get('title')!r} text={(snap.get('text') or '')[:120]!r}")
+        if not click_confirm(browser_app):
+            print("    ⚠️ 未找到确认按钮，放弃（保持未保存，下次重试）")
+            return True
+        time.sleep(3.0)  # 等点确认后页面跳转到真文章
+    return True
+
+
 # ==================== Vault 文件重命名 ====================
 
 def _non_conflicting_path(target: Path, source: Path) -> Path:
@@ -404,6 +489,20 @@ def _non_conflicting_path(target: Path, source: Path) -> Path:
         if not cand.exists() or cand.resolve() == source.resolve():
             return cand
         n += 1
+
+
+# Web Clipper 落盘的验证页内容特征。saver 在验证页上 quick_clip 会把验证页存成 md
+# （title=微信公众平台），find_and_rename 须排除这类文件，防止把验证页当文章认领。
+VERIFY_CLIPPING_MARKERS = ("环境异常", "完成验证", "去验证")
+
+
+def _is_verify_clipping(md_path: Path) -> bool:
+    """检测 Web Clipper 落盘的 .md 是否为微信验证页内容（非文章）。"""
+    try:
+        txt = md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return any(k in txt for k in VERIFY_CLIPPING_MARKERS) or '"微信公众平台"' in txt
 
 
 def find_and_rename_in_vault(
@@ -449,13 +548,19 @@ def find_and_rename_in_vault(
     for search_dir in search_dirs:
         if not search_dir.exists():
             continue
-        for md_file in search_dir.glob("*.md"):
+        # CLIPPINGS_DIR 用 rglob：Web Clipper 偶发把含 \n 的 title 当文件名 → 畸形嵌套
+        # 目录，glob("*.md") 只扫顶层会漏掉深处完好的 .md（见 id=2913）。
+        # VAULT_DIR 保持 glob，避免递归扫全 vault 拖慢。
+        matcher = search_dir.rglob if search_dir == CLIPPINGS_DIR else search_dir.glob
+        for md_file in matcher("*.md"):
             try:
                 mtime = os.path.getmtime(md_file)
             except OSError:
                 continue
             if now - mtime > 60:
                 continue
+            if _is_verify_clipping(md_file):
+                continue  # 验证页落盘，非文章，跳过认领（防错误数据）
             recent_files.append((md_file, mtime, md_file not in existing_paths))
 
     # 第一步：精确匹配 —— 标题与文件名互为子串（substring gate 已足够强，移除对中文无效的字符集启发式）
@@ -565,7 +670,10 @@ def save_one_article(
     existing_files = set()
     for d in [CLIPPINGS_DIR, VAULT_DIR]:
         if d.exists():
-            for f in d.glob("*.md"):
+            # 与 find_and_rename 一致：CLIPPINGS_DIR 用 rglob，否则快照漏记深层文件，
+            # 轮询时会把旧的畸形目录文件误判为"新文件"而错认领。
+            matcher = d.rglob if d == CLIPPINGS_DIR else d.glob
+            for f in matcher("*.md"):
                 try:
                     existing_files.add((f, os.path.getmtime(f)))
                 except OSError:
@@ -575,6 +683,9 @@ def save_one_article(
     print(f"  打开: {title[:50]}...")
     open_url(browser_app, url)
     time.sleep(WAIT_PAGE_LOAD)
+
+    # 2.5 微信验证页检测 + 自动确认（风控验证页会让 quick_clip 打在空页上 → 0 落盘）
+    handle_verify_page(browser_app)
 
     # 3. 触发 Web Clipper
     activate_browser(browser_app)

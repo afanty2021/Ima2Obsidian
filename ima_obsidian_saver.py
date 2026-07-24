@@ -398,6 +398,8 @@ def trigger_clipper_and_save(mods: list):
 # 打在验证页上无文章内容 → 0 落盘（见 Plans/snoopy-pondering-biscuit.md）。
 # Chrome execute JS 已开启，故在 quick_clip 前用 JS 检测 + 自动点「确认」。
 VERIFY_KEYWORDS = ("当前环境异常", "验证后才能正常访问", "环境异常", "完成验证")
+# 「去验证」按钮(id=js_verify)在验证页渲染较慢，click_confirm 首次可能落空，故重试
+VERIFY_CLICK_RETRIES = 4
 
 
 def execute_chrome_js(js: str, browser_app: str = "Google Chrome") -> Optional[str]:
@@ -469,7 +471,14 @@ def handle_verify_page(browser_app: str = "Google Chrome") -> bool:
         encountered = True
         print(f"    ⚠️ 检测到微信验证页，尝试自动确认（轮 {attempt + 1}/2）")
         print(f"       [自取证] title={snap.get('title')!r} text={(snap.get('text') or '')[:120]!r}")
-        if not click_confirm(browser_app):
+        # 「去验证」a(id=js_verify)渲染慢，click_confirm 首次可能落空 → 重试等渲染
+        clicked = False
+        for _ in range(VERIFY_CLICK_RETRIES):
+            if click_confirm(browser_app):
+                clicked = True
+                break
+            time.sleep(1.0)
+        if not clicked:
             print("    ⚠️ 未找到确认按钮，放弃（保持未保存，下次重试）")
             return True
         time.sleep(3.0)  # 等点确认后页面跳转到真文章

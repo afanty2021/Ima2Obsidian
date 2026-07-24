@@ -87,13 +87,25 @@ class TestHandleVerifyPage:
         assert mock_click.call_count == 1
 
     def test_verify_page_no_confirm_button_gives_up(self):
-        """验证页但找不到确认按钮 → 返回 True（遇到过），点 1 次失败即放弃不重试"""
+        """验证页但找不到确认按钮 → 返回 True（遇到过）；重试耗尽才放弃（a 渲染慢）"""
         with patch("ima_obsidian_saver.read_page_snapshot",
                    return_value={"title": "验证", "text": "当前环境异常"}), \
              patch("ima_obsidian_saver.click_confirm", return_value=False) as mock_click, \
              patch("ima_obsidian_saver.time.sleep"):
             assert saver.handle_verify_page("Google Chrome") is True
-        assert mock_click.call_count == 1
+        assert mock_click.call_count == saver.VERIFY_CLICK_RETRIES  # 重试耗尽才放弃
+
+    def test_retries_click_confirm_until_button_renders(self):
+        """「去验证」a 渲染慢，click_confirm 首次落空 → 重试到成功"""
+        snaps = [
+            {"title": "验证", "text": "当前环境异常"},
+            {"title": "文章", "text": "正文"},  # 点确认后离开验证页
+        ]
+        with patch("ima_obsidian_saver.read_page_snapshot", side_effect=snaps), \
+             patch("ima_obsidian_saver.click_confirm", side_effect=[False, True]) as mock_click, \
+             patch("ima_obsidian_saver.time.sleep"):
+            assert saver.handle_verify_page("Google Chrome") is True
+        assert mock_click.call_count == 2  # 首次落空，重试成功
 
 
 class TestExtractPublishDateJs:

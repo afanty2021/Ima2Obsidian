@@ -590,7 +590,10 @@ def _is_verify_clipping(md_path: Path) -> bool:
         txt = md_path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
-    if '"微信公众平台"' in txt:  # 验证页落盘 frontmatter title 强标志
+    # 验证页落盘 frontmatter title 恒为"微信公众平台"（文章 title 是文章名）→ 直接判定。
+    # 正则锚定 title 行并兼容 YAML 引号变体（双引号/单引号/无引号），不依赖单一引号格式
+    # （纯中文 title 在 YAML 中常态无引号，旧的 '"微信公众平台"' 子串匹配会落空）。
+    if re.search(r'^title:\s*["\']?微信公众平台["\']?\s*$', txt, re.MULTILINE):
         return True
     if any(k in txt for k in DELETED_CLIPPING_MARKERS):  # 删除页整句，单命中可靠
         return True

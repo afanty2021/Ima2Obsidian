@@ -66,8 +66,19 @@ class TestMalformedNestedDir:
         assert saver._is_verify_clipping(md) is False
 
     def test_verify_title_strong_signal(self, tmp_path):
-        """frontmatter title=微信公众平台 → 验证页落盘（强标志，无视 marker 数量）"""
+        """frontmatter title=微信公众平台 → 验证页落盘（强标志，无视 marker 数量）
+
+        body 故意不含任何 VERIFY marker（sum=0），使本测试只能由强信号分支触发——
+        若强信号分支被误删，sum<2 → False → 测试失败，从而防御该分支回归。
+        """
         md = tmp_path / "v.md"
-        md.write_text('---\ntitle: "微信公众平台"\n---\n环境异常 完成验证 去验证',
+        md.write_text('---\ntitle: "微信公众平台"\n---\n这是正文，不含任何验证页 marker。',
+                      encoding="utf-8")
+        assert saver._is_verify_clipping(md) is True
+
+    def test_verify_title_strong_signal_unquoted(self, tmp_path):
+        """title 无引号（YAML 纯中文 title 常态）→ 强信号正则仍应命中（兼容引号变体）"""
+        md = tmp_path / "v.md"
+        md.write_text('---\ntitle: 微信公众平台\n---\n正文无 marker。',
                       encoding="utf-8")
         assert saver._is_verify_clipping(md) is True

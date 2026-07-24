@@ -37,3 +37,19 @@ def test_is_on_screen_false_uses_bring_to_front_not_restart():
     mock_restart.assert_not_called()
     # bring_to_front 经 run_cua 调用
     assert any("bring_to_front" in " ".join(str(a) for a in c.args) for c in mock_cua.call_args_list)
+
+
+def test_combo_is_on_screen_false_and_y_offscreen_also_restarts():
+    """is_on_screen=False 且 y<-50 的组合 → bring_to_front 切回 Space 后仍须复查 y 并 restart_ima
+
+    旧 if/elif 互斥逻辑下，is_on_screen=False 命中 if 后 elif(y<-50) 永不评估，组合情况的
+    y<-50 得不到复位。改顺序 if 后，bring_to_front 后复查 y 仍<-50 → 触发 restart_ima。
+    """
+    with patch("ima_incremental_update.get_ima_main_window",
+               side_effect=[_win(False, -100), _win(True, -100), _win(True, 33)]), \
+         patch("ima_incremental_update.restart_ima") as mock_restart, \
+         patch("ima_incremental_update.run_cua", return_value='{"tree_markdown":""}'), \
+         patch("ima_incremental_update.subprocess.run"), \
+         patch("ima_incremental_update.time.sleep"):
+        ima_incremental_update.navigate_to_kb("AI")
+    mock_restart.assert_called_once()

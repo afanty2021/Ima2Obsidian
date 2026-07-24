@@ -306,7 +306,8 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
     #   切 Space 拉前台，保持页面状态（实测 AXStaticText 0→92）。
     # - y<-50（窗口被移到屏外，同 Space）：bring_to_front 只 activate 不移动窗口位置，须 restart_ima
     #   quit+relaunch 重置 y≥0（osascript/drag 无法程序化移回 Electron 窗口，见 restart_ima docstring）。
-    bounds = window.get("bounds", {})
+    # 两步顺序执行（非 if/elif 互斥）：is_on_screen=False 且 y<-50 的组合情况，须先 bring_to_front
+    # 切回 Space、再复查 y 走 restart_ima——否则若用 elif，y<-50 在 is_on_screen=False 时永远得不到复位。
     if not window.get("is_on_screen", True):
         log(f"⚠️  IMA 窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到前台...")
         try:
@@ -318,9 +319,15 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
                 return False
         except Exception as e:
             log(f"⚠️  bring_to_front 失败: {e}，继续尝试原窗口")
-    elif bounds.get("y", 0) < -50:
-        log(f"⚠️  IMA 窗口在屏幕外 (bounds.y={bounds.get('y')})，restart_ima 重置窗口位置...")
-        restart_ima()
+
+    # 复查最新窗口的 y（bring_to_front 切回 Space 可能暴露离屏 y），独立 if 非 elif，
+    # 覆盖 is_on_screen=False 且 y<-50 的组合情况。restart_ima 包 try 对齐 bring_to_front 的 fail-soft。
+    if window and window.get("bounds", {}).get("y", 0) < -50:
+        log(f"⚠️  IMA 窗口在屏幕外 (bounds.y={window.get('bounds', {}).get('y')})，restart_ima 重置窗口位置...")
+        try:
+            restart_ima()
+        except Exception as e:
+            log(f"⚠️  restart_ima 失败: {e}，继续尝试原窗口")
         window = get_ima_main_window()
         if not window:
             log("❌ restart_ima 后仍未找到 IMA 窗口")

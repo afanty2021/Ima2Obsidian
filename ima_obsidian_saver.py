@@ -141,6 +141,23 @@ def extract_publish_date(url: str) -> str:
     return datetime.now().strftime("%y%m%d")
 
 
+def extract_publish_date_js(browser_app: str = "Google Chrome") -> Optional[str]:
+    """execute JS 读微信文章页 #publish_time 元素的发布日期（如 '2026年7月15日 09:56'）→ YYMMDD。
+
+    requests 抓到的是微信精简页（无 create_time 字段，extract_publish_date 必失败）；
+    浏览器渲染后 #publish_time 才有发布日期，故 open 文章后用本函数读（更可靠）。
+    非日期文本/失败返回 None，让上游降级到 extract_publish_date 的值或 extract_date_from_content。
+    """
+    js = "(document.getElementById('publish_time')||{}).textContent"
+    raw = execute_chrome_js(js, browser_app)
+    if not raw:
+        return None
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", raw)
+    if not m:
+        return None
+    return f"{m.group(1)[2:]}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+
+
 def extract_date_from_content(text: str) -> Optional[str]:
     """从 Web Clipper 保存的文章正文提取发布日期（如 *2026年6月25日 10:00*）
 
@@ -686,6 +703,12 @@ def save_one_article(
 
     # 2.5 微信验证页检测 + 自动确认（风控验证页会让 quick_clip 打在空页上 → 0 落盘）
     handle_verify_page(browser_app)
+
+    # 2.6 execute JS 读 #publish_time 覆盖日期（比 requests 预提取可靠；验证页/未加载则降级）
+    js_date = extract_publish_date_js(browser_app)
+    if js_date:
+        date_str = js_date
+        print(f"    发布日期(execute JS): {date_str}")
 
     # 3. 触发 Web Clipper
     activate_browser(browser_app)

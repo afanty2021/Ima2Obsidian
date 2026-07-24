@@ -94,3 +94,28 @@ class TestHandleVerifyPage:
              patch("ima_obsidian_saver.time.sleep"):
             assert saver.handle_verify_page("Google Chrome") is True
         assert mock_click.call_count == 1
+
+
+class TestExtractPublishDateJs:
+    """execute JS 读微信文章页 #publish_time（如 '2026年7月15日 09:56'）→ YYMMDD。
+
+    requests 抓到的是微信精简页（无 create_time 字段，extract_publish_date 必失败）；
+    浏览器渲染后 #publish_time 元素才有发布日期，故改用 execute JS。
+    """
+
+    def test_parses_weixin_publish_time(self):
+        with patch("ima_obsidian_saver.execute_chrome_js", return_value="2026年7月15日 09:56"):
+            assert saver.extract_publish_date_js() == "260715"
+
+    def test_single_digit_month_day(self):
+        with patch("ima_obsidian_saver.execute_chrome_js", return_value="2026年7月5日 10:00"):
+            assert saver.extract_publish_date_js() == "260705"
+
+    def test_none_when_empty(self):
+        with patch("ima_obsidian_saver.execute_chrome_js", return_value=None):
+            assert saver.extract_publish_date_js() is None
+
+    def test_none_when_not_a_date(self):
+        """验证页/未加载页读到的非日期文本 → None（让上游降级）"""
+        with patch("ima_obsidian_saver.execute_chrome_js", return_value="微信公众平台"):
+            assert saver.extract_publish_date_js() is None

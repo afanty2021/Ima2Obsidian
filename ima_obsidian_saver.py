@@ -591,9 +591,12 @@ def _is_verify_clipping(md_path: Path) -> bool:
     except OSError:
         return False
     # 验证页落盘 frontmatter title 恒为"微信公众平台"（文章 title 是文章名）→ 直接判定。
-    # 正则锚定 title 行并兼容 YAML 引号变体（双引号/单引号/无引号），不依赖单一引号格式
-    # （纯中文 title 在 YAML 中常态无引号，旧的 '"微信公众平台"' 子串匹配会落空）。
-    if re.search(r'^title:\s*["\']?微信公众平台["\']?\s*$', txt, re.MULTILINE):
+    # 只在首个 frontmatter 块（--- ... ---）内搜，避免正文 YAML 代码块（讲 Web Clipper 等
+    # 技术文章引用 frontmatter 示例）误判 → 跳过认领 → 静默保存失败。
+    fm = re.match(r'^---\s*\n(.*?)\n---', txt, re.DOTALL)
+    fm_text = fm.group(1) if fm else ""
+    # 兼容 YAML 引号变体（双引号/单引号/无引号；纯中文 title 常态无引号）
+    if re.search(r'^title:\s*["\']?微信公众平台["\']?\s*$', fm_text, re.MULTILINE):
         return True
     if any(k in txt for k in DELETED_CLIPPING_MARKERS):  # 删除页整句，单命中可靠
         return True

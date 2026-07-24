@@ -82,3 +82,16 @@ class TestMalformedNestedDir:
         md.write_text('---\ntitle: 微信公众平台\n---\n正文无 marker。',
                       encoding="utf-8")
         assert saver._is_verify_clipping(md) is True
+
+    def test_title_in_body_codeblock_not_misjudged(self, tmp_path):
+        """正文 YAML 代码块含 'title: 微信公众平台'（非 frontmatter）→ 不误判（修 code-review followup）
+
+        re.MULTILINE 的 ^title:...$ 会匹配正文任意行；讲 Web Clipper/Obsidian 的技术文章
+        正文常含 YAML 示例 → 误判验证页 → 跳过认领 → 静默保存失败。修复：只搜首个 frontmatter 块。
+        """
+        md = tmp_path / "tech.md"
+        md.write_text(
+            '---\ntitle: "Web Clipper 配置指南"\n---\n'
+            '配置示例：\n```yaml\ntitle: 微信公众平台\n```\n这是正文。',
+            encoding="utf-8")
+        assert saver._is_verify_clipping(md) is False

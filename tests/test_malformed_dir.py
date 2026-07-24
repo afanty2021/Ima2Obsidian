@@ -53,3 +53,21 @@ class TestMalformedNestedDir:
         )
         assert renamed is False  # 验证页落盘不被认领
         assert verify_md.exists()  # 仍留在 Clippings，未被移动
+
+    def test_single_marker_in_body_not_misjudged(self, tmp_path):
+        """正文含单个 marker（如'环境异常'）但 title 非验证页 → 不误判为验证页落盘（修 code-review #2）
+
+        marker 是验证页特征词但正文也可能含；只有 frontmatter title=微信公众平台（验证页落盘
+        恒为此 title）或 ≥2 个 marker 同时命中才算验证页，避免误伤合法文章。
+        """
+        md = tmp_path / "article.md"
+        md.write_text('---\ntitle: "论环境异常的影响"\n---\n本文讨论环境异常现象及其对策。',
+                      encoding="utf-8")
+        assert saver._is_verify_clipping(md) is False
+
+    def test_verify_title_strong_signal(self, tmp_path):
+        """frontmatter title=微信公众平台 → 验证页落盘（强标志，无视 marker 数量）"""
+        md = tmp_path / "v.md"
+        md.write_text('---\ntitle: "微信公众平台"\n---\n环境异常 完成验证 去验证',
+                      encoding="utf-8")
+        assert saver._is_verify_clipping(md) is True

@@ -32,6 +32,11 @@ class TestIsVerifyPage:
         """验证页 text 没渲染只剩 title='微信公众平台' → 也命中（修实测 33 篇漏检）"""
         assert saver.is_verify_page({"title": "微信公众平台", "text": ""}) is True
 
+    def test_verify_title_with_long_text_not_misjudged(self):
+        """慢加载文章 title 暂时'微信公众平台'但 text 已有长正文 → 不误判（修 code-review #3）"""
+        long_text = "这是文章正文内容，已经加载出来了。" * 5  # >50 字
+        assert saver.is_verify_page({"title": "微信公众平台", "text": long_text}) is False
+
 
 class TestReadPageSnapshot:
     def test_parse_json(self):

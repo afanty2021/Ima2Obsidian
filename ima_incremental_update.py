@@ -301,14 +301,14 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
         log("❌ 未找到 IMA 窗口，无法导航")
         return False
 
-    # 检测窗口不在屏幕（is_on_screen=False：在别的 Space/隐藏）→ bring_to_front 拉到当前屏幕前台。
-    # cua-driver 读非屏幕窗口 AX 树为空（仅菜单栏，AXStaticText=0），导航必失败。
-    # 旧逻辑 restart_ima：重启不解决 is_on_screen=False（窗口仍在别的 Space），且回到默认对话页丢状态。
-    # bring_to_front 用 NSRunningApplication.activate（归因已授权的 com.trycua.driver），
-    # 拉窗口到前台 + 保持页面状态。实测：is_on_screen=False 时 AXStaticText 0→92。
+    # 窗口不在屏幕的两种情况分别处理（bring_to_front 对 is_on_screen=False 有效，但对 y<0 屏外无效）：
+    # - is_on_screen=False（窗口在别的 Space/隐藏）：bring_to_front 用 NSRunningApplication.activate
+    #   切 Space 拉前台，保持页面状态（实测 AXStaticText 0→92）。
+    # - y<-50（窗口被移到屏外，同 Space）：bring_to_front 只 activate 不移动窗口位置，须 restart_ima
+    #   quit+relaunch 重置 y≥0（osascript/drag 无法程序化移回 Electron 窗口，见 restart_ima docstring）。
     bounds = window.get("bounds", {})
-    if not window.get("is_on_screen", True) or bounds.get("y", 0) < -50:
-        log(f"⚠️  IMA 窗口不在屏幕 (bounds={bounds}, is_on_screen={window.get('is_on_screen')})，bring_to_front 拉到前台...")
+    if not window.get("is_on_screen", True):
+        log(f"⚠️  IMA 窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到前台...")
         try:
             run_cua(["call", "bring_to_front", json.dumps({"pid": window["pid"]})])
             time.sleep(2)
@@ -318,6 +318,13 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
                 return False
         except Exception as e:
             log(f"⚠️  bring_to_front 失败: {e}，继续尝试原窗口")
+    elif bounds.get("y", 0) < -50:
+        log(f"⚠️  IMA 窗口在屏幕外 (bounds.y={bounds.get('y')})，restart_ima 重置窗口位置...")
+        restart_ima()
+        window = get_ima_main_window()
+        if not window:
+            log("❌ restart_ima 后仍未找到 IMA 窗口")
+            return False
 
     pid = window["pid"]
     window_id = window["window_id"]

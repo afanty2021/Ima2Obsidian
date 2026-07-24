@@ -251,9 +251,27 @@ def mark_saved(article_id: int, published_date: str = None):
         conn.commit()
 
 
+def mark_deleted(article_id: int):
+    """把文章标记为「已被发布者删除」：status 改为 'deleted'，永久跳出待保存队列。
+
+    与 mark_saved 不同——删除是永久状态，不写 obsidian_saved（保持其 0/NULL 语义
+    即「从未成功保存过」），仅改 status。所有待保存查询（get_unsaved_articles /
+    get_stats / reclaim_clippings / incremental_update）都用 WHERE status='success'，
+    故 status='deleted' 自动从这些查询消失，无需改任何 WHERE，也不会被下次运行反复打开。
+    不计 failed_count，避免 0 落盘的删除页触发上游 launchd/incremental_update 告警。
+    """
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE articles SET status = 'deleted' WHERE id = ?",
+            (article_id,),
+        )
+        conn.commit()
+
+
 def get_stats(kb: str = None):
     """
-    返回 {total, saved, unsaved}。
+    返回 {total, saved, unsaved, deleted}。
 
     unsaved 直接用与 get_unsaved_articles 完全相同的 WHERE 计算，
     避免 max(0, total-saved) 在 obsidian_saved 出现非 {0,1,NULL} 异常值时
@@ -278,7 +296,16 @@ def get_stats(kb: str = None):
             params,
         )
         unsaved = c.fetchone()[0]
-    return {"total": total, "saved": saved, "unsaved": unsaved}
+        # deleted：status='deleted'（已被发布者删除，永久跳过）。与 total 同 url/kb 口径，
+        # 但 status 维度独立——不计入 total/unsaved，单独展示有多少文章被发布者删除。
+        c.execute(
+            "SELECT COUNT(*) FROM articles "
+            "WHERE url LIKE '%mp.weixin.qq.com%' AND status = 'deleted'"
+            + (" AND knowledge_base = ?" if kb else ""),
+            params,
+        )
+        deleted = c.fetchone()[0]
+    return {"total": total, "saved": saved, "unsaved": unsaved, "deleted": deleted}
 
 
 # ==================== 浏览器自动化 ====================
@@ -435,23 +462,50 @@ def read_page_snapshot(browser_app: str = "Google Chrome") -> Optional[dict]:
 
 
 def is_verify_page(snapshot: Optional[dict]) -> bool:
-    """判断页面快照是否为微信风控验证页（纯函数）。"""
+    """判断页面快照是否为微信风控验证页（纯函数）。
+
+    验证页 text 可能没渲染（只剩 title='微信公众平台'），故 title 判定优先于关键词扫描。
+    """
     if not snapshot:
         return False
-    text = (snapshot.get("text") or "") + (snapshot.get("title") or "")
+    title = snapshot.get("title") or ""
+    if title == "微信公众平台":  # 验证页 title（text 没渲染时的可靠标志）
+        return True
+    text = (snapshot.get("text") or "") + title
     return any(k in text for k in VERIFY_KEYWORDS)
 
 
-def click_confirm(browser_app: str = "Google Chrome") -> bool:
-    """在当前页查找「确认/继续访问/继续/确定」可点击元素并点击，返回是否点到。
+# 微信「文章已被发布者删除」特征词。这类文章已不存在，永远无法保存——若保持未保存，
+# 每次运行都会反复打开它（0 落盘 → failed_count++ → 触发上游告警）。检测到即 mark_deleted
+# 把 status 改 'deleted'，自动从所有 status='success' 查询消失，永久跳过。
+DELETED_KEYWORDS = ("该内容已被发布者删除", "此内容因违规已删除")
 
-    多 selector 容错：验证页「确认」按钮真实 DOM 未知（间歇触发无法当场取证），故遍历
-    常见可点击元素按文本匹配。execute_chrome_js 返回 '1' 表示点到。
+
+def is_deleted_page(snapshot: Optional[dict]) -> bool:
+    """判断页面快照是否为「文章已被发布者删除」页（纯函数，与 is_verify_page 同构）。
+
+    删除页是永久状态（不同于可恢复的验证页）：命中后短路返回，不触发 quick_clip。
+    关键词与 VERIFY_KEYWORDS 互斥（删除页文本不含验证词），二者可先后检测互不误判。
     """
-    js = ("var b=[...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')];"
+    if not snapshot:
+        return False
+    text = (snapshot.get("text") or "") + (snapshot.get("title") or "")
+    return any(k in text for k in DELETED_KEYWORDS)
+
+
+def click_confirm(browser_app: str = "Google Chrome") -> bool:
+    """点掉验证页「去验证」按钮，返回是否点到。
+
+    优先 getElementById('js_verify')——验证页「去验证」a 的稳定 id，不依赖 selector 时机
+    （实测 selector 遍历在 saver 自动跑时偶发漏点）。js_verify 不在时退回 selector 文本匹配。
+    execute_chrome_js 返回 '1' 表示点到。
+    """
+    js = ("var v=document.getElementById('js_verify');"
+          "if(v){v.click();'1'}else{"
+          "var b=[...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')];"
           "var k=['确认','继续访问','继续','确定','去验证'];"
           "for(var e of b){var t=(e.textContent||e.value||'').trim();"
-          "if(k.some(function(x){return t.indexOf(x)>=0})){e.click();return '1'}} '0'")
+          "if(k.some(function(x){return t.indexOf(x)>=0})){e.click();return '1'}}'0'}")
     return execute_chrome_js(js, browser_app) == "1"
 
 
@@ -517,18 +571,21 @@ def _non_conflicting_path(target: Path, source: Path) -> Path:
         n += 1
 
 
-# Web Clipper 落盘的验证页内容特征。saver 在验证页上 quick_clip 会把验证页存成 md
-# （title=微信公众平台），find_and_rename 须排除这类文件，防止把验证页当文章认领。
+# Web Clipper 落盘的干扰页内容特征。saver 在验证页/删除页上 quick_clip 会把干扰页存成 md
+# （title=微信公众平台），find_and_rename 须排除这类文件，防止把干扰页当文章认领。
+# 删除页命中后已短路不 clip，此处为防御性兜底（时序异常/短路未生效时仍能拦截）。
 VERIFY_CLIPPING_MARKERS = ("环境异常", "完成验证", "去验证")
+DELETED_CLIPPING_MARKERS = ("该内容已被发布者删除", "此内容因违规已删除")
 
 
 def _is_verify_clipping(md_path: Path) -> bool:
-    """检测 Web Clipper 落盘的 .md 是否为微信验证页内容（非文章）。"""
+    """检测 Web Clipper 落盘的 .md 是否为验证页/删除页等干扰内容（非文章）。"""
     try:
         txt = md_path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
-    return any(k in txt for k in VERIFY_CLIPPING_MARKERS) or '"微信公众平台"' in txt
+    markers = VERIFY_CLIPPING_MARKERS + DELETED_CLIPPING_MARKERS
+    return any(k in txt for k in markers) or '"微信公众平台"' in txt
 
 
 def find_and_rename_in_vault(
@@ -667,11 +724,12 @@ def save_one_article(
     target_folder: str = None,
 ):
     """
-    返回 (success: bool, date_str: Optional[str])。
+    返回 (status: str, date_str: Optional[str])，status ∈ {'saved','failed','deleted'}。
 
-    date_str 在成功时为用于文件命名的 YYMMDD；失败时为 None。
-    调用方应将 date_str 传给 mark_saved 持久化到 published_date 列，
-    避免 DB 中只留文件名而查不到日期。
+    - 'saved'：文件已落盘并改名，date_str 为用于命名的 YYMMDD（调用方传给 mark_saved）
+    - 'failed'：未落盘（验证页/未找到文件等可重试失败），date_str=None，下次自动重试
+    - 'deleted'：文章已被发布者删除（永久不可恢复），date_str=None（调用方调 mark_deleted）
+    调用方据 status 分流：saved→mark_saved，deleted→mark_deleted，failed→仅计数。
     """
     url = article["url"]
     title = article.get("title", "Unknown") or "Unknown"
@@ -685,7 +743,7 @@ def save_one_article(
         print(f"  [DRY RUN] {title[:50]}...")
         print(f"    发布日期: {date_str}")
         print(f"    目标位置: {folder_info}{new_name[:60]}")
-        return True, date_str
+        return "saved", date_str
 
     # 1. 提取发布日期
     print(f"  提取日期...")
@@ -712,6 +770,17 @@ def save_one_article(
 
     # 2.5 微信验证页检测 + 自动确认（风控验证页会让 quick_clip 打在空页上 → 0 落盘）
     handle_verify_page(browser_app)
+
+    # 2.55 「文章已被发布者删除」检测：永久不可恢复，命中即短路返回，不触发 quick_clip
+    #   （删除页 quick_clip 只会 0 落盘；且保持未保存会被每次运行反复打开 → failed_count 假告警）
+    snap = read_page_snapshot(browser_app)
+    if is_deleted_page(snap):
+        print(f"    🗑️  文章已被发布者删除，标记 status='deleted' 永久跳过")
+        print(f"       [自取证] title={(snap or {}).get('title')!r} "
+              f"text={((snap or {}).get('text') or '')[:120]!r}")
+        close_tab(browser_app)
+        time.sleep(WAIT_CLOSE_TAB)
+        return "deleted", None
 
     # 2.6 execute JS 读 #publish_time 覆盖日期（比 requests 预提取可靠；验证页/未加载则降级）
     js_date = extract_publish_date_js(browser_app)
@@ -753,10 +822,13 @@ def save_one_article(
     close_tab(browser_app)
     time.sleep(WAIT_CLOSE_TAB)
 
-    # 仅当文件确实已保存并改名/移动时才算成功，否则不标记为已保存以便下次重试
+    # 返回 (status, date_str)：status ∈ {'saved','failed','deleted'}，二元组契约。
+    # 仅当文件确实已保存并改名/移动时才算 'saved'，否则 'failed'（不 mark_saved 以便下次重试）。
     # actual_date 优先取 find_and_rename_in_vault 从文件内容提取的真实日期
     # （覆盖 extract_publish_date 降级为今天的值），让 DB published_date 与文件名一致
-    return renamed, (actual_date or date_str if renamed else None)
+    if renamed:
+        return "saved", (actual_date or date_str)
+    return "failed", None
 
 
 # ==================== 主函数 ====================
@@ -803,6 +875,8 @@ def main():
     print(f"  微信文章总数: {stats['total']}")
     print(f"  已保存到 Obsidian: {stats['saved']}")
     print(f"  待保存: {stats['unsaved']}")
+    if stats.get("deleted"):
+        print(f"  已删除(永久跳过): {stats['deleted']}")
     print(f"\nObsidian Vault: {VAULT_DIR}")
     if args.des:
         print(f"目标文件夹: {args.des}")
@@ -842,20 +916,27 @@ def main():
 
     saved_count = 0
     failed_count = 0
+    deleted_count = 0
 
     for i, article in enumerate(articles, 1):
         print(f"\n[{i}/{len(articles)}]", end=" ")
         try:
-            success, date_str = save_one_article(
+            status, date_str = save_one_article(
                 article, browser_config, mode=args.mode, dry_run=args.dry_run,
                 target_folder=args.des
             )
-            if success:
+            if status == "saved":
                 if not args.dry_run:
                     mark_saved(article["id"], published_date=date_str)
                 saved_count += 1
                 print(f"    ✅ 完成")
-            else:
+            elif status == "deleted":
+                # 文章已被发布者删除：永久跳过，不计 failed（避免触发上游告警）
+                if not args.dry_run:
+                    mark_deleted(article["id"])
+                deleted_count += 1
+                print(f"    🗑️  已删除（标记 status='deleted' 永久跳过）")
+            else:  # failed
                 failed_count += 1
                 print(f"    ❌ 失败")
         except KeyboardInterrupt:
@@ -878,10 +959,14 @@ def main():
     print("=" * 60)
     print(f"  本次成功: {saved_count} 篇")
     print(f"  本次失败: {failed_count} 篇")
+    print(f"  本次已删除: {deleted_count} 篇")
     print(f"  剩余待保存: {stats['unsaved']}")
+    if stats.get("deleted"):
+        print(f"  累计已删除(永久跳过): {stats['deleted']} 篇")
 
     # 退出码：让上游（incremental_update / launchd）能据失败数告警
     #   dry-run 不告警；全部失败 exit 1；部分失败 exit 2；否则 0
+    #   deleted 不计入 failed（文章本身已不存在，非系统故障，不应告警）
     if not args.dry_run and failed_count > 0:
         sys.exit(1 if saved_count == 0 else 2)
 

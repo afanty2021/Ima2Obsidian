@@ -271,7 +271,7 @@ class TestReclaimPreservesDbDateWhenContentHasNoDate:
 # ==================== L4: get_stats 连接数回归锁 ====================
 
 class TestGetStatsConnectionCount:
-    """get_stats 用单连接做三条 SELECT（total / saved / unsaved）。
+    """get_stats 用单连接做四条 SELECT（total / saved / unsaved / deleted）。
 
     注意：本测试只锁"连接数 == 1"这一结构属性，不真正验证 TOCTOU 安全性。
     SQLite 默认 isolation_level 不对 SELECT 触发 BEGIN，故单连接内多次 SELECT
@@ -313,5 +313,5 @@ class TestGetStatsConnectionCount:
         assert len(instances) == 1, \
             f"get_stats 应只用 1 个连接（结构回归锁）；实际开了 {len(instances)} 个"
         # 结构回归锁 2：返回值正确（零成本消除"调了不验证"的被动孪生）
-        assert stats == {"total": 1, "saved": 0, "unsaved": 1}, \
-            f"get_stats 返回值应为 1/0/1；实际 {stats}"
+        assert stats == {"total": 1, "saved": 0, "unsaved": 1, "deleted": 0}, \
+            f"get_stats 返回值应为 1/0/1/0；实际 {stats}"

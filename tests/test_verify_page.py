@@ -28,6 +28,10 @@ class TestIsVerifyPage:
     def test_empty_snapshot(self):
         assert saver.is_verify_page({}) is False
 
+    def test_hit_verify_title_only(self):
+        """验证页 text 没渲染只剩 title='微信公众平台' → 也命中（修实测 33 篇漏检）"""
+        assert saver.is_verify_page({"title": "微信公众平台", "text": ""}) is True
+
 
 class TestReadPageSnapshot:
     def test_parse_json(self):
@@ -63,6 +67,12 @@ class TestClickConfirm:
         with patch("ima_obsidian_saver.execute_chrome_js", return_value="1") as m:
             saver.click_confirm()
         assert "去验证" in m.call_args[0][0]
+
+    def test_js_prioritizes_js_verify_id(self):
+        """click_confirm 应优先 getElementById('js_verify')（实测 selector 遍历在 saver 自动跑时漏点）"""
+        with patch("ima_obsidian_saver.execute_chrome_js", return_value="1") as m:
+            saver.click_confirm()
+        assert "getElementById('js_verify')" in m.call_args[0][0]
 
 
 class TestHandleVerifyPage:

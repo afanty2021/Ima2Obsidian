@@ -104,16 +104,21 @@ def test_save_one_article_propagates_content_date_to_main(tmp_path, monkeypatch)
     browser_config = {"app": "Chrome", "shortcut_mods": ["option", "shift"]}
 
     with patch("ima_obsidian_saver.extract_publish_date", return_value=today_str), \
+         patch("ima_obsidian_saver.extract_publish_date_js", return_value=None), \
          patch("ima_obsidian_saver.open_url"), \
+         patch("ima_obsidian_saver.handle_verify_page", return_value=False), \
+         patch("ima_obsidian_saver.read_page_snapshot",
+               return_value={"title": "测试", "text": "正文内容"}), \
          patch("ima_obsidian_saver.activate_browser"), \
          patch("ima_obsidian_saver.trigger_quick_clip"), \
+         patch("ima_obsidian_saver.time.sleep"), \
          patch("ima_obsidian_saver.close_tab"), \
          patch("ima_obsidian_saver.find_and_rename_in_vault",
                return_value=(True, real_date)):
         from ima_obsidian_saver import save_one_article
-        success, date_str = save_one_article(article, browser_config)
+        status, date_str = save_one_article(article, browser_config)
 
-    assert success is True
+    assert status == "saved"
     assert date_str == real_date, (
         f"save_one_article 应传回内容日期 {real_date} 而非 extract_publish_date 的 {today_str}；"
         f"否则 main 会把错误日期写进 DB"
@@ -121,10 +126,10 @@ def test_save_one_article_propagates_content_date_to_main(tmp_path, monkeypatch)
 
 
 class TestSaveOneArticleTupleContract:
-    """save_one_article 元组契约：所有路径必须返回 (bool, Optional[str]) 二元组"""
+    """save_one_article 元组契约：所有路径必须返回 (status:str, Optional[str]) 二元组"""
 
     def test_failure_returns_false_none(self, tmp_path, monkeypatch):
-        """renamed=False 时返回 (False, None)，不能只返回 False 或 (False, today_str)"""
+        """renamed=False 时返回 ('failed', None)，不能只返回单值或 ('failed', today_str)"""
         vault = tmp_path / "Vault"
         vault.mkdir()
         clip_dir = vault / "Clippings"
@@ -135,10 +140,18 @@ class TestSaveOneArticleTupleContract:
         article = {"id": 1, "url": "https://example.com/x", "title": "测试", "kb": "AI"}
         browser_config = {"app": "Chrome", "shortcut_mods": ["option", "shift"]}
 
+        # 失败路径 find_and_rename 恒 False，轮询会空转到 deadline（25s）；mock time.sleep
+        # 不推进 time.time 反而让循环死转——故把 WAIT_CLIP_TOTAL 归零让轮询立即到期。
+        monkeypatch.setattr("ima_obsidian_saver.WAIT_CLIP_TOTAL", 0)
         with patch("ima_obsidian_saver.extract_publish_date", return_value="260101"), \
+             patch("ima_obsidian_saver.extract_publish_date_js", return_value=None), \
              patch("ima_obsidian_saver.open_url"), \
+             patch("ima_obsidian_saver.handle_verify_page", return_value=False), \
+             patch("ima_obsidian_saver.read_page_snapshot",
+                   return_value={"title": "测试", "text": "正文内容"}), \
              patch("ima_obsidian_saver.activate_browser"), \
              patch("ima_obsidian_saver.trigger_quick_clip"), \
+             patch("ima_obsidian_saver.time.sleep"), \
              patch("ima_obsidian_saver.close_tab"), \
              patch("ima_obsidian_saver.find_and_rename_in_vault",
                    return_value=(False, None)):  # 模拟文件未找到
@@ -148,12 +161,12 @@ class TestSaveOneArticleTupleContract:
         # 必须是二元组，不是 bool，不是单值
         assert isinstance(result, tuple) and len(result) == 2, \
             f"应返回二元组，实际: {result!r}"
-        success, date_str = result
-        assert success is False
+        status, date_str = result
+        assert status == "failed"
         assert date_str is None, "失败时不应返回日期（main 不应据此调 mark_saved）"
 
     def test_dry_run_returns_true_and_date(self, tmp_path, monkeypatch):
-        """dry_run 返回 (True, date_str)，让 main 能据此打印但不持久化"""
+        """dry_run 返回 ('saved', date_str)，让 main 能据此打印但不持久化"""
         vault = tmp_path / "Vault"
         vault.mkdir()
         monkeypatch.setattr("ima_obsidian_saver.VAULT_DIR", vault)
@@ -164,7 +177,7 @@ class TestSaveOneArticleTupleContract:
 
         with patch("ima_obsidian_saver.extract_publish_date", return_value="250304"):
             from ima_obsidian_saver import save_one_article
-            success, date_str = save_one_article(article, browser_config, dry_run=True)
+            status, date_str = save_one_article(article, browser_config, dry_run=True)
 
-        assert success is True
+        assert status == "saved"
         assert date_str == "250304"

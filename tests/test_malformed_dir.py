@@ -95,3 +95,15 @@ class TestMalformedNestedDir:
             '配置示例：\n```yaml\ntitle: 微信公众平台\n```\n这是正文。',
             encoding="utf-8")
         assert saver._is_verify_clipping(md) is False
+
+    def test_long_article_with_deleted_phrase_not_skipped(self, tmp_path):
+        """合法长文章正文引用删除整句 → 不当干扰页跳过（避免静默保存失败）
+
+        删除页 .md 仅一句提示（整文件 <200 字）；合法文章正文长，即便引用整句 .md 也远超阈值。
+        """
+        md = tmp_path / "media.md"
+        body = ("近日有读者发现某公众号文章打开后提示该内容已被发布者删除，"
+                "据悉该文章此前因违规被投诉。" + "详细分析内容。" * 30)
+        md.write_text(f'---\ntitle: "媒体报道"\n---\n{body}', encoding="utf-8")
+        assert len(md.read_text(encoding="utf-8")) > 200  # 前置：长文件
+        assert saver._is_verify_clipping(md) is False

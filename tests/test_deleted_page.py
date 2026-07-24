@@ -42,6 +42,17 @@ class TestIsDeletedPage:
     def test_empty_snapshot(self):
         assert saver.is_deleted_page({}) is False
 
+    def test_long_article_with_phrase_not_deleted(self):
+        """合法长文章正文引用删除整句（讨论审查/媒体类）→ 不误判删除页
+
+        删除页是极简页（innerText <60 字）；合法文章正文长，即便引用整句也远超阈值，
+        避免 mark_deleted 永久跳过导致数据丢失。
+        """
+        long_body = ("近日有读者发现某公众号文章打开后提示该内容已被发布者删除，"
+                     "据悉该文章此前因违规被投诉。" + "详细情况分析" * 20)
+        assert len(long_body) > 60  # 前置：确实是长正文
+        assert saver.is_deleted_page({"title": "媒体报道", "text": long_body}) is False
+
 
 class TestSaveOneArticleDeletedPath:
     """save_one_article 检测到删除页须短路返回 ('deleted', None)，不触发 quick_clip。"""
@@ -55,16 +66,6 @@ class TestSaveOneArticleDeletedPath:
         monkeypatch.setattr("ima_obsidian_saver.VAULT_DIR", vault)
         monkeypatch.setattr("ima_obsidian_saver.CLIPPINGS_DIR", clip_dir)
         return vault, clip_dir
-
-    def _common_mocks(self, snapshot):
-        """save_one_article 浏览器链 mock：返回 (context_mgr, mock_dict)"""
-        return [
-            patch("ima_obsidian_saver.extract_publish_date", return_value="260101"),
-            patch("ima_obsidian_saver.open_url"),
-            patch("ima_obsidian_saver.handle_verify_page", return_value=False),
-            patch("ima_obsidian_saver.read_page_snapshot", return_value=snapshot),
-            patch("ima_obsidian_saver.time.sleep"),
-        ]
 
     def test_deleted_page_short_circuits(self, isolated_vault):
         """删除页：返回 ('deleted', None)，不调 trigger_quick_clip/find_and_rename，关闭标签"""

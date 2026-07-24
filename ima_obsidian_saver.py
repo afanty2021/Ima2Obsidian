@@ -486,12 +486,14 @@ def is_deleted_page(snapshot: Optional[dict]) -> bool:
     """判断页面快照是否为「文章已被发布者删除」页（纯函数，与 is_verify_page 同构）。
 
     删除页是永久状态（不同于可恢复的验证页）：命中后短路返回，不触发 quick_clip。
-    关键词与 VERIFY_KEYWORDS 互斥（删除页文本不含验证词），二者可先后检测互不误判。
+    要求文本短（<60 字）才判删除页——删除页是极简页（仅一句提示，innerText 很短）；
+    合法文章即便正文引用该整句（讨论审查/媒体类文章），前 800 字正文也远超阈值，
+    避免被误判删除页 → mark_deleted 永久跳过 → 不可逆数据丢失。
     """
     if not snapshot:
         return False
     text = (snapshot.get("text") or "") + (snapshot.get("title") or "")
-    return any(k in text for k in DELETED_KEYWORDS)
+    return len(text) < 60 and any(k in text for k in DELETED_KEYWORDS)
 
 
 def click_confirm(browser_app: str = "Google Chrome") -> bool:
@@ -583,7 +585,8 @@ def _is_verify_clipping(md_path: Path) -> bool:
     """检测 Web Clipper 落盘的 .md 是否为验证页/删除页等干扰内容（非文章）。
 
     title=微信公众平台 是验证页落盘强标志（文章 title 是文章名）→ 直接判定。
-    DELETED marker（整句）单命中可靠（正文罕见含整句）。
+    DELETED marker（整句）仅在文件短（<200 字）时单命中可靠——删除页 .md 仅一句提示，
+    合法文章即便引用整句正文也很长，避免误判 → 跳过认领 → 静默保存失败。
     VERIFY marker（环境异常等短词）正文也可能含 → 要求 ≥2 个同时命中，避免误伤合法文章。
     """
     try:
@@ -598,7 +601,9 @@ def _is_verify_clipping(md_path: Path) -> bool:
     # 兼容 YAML 引号变体（双引号/单引号/无引号；纯中文 title 常态无引号）
     if re.search(r'^title:\s*["\']?微信公众平台["\']?\s*$', fm_text, re.MULTILINE):
         return True
-    if any(k in txt for k in DELETED_CLIPPING_MARKERS):  # 删除页整句，单命中可靠
+    # 删除页 .md 仅一句提示（整文件很短）；合法文章即便正文引用整句，.md 也很长 →
+    # 要求文件短才判删除页落盘，避免误伤引用整句的合法文章（静默跳过认领 = 永久卡队列）。
+    if len(txt) < 200 and any(k in txt for k in DELETED_CLIPPING_MARKERS):
         return True
     return sum(1 for k in VERIFY_CLIPPING_MARKERS if k in txt) >= 2
 

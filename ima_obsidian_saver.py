@@ -37,7 +37,7 @@ import time
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 import warnings
 
@@ -466,6 +466,14 @@ def read_page_snapshot(browser_app: str = "Google Chrome") -> Optional[dict]:
         return None
 
 
+# ==================== 渐进验证：body 长度 debug print 节流 ====================
+
+# 已打印过的 body 长度集合：相同长度只打印一次，避免 launchd/cron 长期跑（1000 篇）
+# 累积大量重复 [debug] len(body)=N 噪声（spec §5 实证语义是「采集几个不同长度样本」，
+# 相同长度重复打印无信息增益）。
+_DEBUG_BODY_LEN_SEEN: Set[int] = set()
+
+
 # ==================== 永久不可恢复页判定（单源） ====================
 
 # 三类永久不可恢复页（行为一致：mark_deleted 永久跳过，不计 failed）：
@@ -844,11 +852,14 @@ def save_one_article(
     #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
     snap = read_page_snapshot(browser_app)
     # 渐进验证：<60 字阈值对真实屏蔽/违规页是否有效（spec §5 风险缓解措施）
-    # 默认开启；运维嫌吵可设 IMA_DEBUG_BODY_LEN=0 关闭
+    # 默认开启；运维嫌吵可设 IMA_DEBUG_BODY_LEN=0/false/no/off 关闭
     # TODO(渐进验证)：首篇屏蔽/违规 URL 命中后，根据日志确认 len(body) 真实长度；
     #   若 ≥60 字阈值过紧需调整 _deleted_reason；若确认阈值有效，移除此 print 与门控
-    if os.environ.get("IMA_DEBUG_BODY_LEN", "1") != "0":
-        print(f"    [debug] len(body)={len((snap or {}).get('text') or '')}")
+    if os.environ.get("IMA_DEBUG_BODY_LEN", "1").lower() not in ("0", "false", "no", "off", ""):
+        body_len = len((snap or {}).get('text') or '')
+        if body_len not in _DEBUG_BODY_LEN_SEEN:
+            _DEBUG_BODY_LEN_SEEN.add(body_len)
+            print(f"    [debug] len(body)={body_len}")
     reason = _deleted_reason(snap)
     if reason is not None:
         print(f"    🗑️  {reason}，标记 status='deleted' 永久跳过")

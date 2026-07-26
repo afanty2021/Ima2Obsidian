@@ -252,13 +252,18 @@ def mark_saved(article_id: int, published_date: str = None):
 
 
 def mark_deleted(article_id: int):
-    """把文章标记为「已被发布者删除」：status 改为 'deleted'，永久跳出待保存队列。
+    """把文章标记为「永久不可恢复」：status 改为 'deleted'，永久跳出待保存队列。
 
-    与 mark_saved 不同——删除是永久状态，不写 obsidian_saved（保持其 0/NULL 语义
+    涵盖三类页面（行为一致，DB 不区分）：
+      - 发布者删除（该内容已被发布者删除）
+      - 违规下架（此内容因违规已删除 / 此内容因违规无法查看）
+      - 账号屏蔽（此账号已被屏蔽，内容无法查看）
+
+    与 mark_saved 不同——永久不可恢复是终态，不写 obsidian_saved（保持其 0/NULL 语义
     即「从未成功保存过」），仅改 status。所有待保存查询（get_unsaved_articles /
-    get_stats / reclaim_clippings / incremental_update）都用 WHERE status='success'，
-    故 status='deleted' 自动从这些查询消失，无需改任何 WHERE，也不会被下次运行反复打开。
-    不计 failed_count，避免 0 落盘的删除页触发上游 launchd/incremental_update 告警。
+    get_stats / find_and_rename_in_vault / ima_incremental_update.py）都用
+    WHERE status='success'，故 status='deleted' 自动从这些查询消失，无需改任何 WHERE。
+    不计 failed_count，避免 0 落盘的删除页触发上游告警。
     """
     with closing(sqlite3.connect(DB_FILE)) as conn:
         c = conn.cursor()
@@ -296,8 +301,8 @@ def get_stats(kb: str = None):
             params,
         )
         unsaved = c.fetchone()[0]
-        # deleted：status='deleted'（已被发布者删除，永久跳过）。与 total 同 url/kb 口径，
-        # 但 status 维度独立——不计入 total/unsaved，单独展示有多少文章被发布者删除。
+        # deleted：status='deleted'（永久不可恢复，含发布者删除/违规/屏蔽）。与 total 同
+        # url/kb 口径，但 status 维度独立——不计入 total/unsaved，单独展示有多少文章永久不可恢复。
         c.execute(
             "SELECT COUNT(*) FROM articles "
             "WHERE url LIKE '%mp.weixin.qq.com%' AND status = 'deleted'"
@@ -788,7 +793,7 @@ def save_one_article(
 
     - 'saved'：文件已落盘并改名，date_str 为用于命名的 YYMMDD（调用方传给 mark_saved）
     - 'failed'：未落盘（验证页/未找到文件等可重试失败），date_str=None，下次自动重试
-    - 'deleted'：文章已被发布者删除（永久不可恢复），date_str=None（调用方调 mark_deleted）
+    - 'deleted'：永久不可恢复页（发布者删除/违规下架/账号屏蔽），date_str=None（调用方调 mark_deleted）
     调用方据 status 分流：saved→mark_saved，deleted→mark_deleted，failed→仅计数。
     """
     url = article["url"]
@@ -994,7 +999,7 @@ def main():
                 saved_count += 1
                 print(f"    ✅ 完成")
             elif status == "deleted":
-                # 文章已被发布者删除：永久跳过，不计 failed（避免触发上游告警）
+                # 永久不可恢复页（发布者删除/违规/屏蔽）：永久跳过，不计 failed（避免触发上游告警）
                 if not args.dry_run:
                     mark_deleted(article["id"])
                 deleted_count += 1

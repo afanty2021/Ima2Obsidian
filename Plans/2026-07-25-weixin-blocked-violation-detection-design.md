@@ -246,6 +246,10 @@ def mark_deleted(article_id: int):
 4. **新增关键词时重新审视现有逻辑前提**（v4→v5）：原 2 条整句 unlikely 作标题，并 title 无害；新增名词性短语「此账号已被屏蔽」打破这前提 → 标题误杀 → 改为只查 body。
 5. **docstring 引用的函数/常量必须实际存在**（v5）：`incremental_update` 是脚本非函数；`reclaim_clippings` 是旧称；`DELETED_KEYWORDS` 已删不能引用。
 
+> 勘误(最终 review 发现):教训 #5 称「reclaim_clippings 是 find_and_rename_in_vault 旧称」有误——
+> reclaim_clippings.py 是独立外部脚本(读 DB 认领孤儿),find_and_rename_in_vault 是 saver 内部函数
+> (读文件系统改名),两者职责不同。mark_deleted docstring 已恢复引用 reclaim_clippings.py。
+
 ## 7. 改动清单
 
 **`ima_obsidian_saver.py`**：

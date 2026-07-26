@@ -261,7 +261,7 @@ def mark_deleted(article_id: int):
 
     与 mark_saved 不同——永久不可恢复是终态，不写 obsidian_saved（保持其 0/NULL 语义
     即「从未成功保存过」），仅改 status。所有待保存查询（get_unsaved_articles /
-    get_stats / find_and_rename_in_vault / ima_incremental_update.py）都用
+    get_stats / reclaim_clippings.py / ima_incremental_update.py）都用
     WHERE status='success'，故 status='deleted' 自动从这些查询消失，无需改任何 WHERE。
     不计 failed_count，避免 0 落盘的删除页触发上游告警。
     """

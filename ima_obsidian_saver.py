@@ -646,9 +646,12 @@ def _is_verify_clipping(md_path: Path) -> bool:
     # 兼容 YAML 引号变体（双引号/单引号/无引号；纯中文 title 常态无引号）
     if re.search(r'^title:\s*["\']?微信公众平台["\']?\s*$', fm_text, re.MULTILINE):
         return True
-    # 删除页 .md 仅一句提示（整文件很短）；合法文章即便正文引用整句，.md 也很长 →
-    # 要求文件短才判删除页落盘，避免误伤引用整句的合法文章（静默跳过认领 = 永久卡队列）。
-    if len(txt) < 200 and any(k in txt for k in DELETED_CLIPPING_MARKERS):
+    # 删除页 .md 仅一句提示（正文很短）；合法文章即便正文引用整句，.md 正文也很长 →
+    # 要求正文短才判删除页落盘，避免误伤引用整句的合法文章（静默跳过认领 = 永久卡队列）。
+    # 剥 frontmatter 后算长度：真实 Web Clipper frontmatter（source URL 150+字 + author +
+    # published + tags）已 ~200 字，含 frontmatter 算长度会让 path ② 永不触发（fix #4）。
+    body_text = txt[fm.end():] if fm else txt
+    if len(body_text) < 200 and any(k in txt for k in DELETED_CLIPPING_MARKERS):
         return True
     return sum(1 for k in VERIFY_CLIPPING_MARKERS if k in txt) >= 2
 

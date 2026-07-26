@@ -144,3 +144,30 @@ class TestMalformedNestedDir:
         md.write_text(f'---\ntitle: "谈审查"\n---\n{body}', encoding="utf-8")
         assert len(md.read_text(encoding="utf-8")) > 200  # 前置：长文件
         assert saver._is_verify_clipping(md) is False
+
+    def test_clipping_blocked_marker_with_realistic_long_frontmatter(self, tmp_path):
+        """真实 Web Clipper frontmatter（source URL 150+字）+ 短正文 → path ② 应命中（fix #4）
+
+        生产 Web Clipper 落盘的 .md frontmatter 含 source URL（~150 字）+ author +
+        published + clipped + tags，frontmatter 本身已 >200 字。不剥 frontmatter 算长度时
+        len(txt) 永远 >200 → path ② 永不触发 → DELETED_CLIPPING_MARKERS 兜底失效。
+        fix #4：剥 frontmatter 后算正文长度，正文短 → path ② 命中。
+        """
+        md = tmp_path / "realistic.md"
+        frontmatter = (
+            '---\n'
+            'title: "此账号已被屏蔽"\n'
+            'source: "https://mp.weixin.qq.com/s?__biz=MzI2NTQzNjUyMw==&mid=2247484231&idx=1'
+            '&sn=abcdef1234567890abcdef1234567890&chksm=eaa1234567890abcdef1234567890abcdef&scene=27"\n'
+            'author: "某公众号"\n'
+            'published: "2026-07-15"\n'
+            'clipped: "2026-07-26"\n'
+            'tags: []\n'
+            '---\n'
+        )
+        body = "此账号已被屏蔽，内容无法查看"  # 正文短（<200 字）
+        md.write_text(frontmatter + body, encoding="utf-8")
+        # 前置：含 frontmatter 总长 >200（模拟真实 Web Clipper，旧逻辑在此就短路跳过 path ②）
+        assert len(md.read_text(encoding="utf-8")) > 200
+        # fix #4 后：剥 frontmatter 算正文长度，正文 <200 字 → path ② 命中
+        assert saver._is_verify_clipping(md) is True

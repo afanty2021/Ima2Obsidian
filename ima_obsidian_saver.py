@@ -507,10 +507,17 @@ def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
 def is_verify_page(snapshot: Optional[dict]) -> bool:
     """判断页面快照是否为微信风控验证页（纯函数）。
 
+    前置 _deleted_reason 排除——在 _deleted_reason 判定范围内（body <60 字且含
+    _DELETED_REASON_MAP 关键词）的永久不可恢复页不是验证页，避免 handle_verify_page
+    对屏蔽/违规页浪费 ~12-14s 重试（click_confirm 误点通用按钮 + 两轮 attempt sleep）。
+    验证页 body 不含 _DELETED_REASON_MAP 关键词 → _deleted_reason 返回 None → 原逻辑不变。
+
     text 或 title 含验证词 → 强信号；或 title='微信公众平台' 且 text 短（<50字，验证页
     没渲染——慢加载文章 text 已有长正文时不误判，避免 click_confirm 误点正文按钮）。
     """
     if not snapshot:
+        return False
+    if _deleted_reason(snapshot) is not None:       # 前置排除：删除页不是验证页
         return False
     title = snapshot.get("title") or ""
     text = snapshot.get("text") or ""

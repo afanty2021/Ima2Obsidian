@@ -37,6 +37,30 @@ class TestIsVerifyPage:
         long_text = "这是文章正文内容，已经加载出来了。" * 5  # >50 字
         assert saver.is_verify_page({"title": "微信公众平台", "text": long_text}) is False
 
+    def test_verify_page_excludes_blocked_account_page(self):
+        """屏蔽页（body 含「此账号已被屏蔽」）→ 不是验证页（前置 _deleted_reason 排除）
+
+        防止 handle_verify_page 对屏蔽页浪费 ~12-14s 重试（click_confirm 误点通用按钮
+        + 两轮 attempt sleep）。spec §3.3 决策 4。
+        """
+        snap = {"title": "微信公众平台", "text": "此账号已被屏蔽，内容无法查看"}
+        assert saver.is_verify_page(snap) is False
+
+    def test_verify_page_excludes_violation_unavailable_page(self):
+        """违规页（新文案）→ 不是验证页"""
+        snap = {"title": "微信公众平台", "text": "此内容因违规无法查看"}
+        assert saver.is_verify_page(snap) is False
+
+    def test_verify_page_excludes_publisher_deleted_page(self):
+        """发布者删除页 → 不是验证页（回归保护）"""
+        snap = {"title": "微信", "text": "该内容已被发布者删除"}
+        assert saver.is_verify_page(snap) is False
+
+    def test_verify_page_keeps_real_verify_page(self):
+        """真验证页（body 不含 DELETED 关键词）→ 仍命中（验证后转删除链路保留）"""
+        snap = {"title": "微信公众平台", "text": "当前环境异常，完成验证"}
+        assert saver.is_verify_page(snap) is True
+
 
 class TestReadPageSnapshot:
     def test_parse_json(self):

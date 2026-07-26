@@ -845,6 +845,8 @@ def save_one_article(
     snap = read_page_snapshot(browser_app)
     # 渐进验证：<60 字阈值对真实屏蔽/违规页是否有效（spec §5 风险缓解措施）
     # 默认开启；运维嫌吵可设 IMA_DEBUG_BODY_LEN=0 关闭
+    # TODO(渐进验证)：首篇屏蔽/违规 URL 命中后，根据日志确认 len(body) 真实长度；
+    #   若 ≥60 字阈值过紧需调整 _deleted_reason；若确认阈值有效，移除此 print 与门控
     if os.environ.get("IMA_DEBUG_BODY_LEN", "1") != "0":
         print(f"    [debug] len(body)={len((snap or {}).get('text') or '')}")
     reason = _deleted_reason(snap)

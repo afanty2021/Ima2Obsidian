@@ -107,3 +107,40 @@ class TestMalformedNestedDir:
         md.write_text(f'---\ntitle: "媒体报道"\n---\n{body}', encoding="utf-8")
         assert len(md.read_text(encoding="utf-8")) > 200  # 前置：长文件
         assert saver._is_verify_clipping(md) is False
+
+    def test_clipping_title_weixin_pub_platform_blocked(self, tmp_path):
+        """屏蔽页落盘（frontmatter title=微信公众平台）→ path ① 强信号命中 → 不认领
+
+        生产真实路径：微信系统提示页落盘后 frontmatter title 恒为「微信公众平台」，
+        _is_verify_clipping 第一检 title==微信公众平台 直接命中。
+        """
+        md = tmp_path / "blocked.md"
+        md.write_text('---\ntitle: "微信公众平台"\n---\n此账号已被屏蔽，内容无法查看。',
+                      encoding="utf-8")
+        assert saver._is_verify_clipping(md) is True
+
+    def test_clipping_blocked_marker_no_special_title(self, tmp_path):
+        """title 非「微信公众平台」+ DELETED_CLIPPING_MARKERS 命中 + <200 字 → path ② 命中
+
+        生产上 path ① 抢先（title 恒为微信平台），path ② 是概率性兜底（应对 title 变种）。
+        本测试故意用别的 title 才能走到 path ②，验证 DELETED_CLIPPING_MARKERS 兜底生效。
+        """
+        md = tmp_path / "v.md"
+        md.write_text('---\ntitle: "此账号已被屏蔽"\n---\n此账号已被屏蔽，内容无法查看',
+                      encoding="utf-8")
+        assert len(md.read_text(encoding="utf-8")) < 200  # 前置：短文件
+        assert saver._is_verify_clipping(md) is True
+
+    def test_clipping_long_article_with_blocked_marker_not_skipped(self, tmp_path):
+        """合法长文章含屏蔽整句 → 不误判（阈值护栏）
+
+        body 含 DELETED_CLIPPING_MARKERS 整句（非前缀）——若阈值被改成 2，path ② 命中
+        → 测试失败 → 暴露阈值回归。filler 必须用「填充文本。」字面值，禁含 VERIFY 标记
+        （「环境异常」/「完成验证」/「去验证」），否则 path ③ 抢先命中与预期矛盾。
+        multiplier 40 确保 len(str) > 200（_is_verify_clipping 用字符数判定，非字节数）。
+        """
+        md = tmp_path / "media.md"
+        body = "此账号已被屏蔽，内容无法查看。" + "填充文本。" * 40
+        md.write_text(f'---\ntitle: "谈审查"\n---\n{body}', encoding="utf-8")
+        assert len(md.read_text(encoding="utf-8")) > 200  # 前置：长文件
+        assert saver._is_verify_clipping(md) is False

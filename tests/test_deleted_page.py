@@ -257,3 +257,83 @@ class TestSaveOneArticleDeletedPath:
 
         assert result == ("deleted", None)
         assert mock_click.call_count == 0  # 屏蔽页不应触发 verify 重试
+
+    def test_save_one_article_long_body_with_keyword_logs_miss(self, isolated_vault, capsys):
+        """长 body(>=100) + 含 DELETED 关键词（不含 VERIFY）→ 漏检自证打 1 次（v7 §4.3）
+
+        v7 review #2 修复：单次调用内只打 1 次（_deleted_reason 纯函数，自证在调用点）。
+        """
+        saver._POSSIBLE_MISS_SEEN.clear()  # 防串扰
+        vault, clip_dir = isolated_vault
+        # body 含 DELETED 关键词但不含 VERIFY_KEYWORDS（避免 is_verify_page 走 True 分支）
+        body = "此账号已被屏蔽" + "填充文本。" * 30  # len >= 100
+        article = {"id": 1, "url": "https://mp.weixin.qq.com/s?__biz=T", "title": "T", "kb": "AI"}
+        browser_config = {"app": "Chrome", "shortcut_mods": ["option", "shift"]}
+
+        with patch("ima_obsidian_saver.extract_publish_date", return_value="260101"), \
+             patch("ima_obsidian_saver.open_url"), \
+             patch("ima_obsidian_saver.handle_verify_page", return_value=False), \
+             patch("ima_obsidian_saver.read_page_snapshot",
+                   return_value={"title": "某文章", "text": body}), \
+             patch("ima_obsidian_saver.activate_browser"), \
+             patch("ima_obsidian_saver.trigger_quick_clip"), \
+             patch("ima_obsidian_saver.close_tab"), \
+             patch("ima_obsidian_saver.find_and_rename_in_vault", return_value=(False, None)), \
+             patch("ima_obsidian_saver.time.sleep"):
+            result = saver.save_one_article(article, browser_config)
+
+        # 长违规页走 quick_clip 0 落盘 → ("failed", None)
+        assert result == ("failed", None)
+        captured = capsys.readouterr().out
+        # 漏检自证只打 1 次（v7 review #2：不是 v6 的 2 次）
+        assert captured.count("[疑似漏检自取证]") == 1
+
+
+class TestLogPossibleMiss:
+    """_log_possible_miss: 漏检自取证（v7 §3.2）"""
+
+    def setup_method(self):
+        """每个测试前清空节流集合（防 module-level 状态串扰，v7 review #5）"""
+        saver._POSSIBLE_MISS_SEEN.clear()
+
+    def test_no_keyword_quiet(self, capsys):
+        """body 不含 DELETED 关键词 → capsys 无输出"""
+        saver._log_possible_miss("x" * 200)
+        assert capsys.readouterr().out == ""
+
+    def test_with_keyword_format(self, capsys):
+        """含关键词 → 输出含 len/hits/body[:200]"""
+        body = "此账号已被屏蔽" + "x" * 200
+        saver._log_possible_miss(body)
+        out = capsys.readouterr().out
+        assert "[疑似漏检自取证]" in out
+        assert "len(body)=" in out
+        assert "此账号已被屏蔽" in out  # hits 含关键词
+
+    def test_caps_body_at_200(self, capsys):
+        """body 超 200 字 → 输出截断到 200（v7 review #5 修复）
+
+        修正 brief 断言：原 `assert "yyy" not in out` 不可行——body[:200] 含
+        连续 y 段，「yyy」必然在 out 中。改用独一无二尾缀：body 第 201+ 位
+        放 ZTAIL，截断后该字符串必不在 out 中。
+        """
+        body = "此账号已被屏蔽" + "y" * 300 + "ZTAIL"  # 7 + 300 + 5 = 312 字
+        saver._log_possible_miss(body)
+        out = capsys.readouterr().out
+        assert "ZTAIL" not in out  # 第 201+ 位的尾缀被截断
+        assert out.count("y") < 300  # y 数远小于 300,证明被截断（宽松断言防 print 模板 y 干扰）
+
+    def test_throttle_same_body(self, capsys):
+        """同一 body 调 2 次 → 只打 1 次（v7 #6 节流）"""
+        body = "此账号已被屏蔽" + "z" * 200
+        saver._log_possible_miss(body)
+        saver._log_possible_miss(body)
+        out = capsys.readouterr().out
+        assert out.count("[疑似漏检自取证]") == 1
+
+    def test_different_body_both_print(self, capsys):
+        """不同 body → 各打 1 次"""
+        saver._log_possible_miss("此账号已被屏蔽" + "a" * 200)
+        saver._log_possible_miss("该内容已被发布者删除" + "b" * 200)
+        out = capsys.readouterr().out
+        assert out.count("[疑似漏检自取证]") == 2

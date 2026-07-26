@@ -474,6 +474,30 @@ def read_page_snapshot(browser_app: str = "Google Chrome") -> Optional[dict]:
 _DEBUG_BODY_LEN_SEEN: Set[int] = set()
 
 
+# v7 #6：漏检自证节流集合，同一 body 内容只打一次（与 _DEBUG_BODY_LEN_SEEN 设计相仿）。
+# 注意：module-level set 仅存活于单个 Python 进程，跨 launchd run 会重置——
+# 跨 run 重复反而对运维有利（不会漏报漏检 URL）。
+_POSSIBLE_MISS_SEEN: Set[int] = set()
+
+
+def _log_possible_miss(body: str) -> None:
+    """body >= 阈值但含 DELETED 关键词时打自取证诊断（v7 §3.2）。
+
+    不承诺「精准触发排除合法文章」——子串匹配无法区分合法引用整句 vs 真实漏检。
+    讨论审查的媒体文章会触发噪声，已知 tradeoff（靠节流 + 接受）。
+    body[:200] 截断（覆盖文末 chrome 行，为 v8 收集证据）。
+    _POSSIBLE_MISS_SEEN 节流：同一 body 只打一次（单次 run 内去重）。
+    """
+    body_hash = hash(body)
+    if body_hash in _POSSIBLE_MISS_SEEN:
+        return
+    _POSSIBLE_MISS_SEEN.add(body_hash)  # 移到扫描前（无关键词也记录，避免重扫）
+    hits = [k for k, _ in _DELETED_REASON_MAP if k in body]
+    if not hits:
+        return
+    print(f"    [疑似漏检自取证] len(body)={len(body)} 命中关键词={hits} body[:200]={body[:200]!r}")
+
+
 # ==================== 永久不可恢复页判定（单源） ====================
 
 # 三类永久不可恢复页（行为一致：mark_deleted 永久跳过，不计 failed）：
@@ -868,6 +892,12 @@ def save_one_article(
         close_tab(browser_app)
         time.sleep(WAIT_CLOSE_TAB)
         return "deleted", None
+
+    # v7：漏检自取证——_deleted_reason 返回 None 但 body>=100，调 _log_possible_miss
+    #     （调用点显式判；不在 _deleted_reason 内部——避免 is_verify_page 双调用时重复打印）
+    body = (snap or {}).get("text") or ""
+    if len(body) >= 100:
+        _log_possible_miss(body)
 
     # 2.6 execute JS 读 #publish_time 覆盖日期（比 requests 预提取可靠；验证页/未加载则降级）
     js_date = extract_publish_date_js(browser_app)

@@ -616,7 +616,17 @@ def _non_conflicting_path(target: Path, source: Path) -> Path:
 # （title=微信公众平台），find_and_rename 须排除这类文件，防止把干扰页当文章认领。
 # 删除页命中后已短路不 clip，此处为防御性兜底（时序异常/短路未生效时仍能拦截）。
 VERIFY_CLIPPING_MARKERS = ("环境异常", "完成验证", "去验证")
-DELETED_CLIPPING_MARKERS = ("该内容已被发布者删除", "此内容因违规已删除")
+# 与 _DELETED_REASON_MAP 分离：CLIPPING 场景 .md 文件检测，全用整句更保守。
+# 前 3 条与 _DELETED_REASON_MAP 有意保持一致（微信改文案时维护者须同步两处）；
+# 不抽取公共子集——抽象成本 > 低频同步成本（YAGNI）。
+# 注意：生产 CLIPPING 路径上，_is_verify_clipping ① title=='微信公众平台' 第一检抢先
+# 命中（微信系统提示页落盘 title 恒为此），② 对屏蔽/违规页是概率性兜底（应对 title 变种）。
+DELETED_CLIPPING_MARKERS = (
+    "该内容已被发布者删除",
+    "此内容因违规已删除",
+    "此内容因违规无法查看",
+    "此账号已被屏蔽，内容无法查看",  # sentence（_DELETED_REASON_MAP 第 4 条用 prefix；策略不同）
+)
 
 
 def _is_verify_clipping(md_path: Path) -> bool:

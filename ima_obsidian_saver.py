@@ -256,7 +256,7 @@ def mark_deleted(article_id: int):
 
     涵盖三类页面（行为一致，DB 不区分）：
       - 发布者删除（该内容已被发布者删除）
-      - 违规下架（此内容因违规已删除 / 此内容因违规无法查看）
+      - 违规不可查看（此内容因违规已删除 / 此内容因违规无法查看）
       - 账号屏蔽（此账号已被屏蔽，内容无法查看）
 
     与 mark_saved 不同——永久不可恢复是终态，不写 obsidian_saved（保持其 0/NULL 语义
@@ -488,7 +488,7 @@ def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
     """永久不可恢复页判定 + reason 映射（单源实现）。
 
     返回 None ⇔ 非删除页（含普通文章、验证页、空快照）；返回 reason 字符串 ⇔ 是
-    永久不可恢复页（发布者删除 / 违规下架 / 账号屏蔽）。
+    永久不可恢复页（发布者删除 / 违规不可查看 / 账号屏蔽）。
 
     判定：len(body) < 60 阈值 + _DELETED_REASON_MAP 关键词子串匹配（k in body，非正则）。
     只查 body（snapshot['text']），不并 title——删除页 title 恒为「微信公众平台」不含
@@ -793,7 +793,7 @@ def save_one_article(
 
     - 'saved'：文件已落盘并改名，date_str 为用于命名的 YYMMDD（调用方传给 mark_saved）
     - 'failed'：未落盘（验证页/未找到文件等可重试失败），date_str=None，下次自动重试
-    - 'deleted'：永久不可恢复页（发布者删除/违规下架/账号屏蔽），date_str=None（调用方调 mark_deleted）
+    - 'deleted'：永久不可恢复页（发布者删除/违规不可查看/账号屏蔽），date_str=None（调用方调 mark_deleted）
     调用方据 status 分流：saved→mark_saved，deleted→mark_deleted，failed→仅计数。
     """
     url = article["url"]
@@ -837,10 +837,11 @@ def save_one_article(
     #   is_verify_page 前置 _deleted_reason 排除，屏蔽/违规页不会被误判为验证页 → 不浪费重试
     handle_verify_page(browser_app)
 
-    # 2.55 永久不可恢复页检测（发布者删除 / 违规下架 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
+    # 2.55 永久不可恢复页检测（发布者删除 / 违规不可查看 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
     #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
     snap = read_page_snapshot(browser_app)
-    print(f"    [debug] len(body)={len((snap or {}).get('text') or '')}")  # 自取证：监控真实 innerText 长度（渐进验证 <60 字阈值）
+    if os.environ.get("IMA_DEBUG_BODY_LEN"):  # 渐进验证 <60 字阈值；验证后可移除
+        print(f"    [debug] len(body)={len((snap or {}).get('text') or '')}")
     reason = _deleted_reason(snap)
     if reason is not None:
         print(f"    🗑️  {reason}，标记 status='deleted' 永久跳过")

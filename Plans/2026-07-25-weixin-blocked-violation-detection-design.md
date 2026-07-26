@@ -229,7 +229,7 @@ def mark_deleted(article_id: int):
 | 风险 | 缓解 |
 |---|---|
 | 合法文章引用「此账号已被屏蔽」被误判 mark_deleted → 不可逆数据丢失 | `len(body) < 60` 阈值（合法文章 ≫60）；**只查 body 不查 title**（防慢加载 title 误杀） |
-| 真实屏蔽/违规页 body innerText ≥60 字（含 UI chrome）→ `_deleted_reason` 漏检 → bug 静默存留 | `[debug] len(body)=N` 自取证日志（渐进验证）；首篇命中时确认长度，据此迭代 |
+| 真实屏蔽/违规页 body innerText ≥60 字（含 UI chrome）→ `_deleted_reason` 漏检 → bug 静默存留 | `[debug] len(body)=N` 自取证日志（默认开启，由 `IMA_DEBUG_BODY_LEN` env 控制，`=0` 关闭；首篇屏蔽/违规 URL 命中后视实证结果决定是否移除） |
 | 微信改文案 | 第 4 条用前缀匹配；命中即打自取证日志，迭代方便 |
 | 「验证后转删除」时序依赖 3 次快照（verify attempt1 → verify attempt2 → 调用点） | 见 §3.4：删除页是终态不重定向，attempt2 与调用点 snap3 之间页面稳定；测试 §4.4 锁死顺序 |
 | `is_verify_page` 前置排除改变现有行为 | §4.2 现有 7 测试全通过 + 新增 4 测试覆盖前置排除 |

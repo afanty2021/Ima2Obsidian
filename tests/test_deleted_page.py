@@ -146,3 +146,102 @@ class TestSaveOneArticleDeletedPath:
 
         # 快照读不到 → 不应误判删除，应走正常流程（此处 mock 命中 → saved）
         assert result[0] == "saved", f"快照失败时不应误判删除，实际: {result!r}"
+
+    def test_save_blocked_page_short_circuits_with_reason(self, isolated_vault, capsys):
+        """屏蔽页 → ('deleted', None) + 日志含「账号被屏蔽」+ verify 被调用一次（顺序锁）"""
+        vault, clip_dir = isolated_vault
+        article = {"id": 1, "url": "https://mp.weixin.qq.com/s?__biz=T", "title": "已屏蔽", "kb": "AI"}
+        browser_config = {"app": "Chrome", "shortcut_mods": ["option", "shift"]}
+
+        with patch("ima_obsidian_saver.extract_publish_date", return_value="260101"), \
+             patch("ima_obsidian_saver.open_url"), \
+             patch("ima_obsidian_saver.handle_verify_page", return_value=False) as mock_verify, \
+             patch("ima_obsidian_saver.read_page_snapshot",
+                   return_value={"title": "微信公众平台", "text": "此账号已被屏蔽，内容无法查看"}), \
+             patch("ima_obsidian_saver.activate_browser") as mock_activate, \
+             patch("ima_obsidian_saver.trigger_quick_clip") as mock_clip, \
+             patch("ima_obsidian_saver.find_and_rename_in_vault") as mock_rename, \
+             patch("ima_obsidian_saver.close_tab") as mock_close, \
+             patch("ima_obsidian_saver.time.sleep"):
+            result = saver.save_one_article(article, browser_config)
+
+        assert result == ("deleted", None)
+        mock_clip.assert_not_called()
+        mock_rename.assert_not_called()
+        mock_activate.assert_not_called()
+        mock_close.assert_called_once()
+        mock_verify.assert_called_once()  # 锁死「verify 必先调用」顺序不变量
+        captured = capsys.readouterr()
+        assert "🗑️  账号被屏蔽，标记" in captured.out  # 全句匹配，防自取证日志误中
+
+    def test_save_violation_page_short_circuits_with_reason(self, isolated_vault, capsys):
+        """违规页（新文案）→ 日志含「违规不可查看」"""
+        vault, clip_dir = isolated_vault
+        article = {"id": 1, "url": "https://mp.weixin.qq.com/s?__biz=T", "title": "违规", "kb": "AI"}
+        browser_config = {"app": "Chrome", "shortcut_mods": ["option", "shift"]}
+
+        with patch("ima_obsidian_saver.extract_publish_date", return_value="260101"), \
+             patch("ima_obsidian_saver.open_url"), \
+             patch("ima_obsidian_saver.handle_verify_page", return_value=False), \
+             patch("ima_obsidian_saver.read_page_snapshot",
+                   return_value={"title": "微信公众平台", "text": "此内容因违规无法查看"}), \
+             patch("ima_obsidian_saver.activate_browser"), \
+             patch("ima_obsidian_saver.trigger_quick_clip"), \
+             patch("ima_obsidian_saver.close_tab"), \
+             patch("ima_obsidian_saver.find_and_rename_in_vault"), \
+             patch("ima_obsidian_saver.time.sleep"):
+            result = saver.save_one_article(article, browser_config)
+
+        assert result == ("deleted", None)
+        captured = capsys.readouterr()
+        assert "🗑️  违规不可查看，标记" in captured.out
+
+    def test_save_publisher_deleted_reason_in_stdout(self, isolated_vault, capsys):
+        """发布者删除页 → 日志含「发布者删除」（回归保护 reason 文案）"""
+        vault, clip_dir = isolated_vault
+        article = {"id": 1, "url": "https://mp.weixin.qq.com/s?__biz=T", "title": "已删", "kb": "AI"}
+        browser_config = {"app": "Chrome", "shortcut_mods": ["option", "shift"]}
+
+        with patch("ima_obsidian_saver.extract_publish_date", return_value="260101"), \
+             patch("ima_obsidian_saver.open_url"), \
+             patch("ima_obsidian_saver.handle_verify_page", return_value=False), \
+             patch("ima_obsidian_saver.read_page_snapshot",
+                   return_value={"title": "微信", "text": "该内容已被发布者删除"}), \
+             patch("ima_obsidian_saver.activate_browser"), \
+             patch("ima_obsidian_saver.trigger_quick_clip"), \
+             patch("ima_obsidian_saver.close_tab"), \
+             patch("ima_obsidian_saver.find_and_rename_in_vault"), \
+             patch("ima_obsidian_saver.time.sleep"):
+            result = saver.save_one_article(article, browser_config)
+
+        assert result == ("deleted", None)
+        captured = capsys.readouterr()
+        assert "🗑️  发布者删除，标记" in captured.out
+
+    def test_verify_precise_exclusion_e2e(self, isolated_vault):
+        """端到端：不 mock handle_verify_page，验证 is_verify_page 前置排除真生效
+
+        mock read_page_snapshot 返回屏蔽页 + mock click_confirm。
+        若 is_verify_page 前置排除被破坏（删除 _deleted_reason 调用），屏蔽页会被
+        误判为验证页 → handle_verify_page 调 click_confirm → call_count > 0 → 测试失败。
+        mock verify 的集成测试（上面三个）无法发现此回归，故需此端到端用例。
+        """
+        vault, clip_dir = isolated_vault
+        article = {"id": 1, "url": "https://mp.weixin.qq.com/s?__biz=T", "title": "屏蔽", "kb": "AI"}
+        browser_config = {"app": "Chrome", "shortcut_mods": ["option", "shift"]}
+
+        with patch("ima_obsidian_saver.extract_publish_date", return_value="260101"), \
+             patch("ima_obsidian_saver.open_url"), \
+             patch("ima_obsidian_saver.read_page_snapshot",
+                   return_value={"title": "微信公众平台", "text": "此账号已被屏蔽，内容无法查看"}), \
+             patch("ima_obsidian_saver.click_confirm") as mock_click, \
+             patch("ima_obsidian_saver.activate_browser"), \
+             patch("ima_obsidian_saver.trigger_quick_clip"), \
+             patch("ima_obsidian_saver.close_tab"), \
+             patch("ima_obsidian_saver.find_and_rename_in_vault"), \
+             patch("ima_obsidian_saver.time.sleep"):
+            # 不 mock handle_verify_page —— 让它真跑，验证前置排除让 click_confirm 不被调
+            result = saver.save_one_article(article, browser_config)
+
+        assert result == ("deleted", None)
+        assert mock_click.call_count == 0  # 屏蔽页不应触发 verify 重试

@@ -526,14 +526,6 @@ def is_verify_page(snapshot: Optional[dict]) -> bool:
     return title == "微信公众平台" and len(text) < 50
 
 
-def is_deleted_page(snapshot: Optional[dict]) -> bool:
-    """委托给 _deleted_reason（单源；保留 bool 接口供外部调用/旧测试）。
-
-    临时保留：Task 4 改完 save_one_article 调用点后会删除本函数。
-    """
-    return _deleted_reason(snapshot) is not None
-
-
 def click_confirm(browser_app: str = "Google Chrome") -> bool:
     """点掉验证页「去验证」按钮，返回是否点到。
 
@@ -837,13 +829,16 @@ def save_one_article(
     time.sleep(WAIT_PAGE_LOAD)
 
     # 2.5 微信验证页检测 + 自动确认（风控验证页会让 quick_clip 打在空页上 → 0 落盘）
+    #   is_verify_page 前置 _deleted_reason 排除，屏蔽/违规页不会被误判为验证页 → 不浪费重试
     handle_verify_page(browser_app)
 
-    # 2.55 「文章已被发布者删除」检测：永久不可恢复，命中即短路返回，不触发 quick_clip
-    #   （删除页 quick_clip 只会 0 落盘；且保持未保存会被每次运行反复打开 → failed_count 假告警）
+    # 2.55 永久不可恢复页检测（发布者删除 / 违规下架 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
+    #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
     snap = read_page_snapshot(browser_app)
-    if is_deleted_page(snap):
-        print(f"    🗑️  文章已被发布者删除，标记 status='deleted' 永久跳过")
+    print(f"    [debug] len(body)={len((snap or {}).get('text') or '')}")  # 自取证：监控真实 innerText 长度（渐进验证 <60 字阈值）
+    reason = _deleted_reason(snap)
+    if reason is not None:
+        print(f"    🗑️  {reason}，标记 status='deleted' 永久跳过")
         print(f"       [自取证] title={(snap or {}).get('title')!r} "
               f"text={((snap or {}).get('text') or '')[:120]!r}")
         close_tab(browser_app)

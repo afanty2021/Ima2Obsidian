@@ -630,7 +630,7 @@ def _is_verify_clipping(md_path: Path) -> bool:
     """检测 Web Clipper 落盘的 .md 是否为验证页/删除页等干扰内容（非文章）。
 
     title=微信公众平台 是验证页落盘强标志（文章 title 是文章名）→ 直接判定。
-    DELETED marker（整句）仅在文件短（<200 字）时单命中可靠——删除页 .md 仅一句提示，
+    DELETED marker（整句）仅在正文短（剥 frontmatter 后 <200 字）时单命中可靠——删除页 .md 仅一句提示，
     合法文章即便引用整句正文也很长，避免误判 → 跳过认领 → 静默保存失败。
     VERIFY marker（环境异常等短词）正文也可能含 → 要求 ≥2 个同时命中，避免误伤合法文章。
     """
@@ -843,7 +843,9 @@ def save_one_article(
     # 2.55 永久不可恢复页检测（发布者删除 / 违规不可查看 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
     #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
     snap = read_page_snapshot(browser_app)
-    if os.environ.get("IMA_DEBUG_BODY_LEN"):  # 渐进验证 <60 字阈值；验证后可移除
+    # 渐进验证：<60 字阈值对真实屏蔽/违规页是否有效（spec §5 风险缓解措施）
+    # 默认开启；运维嫌吵可设 IMA_DEBUG_BODY_LEN=0 关闭
+    if os.environ.get("IMA_DEBUG_BODY_LEN", "1") != "0":
         print(f"    [debug] len(body)={len((snap or {}).get('text') or '')}")
     reason = _deleted_reason(snap)
     if reason is not None:

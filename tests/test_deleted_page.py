@@ -15,43 +15,59 @@ import pytest
 import ima_obsidian_saver as saver
 
 
-class TestIsDeletedPage:
+class TestDeletedReason:
+    """_deleted_reason: 永久不可恢复页判定 + reason 映射（单源，只查 body）。"""
+
     def test_hit_publisher_deleted(self):
-        """正文含「该内容已被发布者删除」→ 命中"""
-        assert saver.is_deleted_page({"text": "该内容已被发布者删除"}) is True
+        """body 含「该内容已被发布者删除」→ 命中 reason='发布者删除'"""
+        assert saver._deleted_reason({"text": "该内容已被发布者删除"}) == "发布者删除"
 
-    def test_hit_violation_deleted(self):
-        """正文含「此内容因违规已删除」→ 命中"""
-        assert saver.is_deleted_page({"text": "此内容因违规已删除"}) is True
+    def test_hit_violation_deleted_old(self):
+        """body 含「此内容因违规已删除」（旧文案）→ '违规不可查看'"""
+        assert saver._deleted_reason({"text": "此内容因违规已删除"}) == "违规不可查看"
 
-    def test_hit_in_title(self):
-        """标题含关键词 → 命中（关键词同时扫 title）"""
-        assert saver.is_deleted_page({"title": "该内容已被发布者删除", "text": ""}) is True
+    def test_hit_violation_unavailable_new(self):
+        """body 含「此内容因违规无法查看」（新文案）→ '违规不可查看'"""
+        assert saver._deleted_reason({"text": "此内容因违规无法查看"}) == "违规不可查看"
+
+    def test_hit_blocked_account(self):
+        """body 含「此账号已被屏蔽」（前缀匹配）→ '账号被屏蔽'"""
+        assert saver._deleted_reason({"text": "此账号已被屏蔽，内容无法查看"}) == "账号被屏蔽"
 
     def test_miss_normal_article(self):
-        """正常文章页不命中"""
-        assert saver.is_deleted_page({"title": "别只循环听英文歌", "text": "正文内容"}) is False
+        """正常文章 body 不命中"""
+        assert saver._deleted_reason({"title": "别只循环听英文歌", "text": "正文内容"}) is None
 
     def test_miss_verify_page(self):
-        """微信验证页不应被判为删除页（验证页可恢复、删除页永久，处理路径不同，须互斥）"""
-        assert saver.is_deleted_page({"title": "验证", "text": "当前环境异常，完成验证"}) is False
+        """微信验证页不应被判为删除页（验证页可恢复、删除页永久，处理路径不同）"""
+        assert saver._deleted_reason({"title": "验证", "text": "当前环境异常，完成验证"}) is None
 
     def test_none_snapshot(self):
-        assert saver.is_deleted_page(None) is False
+        assert saver._deleted_reason(None) is None
 
     def test_empty_snapshot(self):
-        assert saver.is_deleted_page({}) is False
+        assert saver._deleted_reason({}) is None
 
     def test_long_article_with_phrase_not_deleted(self):
-        """合法长文章正文引用删除整句（讨论审查/媒体类）→ 不误判删除页
+        """合法长文章 body 引用删除整句（讨论审查/媒体类）→ 不误判
 
-        删除页是极简页（innerText <60 字）；合法文章正文长，即便引用整句也远超阈值，
-        避免 mark_deleted 永久跳过导致数据丢失。
+        阈值是防误判的关键——合法文章 body 远超 60 字。
         """
         long_body = ("近日有读者发现某公众号文章打开后提示该内容已被发布者删除，"
                      "据悉该文章此前因违规被投诉。" + "详细情况分析" * 20)
-        assert len(long_body) > 60  # 前置：确实是长正文
-        assert saver.is_deleted_page({"title": "媒体报道", "text": long_body}) is False
+        assert len(long_body) > 60  # 前置：确实是长 body
+        assert saver._deleted_reason({"title": "媒体报道", "text": long_body}) is None
+
+    def test_legit_title_with_keyword_body_empty_not_deleted(self):
+        """合法文章 title 含关键词短语但 body 为空（慢加载）→ 不命中（只查 body，防标题误杀）
+
+        新增第 4 关键词「此账号已被屏蔽」是名词性短语，合法文章 title 可能含此短语
+        （如「评此账号已被屏蔽现象」）。若 _deleted_reason 并 title 扫描，慢加载
+        body='' 时 title+body <60 + 子串命中 → mark_deleted 永久跳过合法文章。
+        只查 body 防此误杀。
+        """
+        snap = {"title": "评此账号已被屏蔽现象", "text": ""}
+        assert saver._deleted_reason(snap) is None
 
 
 class TestSaveOneArticleDeletedPath:

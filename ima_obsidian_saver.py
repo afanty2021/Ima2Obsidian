@@ -461,6 +461,49 @@ def read_page_snapshot(browser_app: str = "Google Chrome") -> Optional[dict]:
         return None
 
 
+# ==================== 永久不可恢复页判定（单源） ====================
+
+# 三类永久不可恢复页（行为一致：mark_deleted 永久跳过，不计 failed）：
+#   发布者删除 / 平台下架违规内容 / 账号被平台屏蔽
+# 顺序敏感：首条命中决定 reason（近义关键词放一起，如两条违规文案映射同一 reason）。
+# 修改本表会影响：_deleted_reason（判定源）、is_verify_page（前置排除）——改词表时
+# 同步审视这些调用方。
+# 匹配语义：全部子串匹配（k in text，非正则）；每条标注 prefix/sentence 见行末注释。
+_DELETED_REASON_MAP = (
+    # 前 3 条 sentence（整句本身就是强信号，极不可能出现在合法短文本；前缀化收益小）
+    ("该内容已被发布者删除",   "发布者删除"),        # sentence
+    ("此内容因违规已删除",     "违规不可查看"),      # sentence（旧文案）
+    ("此内容因违规无法查看",   "违规不可查看"),      # sentence（新文案）
+    # 第 4 条 prefix（「内容无法查看」是通用后缀，前缀对文案微调鲁棒）
+    ("此账号已被屏蔽",         "账号被屏蔽"),        # prefix
+)
+
+
+def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
+    """永久不可恢复页判定 + reason 映射（单源实现）。
+
+    返回 None ⇔ 非删除页（含普通文章、验证页、空快照）；返回 reason 字符串 ⇔ 是
+    永久不可恢复页（发布者删除 / 违规下架 / 账号屏蔽）。
+
+    判定：len(body) < 60 阈值 + _DELETED_REASON_MAP 关键词子串匹配（k in body，非正则）。
+    只查 body（snapshot['text']），不并 title——删除页 title 恒为「微信公众平台」不含
+    关键词，并 title 无益；而合法文章 title 可能含「此账号已被屏蔽」等名词性短语
+    （如「评此账号已被屏蔽现象」），并 title 会在慢加载 body='' 时误杀合法文章。
+
+    阈值是防误判的关键——合法讨论审查的文章前 800 字正文 ≫ 60，靠阈值防 mark_deleted
+    永久跳过导致不可逆数据丢失。不得简化成纯关键词匹配（丢阈值 = 误杀合法文章）。
+    """
+    if not snapshot:
+        return None
+    body = snapshot.get("text") or ""    # 只查 body，不并 title（防标题误杀）
+    if len(body) >= 60:
+        return None
+    for keyword, reason in _DELETED_REASON_MAP:    # 顺序敏感：首条命中决定 reason
+        if keyword in body:                         # 子串匹配（非正则）
+            return reason
+    return None
+
+
 def is_verify_page(snapshot: Optional[dict]) -> bool:
     """判断页面快照是否为微信风控验证页（纯函数）。
 
@@ -476,24 +519,12 @@ def is_verify_page(snapshot: Optional[dict]) -> bool:
     return title == "微信公众平台" and len(text) < 50
 
 
-# 微信「文章已被发布者删除」特征词。这类文章已不存在，永远无法保存——若保持未保存，
-# 每次运行都会反复打开它（0 落盘 → failed_count++ → 触发上游告警）。检测到即 mark_deleted
-# 把 status 改 'deleted'，自动从所有 status='success' 查询消失，永久跳过。
-DELETED_KEYWORDS = ("该内容已被发布者删除", "此内容因违规已删除")
-
-
 def is_deleted_page(snapshot: Optional[dict]) -> bool:
-    """判断页面快照是否为「文章已被发布者删除」页（纯函数，与 is_verify_page 同构）。
+    """委托给 _deleted_reason（单源；保留 bool 接口供外部调用/旧测试）。
 
-    删除页是永久状态（不同于可恢复的验证页）：命中后短路返回，不触发 quick_clip。
-    要求文本短（<60 字）才判删除页——删除页是极简页（仅一句提示，innerText 很短）；
-    合法文章即便正文引用该整句（讨论审查/媒体类文章），前 800 字正文也远超阈值，
-    避免被误判删除页 → mark_deleted 永久跳过 → 不可逆数据丢失。
+    临时保留：Task 4 改完 save_one_article 调用点后会删除本函数。
     """
-    if not snapshot:
-        return False
-    text = (snapshot.get("text") or "") + (snapshot.get("title") or "")
-    return len(text) < 60 and any(k in text for k in DELETED_KEYWORDS)
+    return _deleted_reason(snapshot) is not None
 
 
 def click_confirm(browser_app: str = "Google Chrome") -> bool:

@@ -51,11 +51,11 @@ class TestDeletedReason:
     def test_long_article_with_phrase_not_deleted(self):
         """合法长文章 body 引用删除整句（讨论审查/媒体类）→ 不误判
 
-        阈值是防误判的关键——合法文章 body 远超 60 字。
+        阈值是防误判的关键——合法文章 body 远超 100 字。
         """
         long_body = ("近日有读者发现某公众号文章打开后提示该内容已被发布者删除，"
                      "据悉该文章此前因违规被投诉。" + "详细情况分析" * 20)
-        assert len(long_body) > 60  # 前置：确实是长 body
+        assert len(long_body) > 100  # 前置：确实是长 body
         assert saver._deleted_reason({"title": "媒体报道", "text": long_body}) is None
 
     def test_legit_title_with_keyword_body_empty_not_deleted(self):
@@ -63,11 +63,23 @@ class TestDeletedReason:
 
         新增第 4 关键词「此账号已被屏蔽」是名词性短语，合法文章 title 可能含此短语
         （如「评此账号已被屏蔽现象」）。若 _deleted_reason 并 title 扫描，慢加载
-        body='' 时 title+body <60 + 子串命中 → mark_deleted 永久跳过合法文章。
+        body='' 时 body <100 + 子串命中 → mark_deleted 永久跳过合法文章。
         只查 body 防此误杀。
         """
         snap = {"title": "评此账号已被屏蔽现象", "text": ""}
         assert saver._deleted_reason(snap) is None
+
+    def test_threshold_99_hits(self):
+        """len(body)=99 含关键词 → 命中（v7 阈值 100 边界）"""
+        body = "此账号已被屏蔽" + "x" * (99 - len("此账号已被屏蔽"))
+        assert len(body) == 99
+        assert saver._deleted_reason({"text": body}) == "账号被屏蔽"
+
+    def test_threshold_100_returns_none(self):
+        """len(body)=100 含关键词 → 返回 None（v7 阈值 100 边界；capsys 无日志——纯函数）"""
+        body = "此账号已被屏蔽" + "x" * (100 - len("此账号已被屏蔽"))
+        assert len(body) == 100
+        assert saver._deleted_reason({"text": body}) is None
 
 
 class TestSaveOneArticleDeletedPath:

@@ -498,18 +498,18 @@ def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
     返回 None ⇔ 非删除页（含普通文章、验证页、空快照）；返回 reason 字符串 ⇔ 是
     永久不可恢复页（发布者删除 / 违规不可查看 / 账号屏蔽）。
 
-    判定：len(body) < 60 阈值 + _DELETED_REASON_MAP 关键词子串匹配（k in body，非正则）。
+    判定：len(body) < 100 阈值 + _DELETED_REASON_MAP 关键词子串匹配（k in body，非正则）。
     只查 body（snapshot['text']），不并 title——删除页 title 恒为「微信公众平台」不含
     关键词，并 title 无益；而合法文章 title 可能含「此账号已被屏蔽」等名词性短语
     （如「评此账号已被屏蔽现象」），并 title 会在慢加载 body='' 时误杀合法文章。
 
-    阈值是防误判的关键——合法讨论审查的文章前 800 字正文 ≫ 60，靠阈值防 mark_deleted
+    阈值是防误判的关键——合法讨论审查的文章前 800 字正文 ≫ 100，靠阈值防 mark_deleted
     永久跳过导致不可逆数据丢失。不得简化成纯关键词匹配（丢阈值 = 误杀合法文章）。
     """
     if not snapshot:
         return None
     body = snapshot.get("text") or ""    # 只查 body，不并 title（防标题误杀）
-    if len(body) >= 60:
+    if len(body) >= 100:
         return None
     for keyword, reason in _DELETED_REASON_MAP:    # 顺序敏感：首条命中决定 reason
         if keyword in body:                         # 子串匹配（非正则）
@@ -520,7 +520,7 @@ def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
 def is_verify_page(snapshot: Optional[dict]) -> bool:
     """判断页面快照是否为微信风控验证页（纯函数）。
 
-    前置 _deleted_reason 排除——在 _deleted_reason 判定范围内（body <60 字且含
+    前置 _deleted_reason 排除——在 _deleted_reason 判定范围内（body <100 字且含
     _DELETED_REASON_MAP 关键词）的永久不可恢复页不是验证页，避免 handle_verify_page
     对屏蔽/违规页浪费 ~12-14s 重试（click_confirm 误点通用按钮 + 两轮 attempt sleep）。
     验证页 body 不含 _DELETED_REASON_MAP 关键词 → _deleted_reason 返回 None → 原逻辑不变。
@@ -851,10 +851,10 @@ def save_one_article(
     # 2.55 永久不可恢复页检测（发布者删除 / 违规不可查看 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
     #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
     snap = read_page_snapshot(browser_app)
-    # 渐进验证：<60 字阈值对真实屏蔽/违规页是否有效（spec §5 风险缓解措施）
+    # 渐进验证：<100 字阈值对真实屏蔽/违规页是否有效（spec §5 风险缓解措施 + v7 §3.1）
     # 默认开启；运维嫌吵可设 IMA_DEBUG_BODY_LEN=0/false/no/off 关闭
     # TODO(渐进验证)：首篇屏蔽/违规 URL 命中后，根据日志确认 len(body) 真实长度；
-    #   若 ≥60 字阈值过紧需调整 _deleted_reason；若确认阈值有效，移除此 print 与门控
+    #   若 ≥100 字阈值过紧需调整 _deleted_reason；若确认阈值有效，移除此 print 与门控
     if os.environ.get("IMA_DEBUG_BODY_LEN", "1").lower() not in ("0", "false", "no", "off", ""):
         body_len = len((snap or {}).get('text') or '')
         if body_len not in _DEBUG_BODY_LEN_SEEN:

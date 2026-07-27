@@ -474,29 +474,44 @@ def read_page_snapshot(browser_app: str = "Google Chrome") -> Optional[dict]:
 _DEBUG_BODY_LEN_SEEN: Set[int] = set()
 
 
-# v7 #6：漏检自证节流集合，同一 body 内容只打一次（与 _DEBUG_BODY_LEN_SEEN 设计相仿）。
-# 注意：module-level set 仅存活于单个 Python 进程，跨 launchd run 会重置——
-# 跨 run 重复反而对运维有利（不会漏报漏检 URL）。
-_POSSIBLE_MISS_SEEN: Set[int] = set()
+# 已打印过疑似漏检自取证的 body 集合：相同 body 只打印一次（单次 run 内去重；
+# 跨 launchd run 因进程重启不持久化——这是设计选择：跨 run 重复报警反而对运维友好，
+# 不漏报漏检 URL）。
+# key 用 body 全文（Set[str]）而非 hash(body)（Set[int]）——消除理论碰撞风险
+# （PR #6 review v3 #5）。内存代价可控：只有"含 DELETED 关键词的 body"才被记录
+# （合法文章不计），实测每 run < 10 条。
+_POSSIBLE_MISS_SEEN: Set[str] = set()
 
 
-def _log_possible_miss(body: str) -> None:
+def _log_possible_miss(body: str, url: Optional[str] = None, title: Optional[str] = None) -> None:
     """body >= `_DELETED_REASON_LEN_THRESHOLD`（100）字但含 DELETED 关键词时打自取证诊断（v7 §3.2）。
 
     不承诺「精准触发排除合法文章」——子串匹配无法区分合法引用整句 vs 真实漏检。
     讨论审查的媒体文章会触发噪声，已知 tradeoff（靠节流 + 接受）。
     body[:200] 截断（对 ≤200 字漏检页覆盖全文含文末 chrome；对 >200 字只截开头，
     chrome 行若在文末仍会丢失——v8 需采集更长样本判断）。
-    _POSSIBLE_MISS_SEEN 节流：同一 body 只打一次（单次 run 内去重）。
+
+    节流：同一 body 只打一次（单次 run 内去重）。key 用 body 全文（Set[str]）而非
+    hash(body)，消除理论碰撞风险（PR #6 review v3 #5）。`_POSSIBLE_MISS_SEEN.add`
+    在关键词扫描**后**（仅含关键词才记录）——集合语义清晰（只含可疑漏检 body），
+    CPU 影响可忽略；PR #6 review v3 决策保留此模式。
+
+    日志含 url/title 供运维定位漏检文章（PR #6 review v3 #4）。
+    不受 IMA_DEBUG_BODY_LEN 门控（PR #6 review v3 #2）——漏检诊断独立于降噪开关，
+    两类日志用途相反：[debug] len(body)=N 高频低值（应门控），[疑似漏检自取证]
+    低频高值（不应门控）。
     """
-    body_hash = hash(body)
-    if body_hash in _POSSIBLE_MISS_SEEN:
-        return
     hits = [k for k, _ in _DELETED_REASON_MAP if k in body]
     if not hits:
         return
-    _POSSIBLE_MISS_SEEN.add(body_hash)  # PR #6 review #4：只记录含关键词的疑似漏检 body
-    print(f"    [疑似漏检自取证] len(body)={len(body)} 命中关键词={hits} body[:200]={body[:200]!r}")
+    is_new = body not in _POSSIBLE_MISS_SEEN
+    _POSSIBLE_MISS_SEEN.add(body)  # PR #6 review v3 #5：用 body 全文 key 消除碰撞
+    if not is_new:
+        return
+    url_repr = repr(url) if url else "None"
+    title_repr = repr(title)[:80] if title else "None"
+    print(f"    [疑似漏检自取证] url={url_repr} title={title_repr} "
+          f"len(body)={len(body)} 命中关键词={hits} body[:200]={body[:200]!r}")
 
 
 # ==================== 永久不可恢复页判定（单源） ====================
@@ -907,11 +922,11 @@ def save_one_article(
 
     # v7：漏检自取证——_deleted_reason 返回 None 但 body>=阈值，调 _log_possible_miss
     #     （调用点显式判；不在 _deleted_reason 内部——避免 is_verify_page 双调用时重复打印）
-    # PR #6 review #2：_log_possible_miss 调用须受 IMA_DEBUG_BODY_LEN 门控——
-    #     运维设 IMA_DEBUG_BODY_LEN=0 降噪时 [疑似漏检自取证] 也应静默。
-    if _debug_body_len_enabled:
-        if len(body) >= _DELETED_REASON_LEN_THRESHOLD:
-            _log_possible_miss(body)
+    # PR #6 review v3 #1 #2：_log_possible_miss 调用移出 IMA_DEBUG_BODY_LEN 门控——
+    #     两类日志用途相反（[debug] len(body)=N 高频低值 vs [疑似漏检自取证] 低频高值），
+    #     不应共享开关；运维降噪时漏检诊断证据源不能丢。
+    if len(body) >= _DELETED_REASON_LEN_THRESHOLD:
+        _log_possible_miss(body, url=url, title=title)
 
     # 2.6 execute JS 读 #publish_time 覆盖日期（比 requests 预提取可靠；验证页/未加载则降级）
     js_date = extract_publish_date_js(browser_app)

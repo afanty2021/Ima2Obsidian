@@ -263,6 +263,9 @@ class TestSaveOneArticleDeletedPath:
         """长 body(>=100) + 含 DELETED 关键词（不含 VERIFY）→ 漏检自证打 1 次（v7 §4.3）
 
         v7 review #2 修复：单次调用内只打 1 次（_deleted_reason 纯函数，自证在调用点）。
+        PR #6 review #2：不 mock handle_verify_page——让 is_verify_page→_deleted_reason 路径
+        真跑，锁住 v7（单次）vs v6（_log_possible_miss 在 _deleted_reason 内部时双打印）。
+        PR #6 review #1：patch WAIT_CLIP_TOTAL=0 避免 while 循环 CPU-burn 25 秒。
         """
         saver._POSSIBLE_MISS_SEEN.clear()  # 防串扰
         vault, clip_dir = isolated_vault
@@ -273,20 +276,26 @@ class TestSaveOneArticleDeletedPath:
 
         with patch("ima_obsidian_saver.extract_publish_date", return_value="260101"), \
              patch("ima_obsidian_saver.open_url"), \
-             patch("ima_obsidian_saver.handle_verify_page", return_value=False), \
              patch("ima_obsidian_saver.read_page_snapshot",
                    return_value={"title": "某文章", "text": body}), \
              patch("ima_obsidian_saver.activate_browser"), \
              patch("ima_obsidian_saver.trigger_quick_clip"), \
              patch("ima_obsidian_saver.close_tab"), \
              patch("ima_obsidian_saver.find_and_rename_in_vault", return_value=(False, None)), \
+             patch("ima_obsidian_saver.WAIT_CLIP_TOTAL", 0), \
              patch("ima_obsidian_saver.time.sleep"):
+            # 不 mock handle_verify_page（PR #6 review #2）——让它真跑：
+            #   is_verify_page(snap) → _deleted_reason(snap) → body>=阈值 → None
+            #   → is_verify_page 继续 → body 不含 VERIFY → title != 微信公众平台 → False
+            #   → handle_verify_page 第一次循环退出（不调 click_confirm）
+            # 这样 _deleted_reason 被 is_verify_page + 调用点各调一次，若 _log_possible_miss
+            # 在 _deleted_reason 内部（v6）会打 2 次 → count==2 → 测试失败（捕捉 v6 回归）。
             result = saver.save_one_article(article, browser_config)
 
         # 长违规页走 quick_clip 0 落盘 → ("failed", None)
         assert result == ("failed", None)
         captured = capsys.readouterr().out
-        # 漏检自证只打 1 次（v7 review #2：不是 v6 的 2 次）
+        # 漏检自证只打 1 次（v7：_log_possible_miss 在调用点；v6 回滚会打 2 次 → 测试失败）
         assert captured.count("[疑似漏检自取证]") == 1
 
 

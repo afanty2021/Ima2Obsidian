@@ -503,7 +503,10 @@ def _log_possible_miss(body: str) -> None:
 
 # _deleted_reason 的 body 长度阈值：body < 此值才进入关键词匹配。
 # 实测违规页最大 65 字（PR #5 首日数据），100 留 +35 余量。
-# 提阈值时须同步 _log_possible_miss 调用点（line 899 附近 if len(body) >= 此值）。
+# 提阈值时须同步 _log_possible_miss 调用点（save_one_article 内 if len(body) >= 此值）。
+# PR #6 review #3 决策 C：接受误判风险——图片为主的文章（正文 70 字）+ 含 DELETED 关键词
+# 整句会被 mark_deleted 不可回滚。实测合法文章最小 496 字，留 ~5 倍边际；[自取证] 日志
+# 暴露误判（title+text 片段），运维可发现。v8 可考虑加 undelete 接口（marked_at 时间戳）。
 _DELETED_REASON_LEN_THRESHOLD = 100
 
 # 三类永久不可恢复页（行为一致：mark_deleted 永久跳过，不计 failed）：
@@ -551,7 +554,7 @@ def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
 def is_verify_page(snapshot: Optional[dict]) -> bool:
     """判断页面快照是否为微信风控验证页（纯函数）。
 
-    前置 _deleted_reason 排除——在 _deleted_reason 判定范围内（body <100 字且含
+    前置 _deleted_reason 排除——在 _deleted_reason 判定范围内（body < _DELETED_REASON_LEN_THRESHOLD（100）字且含
     _DELETED_REASON_MAP 关键词）的永久不可恢复页不是验证页，避免 handle_verify_page
     对屏蔽/违规页浪费 ~12-14s 重试（click_confirm 误点通用按钮 + 两轮 attempt sleep）。
     验证页 body 不含 _DELETED_REASON_MAP 关键词 → _deleted_reason 返回 None → 原逻辑不变。
@@ -882,12 +885,14 @@ def save_one_article(
     # 2.55 永久不可恢复页检测（发布者删除 / 违规不可查看 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
     #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
     snap = read_page_snapshot(browser_app)
-    # 渐进验证：<100 字阈值对真实屏蔽/违规页是否有效（spec §5 风险缓解措施 + v7 §3.1）
+    body = (snap or {}).get("text") or ""  # PR #6 review #5：提取一次，下游复用
+    # 渐进验证：<_DELETED_REASON_LEN_THRESHOLD 字阈值对真实屏蔽/违规页是否有效（spec §5 + v7 §3.1）
     # 默认开启；运维嫌吵可设 IMA_DEBUG_BODY_LEN=0/false/no/off 关闭
     # TODO(渐进验证)：首篇屏蔽/违规 URL 命中后，根据日志确认 len(body) 真实长度；
-    #   若 ≥100 字阈值过紧需调整 _deleted_reason；若确认阈值有效，移除此 print 与门控
-    if os.environ.get("IMA_DEBUG_BODY_LEN", "1").lower() not in ("0", "false", "no", "off", ""):
-        body_len = len((snap or {}).get('text') or '')
+    #   若 ≥阈值过紧需调整 _deleted_reason；若确认阈值有效，移除此 print 与门控
+    _debug_body_len_enabled = os.environ.get("IMA_DEBUG_BODY_LEN", "1").lower() not in ("0", "false", "no", "off", "")  # PR #6 review #4：提取一次避免复制粘贴漂移
+    if _debug_body_len_enabled:
+        body_len = len(body)
         if body_len not in _DEBUG_BODY_LEN_SEEN:
             _DEBUG_BODY_LEN_SEEN.add(body_len)
             print(f"    [debug] len(body)={body_len}")
@@ -895,7 +900,7 @@ def save_one_article(
     if reason is not None:
         print(f"    🗑️  {reason}，标记 status='deleted' 永久跳过")
         print(f"       [自取证] title={(snap or {}).get('title')!r} "
-              f"text={((snap or {}).get('text') or '')[:120]!r}")
+              f"text={body[:120]!r}")
         close_tab(browser_app)
         time.sleep(WAIT_CLOSE_TAB)
         return "deleted", None
@@ -904,8 +909,7 @@ def save_one_article(
     #     （调用点显式判；不在 _deleted_reason 内部——避免 is_verify_page 双调用时重复打印）
     # PR #6 review #2：_log_possible_miss 调用须受 IMA_DEBUG_BODY_LEN 门控——
     #     运维设 IMA_DEBUG_BODY_LEN=0 降噪时 [疑似漏检自取证] 也应静默。
-    body = (snap or {}).get("text") or ""
-    if os.environ.get("IMA_DEBUG_BODY_LEN", "1").lower() not in ("0", "false", "no", "off", ""):
+    if _debug_body_len_enabled:
         if len(body) >= _DELETED_REASON_LEN_THRESHOLD:
             _log_possible_miss(body)
 

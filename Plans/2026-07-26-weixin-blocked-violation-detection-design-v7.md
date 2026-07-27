@@ -29,6 +29,15 @@ v7 spec 经 10 角度 review 发现 8 条问题，全部接受：
 - **P3 #7**：「设计对称」措辞不准（key 不同：len vs hash）→ 「设计相仿」
 - **P3 #8**：「v6 污染测试」表述夸大（测试不断言 capsys，不会失败）→ 「v6 pytest stdout 冒出噪声行（CI 检查 stdout 会受影响）」
 
+### PR #6 review v3 修订（v7.2，commit `cf3a544` 之后）
+
+PR #6 在合并前 review v3 发现 5 条问题（合并 P0 #1 + P1 #2 + P2 #3 + P3 #4 #5），全部接受。**核心洞察**：两类日志用途相反——`[debug] len(body)=N` 高频低值（应门控），`[疑似漏检自取证]` 低频高值（不应门控）。
+
+- **P0 #1 + P1 #2**：`_log_possible_miss` 调用被绑到 `IMA_DEBUG_BODY_LEN` 门控内 → 运维设 `IMA_DEBUG_BODY_LEN=0` 降噪时漏检诊断证据源全失。修复：调用移出门控，始终执行；env 只门控 `[debug]` 块。**测试 `test_save_one_article_long_body_with_keyword_logs_miss` 在 `IMA_DEBUG_BODY_LEN=0` 下必须通过**（reviewer 实测复现 bug）。
+- **P2 #3**：v7 spec §3.2 原写「`_POSSIBLE_MISS_SEEN.add(body_hash)` 移到关键词扫描**前**」（v7 review #6 决策）与代码 add 顺序矛盾（实际是扫描**后**）。本 spec §3.2 已回写：add 在扫描后，仅含关键词才记录，集合语义清晰。
+- **P3 #4**：`_log_possible_miss` 日志只含 `len/hits/body[:200]`，缺 url/title → 运维无法定位漏检文章。修复：函数签名加 `url`、`title` 参数（默认 None 兼容旧调用），日志含 `url=... title=...`。
+- **P3 #5**：`_POSSIBLE_MISS_SEEN: Set[int]` 用 `hash(body)` 做 key 有理论碰撞风险。修复：类型改 `Set[str]`，直接存 body 全文。内存代价可控（只有含关键词的 body 才记录，实测每 run < 10 条）。**v7 review #3「`Set[str]` 是类型错误」结论被推翻**——PR #6 review v3 改回 `Set[str]` 是有意为之，不再用 `hash()`。
+
 ## 1. 背景（沿用 v6）
 
 PR #5（v5 实施）2026-07-26 11:50 首次生产运行，`[debug] len(body)=N` 日志给出真实违规页长度分布：**30 / 49 / 55 / 59 / 65**。65 字违规页超 v5 阈值 60 → 漏检 → 反复打开 3 次。证据存档于 MEMORY `ima-saver-deleted-reason-len-threshold-realdata`。
@@ -53,10 +62,10 @@ v7 应急止血：阈值 `60 → 100` + 漏检自取证（移到调用点 + 节�
    - v7：`_deleted_reason` 只做判定（阈值 + 关键词 → reason/None），无 print。自取证移到调用点（决策 2）
 
 4. **节流机制（#6）**
-   - `_POSSIBLE_MISS_SEEN: Set[int]` 模块级集合，key=`hash(body)`（返回 int，v7 review #3：`Set[str]` 是类型错误）
+   - `_POSSIBLE_MISS_SEEN: Set[str]` 模块级集合，key=body 全文（PR #6 review v3 #5：从 `Set[int]`/`hash(body)` 改为 `Set[str]`/body 全文，消除理论碰撞；推翻原 v7 review #3「`Set[str]` 是类型错误」结论）
    - **单次 run 内节流**：同一 body 内容只打一次（如同一 URL 重试时去重）
    - **跨 run 重复**（v7 review #2）：module-level set 仅存活于单个 Python 进程，launchd 每次跑都启动新进程 → 跨 run 会重复打印。**这反而对运维有利**（不会漏报漏检 URL；若跨 run 也节流，漏检 URL 第一次报警后就被静默，运维可能错过）
-   - 与 `[debug] len(body)=N` 的 `_DEBUG_BODY_LEN_SEEN` 设计**相仿**（v7 review #7：都是 module-level set 节流，但 key 不同——前者按 len，后者按 hash）
+   - 与 `[debug] len(body)=N` 的 `_DEBUG_BODY_LEN_SEEN` 设计**相仿**（v7 review #7：都是 module-level set 节流，但 key 不同——前者按 len，后者按 body 全文）
 
 5. **范围严格限定（沿用 v6）**
    - 不动词表（`_DELETED_REASON_MAP` / `DELETED_CLIPPING_MARKERS`）
@@ -104,14 +113,16 @@ def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
 ### 3.2 新增 `_log_possible_miss` 辅助函数（紧邻 `_deleted_reason` 之后）
 
 ```python
-# v7 #6：节流集合，同一 body 内容只打一次（与 _DEBUG_BODY_LEN_SEEN 设计相仿——v7 review #7：
-#   都是 module-level set 节流，但 key 不同——前者按 len(int)，后者按 hash(int)）。
-# 注意：module-level set 仅存活于单个 Python 进程，跨 launchd run 会重置（v7 review #2）。
-#   跨 run 重复反而对运维有利（不会漏报漏检 URL）。
-_POSSIBLE_MISS_SEEN: Set[int] = set()
+# 已打印过疑似漏检自取证的 body 集合：相同 body 只打印一次（单次 run 内去重；
+# 跨 launchd run 因进程重启不持久化——这是设计选择：跨 run 重复报警反而对运维友好，
+# 不漏报漏检 URL）。
+# key 用 body 全文（Set[str]）而非 hash(body)（Set[int]）——消除理论碰撞风险
+# （PR #6 review v3 #5）。内存代价可控：只有"含 DELETED 关键词的 body"才被记录
+# （合法文章不计），实测每 run < 10 条。
+_POSSIBLE_MISS_SEEN: Set[str] = set()
 
 
-def _log_possible_miss(body: str) -> None:
+def _log_possible_miss(body: str, url: Optional[str] = None, title: Optional[str] = None) -> None:
     """body >= 阈值但含 DELETED 关键词时打自取证诊断（v7 §3.2）。
 
     v7 修正（v6 #1/#3/#5/#6）：
@@ -119,16 +130,25 @@ def _log_possible_miss(body: str) -> None:
       讨论审查的媒体文章会触发噪声，已知 tradeoff（靠节流 + 接受）。
     - body[:200] 截断（v6 的 [:100] 会丢文末 chrome 行，与「为 v8 收集 chrome 证据」矛盾）。
     - _POSSIBLE_MISS_SEEN 节流：同一 body 内容只打一次（避免单次 run 内重复打印）。
-      v7 review #6：body_hash 记录移到关键词扫描之前（无关键词 body 也记录，避免重扫）。
+
+    PR #6 review v3 回写：
+    - 节流 key 用 body 全文（Set[str]），不再用 hash(body)（Set[int]）——消除理论碰撞
+      （#5）。`_POSSIBLE_MISS_SEEN.add(body)` 在关键词扫描**后**（仅含关键词才记录）——
+      集合语义清晰（只含可疑漏检 body），CPU 影响可忽略；本决策保留，spec 与代码对齐（#3）。
+    - 签名加 url/title 参数（默认 None 兼容旧调用），日志含定位信息（#4）。
+    - 调用点不受 IMA_DEBUG_BODY_LEN 门控——见 §3.3（#1 #2）。
     """
-    body_hash = hash(body)
-    if body_hash in _POSSIBLE_MISS_SEEN:
-        return
-    _POSSIBLE_MISS_SEEN.add(body_hash)  # v7 review #6：移到扫描前（无关键词也记录，节流优先）
     hits = [k for k, _ in _DELETED_REASON_MAP if k in body]
     if not hits:
         return
-    print(f"    [疑似漏检自取证] len(body)={len(body)} 命中关键词={hits} body[:200]={body[:200]!r}")
+    is_new = body not in _POSSIBLE_MISS_SEEN
+    _POSSIBLE_MISS_SEEN.add(body)  # 扫描后 add（仅含关键词才记录）
+    if not is_new:
+        return
+    url_repr = repr(url) if url else "None"
+    title_repr = repr(title)[:80] if title else "None"
+    print(f"    [疑似漏检自取证] url={url_repr} title={title_repr} "
+          f"len(body)={len(body)} 命中关键词={hits} body[:200]={body[:200]!r}")
 ```
 
 ### 3.3 `save_one_article` 调用点加漏检分支（line 853-870 附近）
@@ -157,15 +177,18 @@ def _log_possible_miss(body: str) -> None:
     # v7：漏检自取证——_deleted_reason 返回 None 但 body>=100，调 _log_possible_miss
     #     （调用点显式 if 分支；不在 _deleted_reason 内部——避免 is_verify_page 双调用时
     #      重复打印，v6 #2/#8 修复）
+    # PR #6 review v3 #1 #2：_log_possible_miss 调用移出 IMA_DEBUG_BODY_LEN 门控——
+    #     两类日志用途相反（[debug] 高频低值 vs [疑似漏检] 低频高值），不应共享开关。
     body = (snap or {}).get("text") or ""
     if len(body) >= 100:
-        _log_possible_miss(body)
+        _log_possible_miss(body, url=url, title=title)
 ```
 
 **关键变更（相对 v6）**：
 - `[debug]` 块**完全保留**现有实现（只改注释 `<60`→`<100` + `# TODO` 锚点阈值同步），不简化——v7 review #1 修复
 - 漏检自取证从 `_deleted_reason` 内部移到调用点（显式 `if len(body) >= 100` 分支，不是 elif——前面 `reason is not None` 已 return）
 - 单次 `save_one_article` 内只打 1 次（`_deleted_reason` 被 `is_verify_page` 调用时不打——因 `_deleted_reason` 已无 print 副作用）
+- **PR #6 review v3 #1 #2**：`_log_possible_miss` 调用移出 `IMA_DEBUG_BODY_LEN` 门控。两类日志用途相反——`[debug] len(body)=N` 高频低值（运维嫌吵会用 env 关），`[疑似漏检自取证]` 低频高值（运维依赖此证据定位漏检），共享开关会让运维在降噪时丢失漏检诊断。修复后 `_log_possible_miss` 始终调用，env 只门控 `[debug]` 块。
 
 ### 3.4 `is_verify_page` docstring 同步（line 523 附近，#4）
 

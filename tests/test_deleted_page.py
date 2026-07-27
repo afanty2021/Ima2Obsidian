@@ -8,6 +8,7 @@
 WHERE status='success' 查询排除，永久跳过，不计 failed。与验证页（临时可恢复）
 不同，删除页是永久状态，命中后短路返回，不再触发 quick_clip。
 """
+import os
 from unittest.mock import patch
 
 import pytest
@@ -266,6 +267,8 @@ class TestSaveOneArticleDeletedPath:
         PR #6 review #2：不 mock handle_verify_page——让 is_verify_page→_deleted_reason 路径
         真跑，锁住 v7（单次）vs v6（_log_possible_miss 在 _deleted_reason 内部时双打印）。
         PR #6 review #1：patch WAIT_CLIP_TOTAL=0 避免 while 循环 CPU-burn 25 秒。
+        PR #6 review v3 #1：IMA_DEBUG_BODY_LEN=0 下也必须打（_log_possible_miss 移出门控）。
+        PR #6 review v3 #4：日志含 url= / title= 定位信息。
         """
         saver._POSSIBLE_MISS_SEEN.clear()  # 防串扰
         vault, clip_dir = isolated_vault
@@ -283,6 +286,7 @@ class TestSaveOneArticleDeletedPath:
              patch("ima_obsidian_saver.close_tab"), \
              patch("ima_obsidian_saver.find_and_rename_in_vault", return_value=(False, None)), \
              patch("ima_obsidian_saver.WAIT_CLIP_TOTAL", 0), \
+             patch.dict(os.environ, {"IMA_DEBUG_BODY_LEN": "0"}), \
              patch("ima_obsidian_saver.time.sleep"):
             # 不 mock handle_verify_page（PR #6 review #2）——让它真跑：
             #   is_verify_page(snap) → _deleted_reason(snap) → body>=阈值 → None
@@ -290,6 +294,8 @@ class TestSaveOneArticleDeletedPath:
             #   → handle_verify_page 第一次循环退出（不调 click_confirm）
             # 这样 _deleted_reason 被 is_verify_page + 调用点各调一次，若 _log_possible_miss
             # 在 _deleted_reason 内部（v6）会打 2 次 → count==2 → 测试失败（捕捉 v6 回归）。
+            # PR #6 review v3 #1：强制 IMA_DEBUG_BODY_LEN=0，移门控后仍应打——若回退到
+            # `if _debug_body_len_enabled:` 包裹的旧实现，则 count==0 → 测试失败。
             result = saver.save_one_article(article, browser_config)
 
         # 长违规页走 quick_clip 0 落盘 → ("failed", None)
@@ -297,6 +303,9 @@ class TestSaveOneArticleDeletedPath:
         captured = capsys.readouterr().out
         # 漏检自证只打 1 次（v7：_log_possible_miss 在调用点；v6 回滚会打 2 次 → 测试失败）
         assert captured.count("[疑似漏检自取证]") == 1
+        # PR #6 review v3 #4：日志含 url= / title= 定位信息
+        assert "url=" in captured
+        assert "title=" in captured
 
 
 class TestLogPossibleMiss:
@@ -347,3 +356,20 @@ class TestLogPossibleMiss:
         saver._log_possible_miss("该内容已被发布者删除" + "b" * 200)
         out = capsys.readouterr().out
         assert out.count("[疑似漏检自取证]") == 2
+
+    def test_url_title_passed_through(self, capsys):
+        """PR #6 review v3 #4：url/title 传参 → 日志含 url= / title= 定位信息"""
+        body = "此账号已被屏蔽" + "x" * 200
+        url = "https://mp.weixin.qq.com/s?__biz=Test"
+        title = "某屏蔽文章标题"
+        saver._log_possible_miss(body, url=url, title=title)
+        out = capsys.readouterr().out
+        assert f"url={url!r}" in out
+        assert f"title={title!r}" in out
+
+    def test_url_title_default_none(self, capsys):
+        """PR #6 review v3 #4：默认值 None → 日志含 url=None title=None（兼容旧调用）"""
+        saver._log_possible_miss("此账号已被屏蔽" + "x" * 200)
+        out = capsys.readouterr().out
+        assert "url=None" in out
+        assert "title=None" in out

@@ -157,12 +157,13 @@ def _log_possible_miss(body: str, url: Optional[str] = None, title: Optional[str
 
 ```python
     snap = read_page_snapshot(browser_app)
+    body = (snap or {}).get("text") or ""  # PR #6 review #5：提取一次，下游复用
     # 渐进验证：<100 字阈值对真实屏蔽/违规页是否有效（spec §5 风险缓解措施 + v7 §3.1）
     # 默认开启；运维嫌吵可设 IMA_DEBUG_BODY_LEN=0/false/no/off 关闭
     # TODO(渐进验证)：首篇屏蔽/违规 URL 命中后，根据日志确认 len(body) 真实长度；
     #   若 ≥100 字阈值过紧需调整 _deleted_reason；若确认阈值有效，移除此 print 与门控
     if os.environ.get("IMA_DEBUG_BODY_LEN", "1").lower() not in ("0", "false", "no", "off", ""):
-        body_len = len((snap or {}).get('text') or '')
+        body_len = len(body)  # 复用前面提取的 body（PR #6 review #5）
         if body_len not in _DEBUG_BODY_LEN_SEEN:
             _DEBUG_BODY_LEN_SEEN.add(body_len)
             print(f"    [debug] len(body)={body_len}")
@@ -170,7 +171,7 @@ def _log_possible_miss(body: str, url: Optional[str] = None, title: Optional[str
     if reason is not None:
         print(f"    🗑️  {reason}，标记 status='deleted' 永久跳过")
         print(f"       [自取证] title={(snap or {}).get('title')!r} "
-              f"text={((snap or {}).get('text') or '')[:120]!r}")
+              f"text={body[:120]!r}")
         close_tab(browser_app)
         time.sleep(WAIT_CLOSE_TAB)
         return "deleted", None
@@ -179,7 +180,6 @@ def _log_possible_miss(body: str, url: Optional[str] = None, title: Optional[str
     #      重复打印，v6 #2/#8 修复）
     # PR #6 review v3 #1 #2：_log_possible_miss 调用移出 IMA_DEBUG_BODY_LEN 门控——
     #     两类日志用途相反（[debug] 高频低值 vs [疑似漏检] 低频高值），不应共享开关。
-    body = (snap or {}).get("text") or ""
     if len(body) >= 100:
         _log_possible_miss(body, url=url, title=title)
 ```
@@ -259,7 +259,7 @@ def is_verify_page(snapshot: Optional[dict]) -> bool:
 | `body[:100]` 丢文末 chrome 证据（v6 #5） | **v7 修复**：`body[:200]`，覆盖 chrome 行 |
 | 自取证日志 launchd 长期跑累积噪声（v6 #6） | **v7 修复**：`_POSSIBLE_MISS_SEEN` 节流——**单次 run 内**同一 body 只打 1 次；**跨 run 重复**（module-level set 跨进程重置，v7 review #2），反而对运维有利（不漏报漏检 URL） |
 | `is_verify_page` 前置排除范围扩大（60→100，v6 #11） | 有利变化（60-99 区间删除页不再进 verify 浪费）；docstring 同步（v6 #4） |
-| `[debug] len(body)=N` 与 `[疑似漏检自取证]` 冗余 | 互补：前者所有页打长度（节流按长度），后者仅疑似漏检打内容（节流按 body 哈希） |
+| `[debug] len(body)=N` 与 `[疑似漏检自取证]` 冗余 | 互补：前者所有页打长度（节流按长度），后者仅疑似漏检打内容（节流按 body 全文，Set[str] 消除理论碰撞） |
 
 ## 6. 改动清单
 

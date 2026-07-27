@@ -304,8 +304,9 @@ class TestSaveOneArticleDeletedPath:
         # 漏检自证只打 1 次（v7：_log_possible_miss 在调用点；v6 回滚会打 2 次 → 测试失败）
         assert captured.count("[疑似漏检自取证]") == 1
         # PR #6 review v3 #4：日志含 url= / title= 定位信息
-        assert "url=" in captured
-        assert "title=" in captured
+        # PR #6 review v4 #2：精确值匹配（子串 "url=" 会被 url=None 的 bug 漏过）
+        assert f"url={article['url']!r}" in captured
+        assert f"title={article['title']!r}" in captured
 
 
 class TestLogPossibleMiss:

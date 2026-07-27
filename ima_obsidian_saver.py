@@ -481,24 +481,30 @@ _POSSIBLE_MISS_SEEN: Set[int] = set()
 
 
 def _log_possible_miss(body: str) -> None:
-    """body >= 阈值但含 DELETED 关键词时打自取证诊断（v7 §3.2）。
+    """body >= `_DELETED_REASON_LEN_THRESHOLD`（100）字但含 DELETED 关键词时打自取证诊断（v7 §3.2）。
 
     不承诺「精准触发排除合法文章」——子串匹配无法区分合法引用整句 vs 真实漏检。
     讨论审查的媒体文章会触发噪声，已知 tradeoff（靠节流 + 接受）。
-    body[:200] 截断（覆盖文末 chrome 行，为 v8 收集证据）。
+    body[:200] 截断（对 ≤200 字漏检页覆盖全文含文末 chrome；对 >200 字只截开头，
+    chrome 行若在文末仍会丢失——v8 需采集更长样本判断）。
     _POSSIBLE_MISS_SEEN 节流：同一 body 只打一次（单次 run 内去重）。
     """
     body_hash = hash(body)
     if body_hash in _POSSIBLE_MISS_SEEN:
         return
-    _POSSIBLE_MISS_SEEN.add(body_hash)  # 移到扫描前（无关键词也记录，避免重扫）
     hits = [k for k, _ in _DELETED_REASON_MAP if k in body]
     if not hits:
         return
+    _POSSIBLE_MISS_SEEN.add(body_hash)  # PR #6 review #4：只记录含关键词的疑似漏检 body
     print(f"    [疑似漏检自取证] len(body)={len(body)} 命中关键词={hits} body[:200]={body[:200]!r}")
 
 
 # ==================== 永久不可恢复页判定（单源） ====================
+
+# _deleted_reason 的 body 长度阈值：body < 此值才进入关键词匹配。
+# 实测违规页最大 65 字（PR #5 首日数据），100 留 +35 余量。
+# 提阈值时须同步 _log_possible_miss 调用点（line 899 附近 if len(body) >= 此值）。
+_DELETED_REASON_LEN_THRESHOLD = 100
 
 # 三类永久不可恢复页（行为一致：mark_deleted 永久跳过，不计 failed）：
 #   发布者删除 / 平台下架违规内容 / 账号被平台屏蔽
@@ -522,10 +528,11 @@ def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
     返回 None ⇔ 非删除页（含普通文章、验证页、空快照）；返回 reason 字符串 ⇔ 是
     永久不可恢复页（发布者删除 / 违规不可查看 / 账号屏蔽）。
 
-    判定：len(body) < 100 阈值 + _DELETED_REASON_MAP 关键词子串匹配（k in body，非正则）。
-    只查 body（snapshot['text']），不并 title——删除页 title 恒为「微信公众平台」不含
-    关键词，并 title 无益；而合法文章 title 可能含「此账号已被屏蔽」等名词性短语
-    （如「评此账号已被屏蔽现象」），并 title 会在慢加载 body='' 时误杀合法文章。
+    判定：len(body) < `_DELETED_REASON_LEN_THRESHOLD`（100）阈值 + _DELETED_REASON_MAP
+    关键词子串匹配（k in body，非正则）。只查 body（snapshot['text']），不并 title——
+    删除页 title 恒为「微信公众平台」不含关键词，并 title 无益；而合法文章 title 可能含
+    「此账号已被屏蔽」等名词性短语（如「评此账号已被屏蔽现象」），并 title 会在慢加载
+    body='' 时误杀合法文章。
 
     阈值是防误判的关键——合法讨论审查的文章前 800 字正文 ≫ 100，靠阈值防 mark_deleted
     永久跳过导致不可逆数据丢失。不得简化成纯关键词匹配（丢阈值 = 误杀合法文章）。
@@ -533,7 +540,7 @@ def _deleted_reason(snapshot: Optional[dict]) -> Optional[str]:
     if not snapshot:
         return None
     body = snapshot.get("text") or ""    # 只查 body，不并 title（防标题误杀）
-    if len(body) >= 100:
+    if len(body) >= _DELETED_REASON_LEN_THRESHOLD:
         return None
     for keyword, reason in _DELETED_REASON_MAP:    # 顺序敏感：首条命中决定 reason
         if keyword in body:                         # 子串匹配（非正则）
@@ -893,11 +900,14 @@ def save_one_article(
         time.sleep(WAIT_CLOSE_TAB)
         return "deleted", None
 
-    # v7：漏检自取证——_deleted_reason 返回 None 但 body>=100，调 _log_possible_miss
+    # v7：漏检自取证——_deleted_reason 返回 None 但 body>=阈值，调 _log_possible_miss
     #     （调用点显式判；不在 _deleted_reason 内部——避免 is_verify_page 双调用时重复打印）
+    # PR #6 review #2：_log_possible_miss 调用须受 IMA_DEBUG_BODY_LEN 门控——
+    #     运维设 IMA_DEBUG_BODY_LEN=0 降噪时 [疑似漏检自取证] 也应静默。
     body = (snap or {}).get("text") or ""
-    if len(body) >= 100:
-        _log_possible_miss(body)
+    if os.environ.get("IMA_DEBUG_BODY_LEN", "1").lower() not in ("0", "false", "no", "off", ""):
+        if len(body) >= _DELETED_REASON_LEN_THRESHOLD:
+            _log_possible_miss(body)
 
     # 2.6 execute JS 读 #publish_time 覆盖日期（比 requests 预提取可靠；验证页/未加载则降级）
     js_date = extract_publish_date_js(browser_app)

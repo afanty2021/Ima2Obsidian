@@ -93,6 +93,7 @@ class TestSaveOneArticleDeletedPath:
         clip_dir.mkdir()
         monkeypatch.setattr("ima_obsidian_saver.VAULT_DIR", vault)
         monkeypatch.setattr("ima_obsidian_saver.CLIPPINGS_DIR", clip_dir)
+        saver._POSSIBLE_MISS_SEEN.clear()  # v7 review #3：防 module-level 状态串扰
         return vault, clip_dir
 
     def test_deleted_page_short_circuits(self, isolated_vault):

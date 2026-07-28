@@ -316,10 +316,20 @@ def get_stats(kb: str = None):
 # ==================== 浏览器自动化 ====================
 
 def activate_browser(browser_app: str):
-    subprocess.run(
+    """激活浏览器到前台。osascript 失败时打印诊断（与 send_keystroke 一致）。
+
+    诊断目的（systematic-debugging Phase 4）：launchd 启动的 Python 子进程可能
+    被 macOS TCC 拒绝 System Events 控制，原 capture_output=True 静默吞 stderr，
+    saver 误以为激活成功继续后续步骤。
+    """
+    result = subprocess.run(
         ["osascript", "-e", f'tell application "{browser_app}" to activate'],
         capture_output=True, timeout=5,
     )
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="replace").strip()
+        print(f"    ⚠️ activate_browser({browser_app!r}) 失败 "
+              f"rc={result.returncode}: {err[:200]}", flush=True)
     time.sleep(0.5)
 
 
@@ -328,15 +338,26 @@ def open_url(browser_app: str, url: str):
 
 
 def send_keystroke(key: str, modifiers: list = None):
+    """模拟键盘事件触发 Web Clipper 等扩展快捷键。
+
+    诊断模式（systematic-debugging Phase 4 step）：osascript 失败时打印
+    returncode + stderr 片段——launchd 环境下 System Events keystroke 可能被
+    macOS TCC 拒绝，原 capture_output=True 静默吞错误导致 saver 误以为快捷键
+    已发送。capture_output=True 保留以避免污染主流程 stdout。
+    """
     if modifiers:
         parts = [f"{m} down" for m in modifiers]
         mod_str = " using {" + ", ".join(parts) + "}"
     else:
         mod_str = ""
-    subprocess.run(
+    result = subprocess.run(
         ["osascript", "-e", f'tell application "System Events" to keystroke "{key}"{mod_str}'],
         capture_output=True, timeout=5,
     )
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="replace").strip()
+        print(f"    ⚠️ send_keystroke(key={key!r}, mods={modifiers}) 失败 "
+              f"rc={result.returncode}: {err[:200]}", flush=True)
 
 
 def close_tab(browser_app: str = None, retry_count: int = 0):

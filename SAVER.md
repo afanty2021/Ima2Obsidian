@@ -68,6 +68,52 @@
 
 ---
 
+## Web Clipper 自动化依赖
+
+`save_one_article` 通过模拟 Option+Shift+O 快捷键触发 Chrome 的 Obsidian Web Clipper 扩展。该机制有 **双层 TCC 要求**（缺一不可）：
+
+### 1. cliclick 二进制（PR #7）
+
+`send_keystroke` 用 `cliclick`（[CGEventPost](https://developer.apple.com/documentation/coregraphics/1455361-cgeventpost)）替代 `osascript`（Apple Event），绕过 macOS TCC AppleEvents 限制（osascript 报错 1002「"osascript"不允许发送按键」）。
+
+**安装**：
+
+```bash
+brew install cliclick
+```
+
+`saver` 启动时通过 `_find_cliclick()` 检测常见路径（`/opt/homebrew/bin/cliclick` → `/usr/local/bin/cliclick` → `/usr/bin/cliclick` → `shutil.which` fallback），不依赖 launchd PATH 含 Homebrew（launchd 启动的进程默认 PATH 仅 `/usr/bin:/bin:/usr/sbin:/sbin`）。
+
+### 2. cliclick Accessibility 授权（必装步骤）
+
+⚠️ **launchd 启动的 cliclick 不继承用户 GUI session 的 Accessibility 授权**——CGEventPost 事件会被 TCC 默默 drop（`cliclick` 命令 rc=0 但事件无效，Web Clipper 不响应）。这与在 iTerm/Terminal 里跑 `cliclick` 不同（交互式终端已有了 Accessibility，会让人误以为 launchd 也能用）。
+
+**必须手动添加 cliclick 到辅助功能**：
+
+1. 打开 **系统设置 → 隐私与安全性 → 辅助功能**
+2. 解锁左下角锁图标（如需要）
+3. 点 **+** 号
+4. 按 **Cmd+Shift+G** 输入路径：`/opt/homebrew/bin/cliclick`（Intel Mac 用 `/usr/local/bin/cliclick`）
+5. 选中 cliclick → 添加
+6. **确保开关打开**（蓝色）
+
+**验证**：`launchctl start com.ima2obsidian.update` 后看 `incremental_update.log` 是否出现「移动(新文件)」+「✅ 完成」。
+
+**已实证**（2026-07-28 18:30 launchctl start 跑）：
+- 修复前（cliclick 未在辅助功能里）：0 成功 / 18 失败
+- 用户手动添加 cliclick 到辅助功能后：38+ 成功 / 2 失败（独立原因）
+
+### 故障排查
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| `⚠️ send_keystroke 失败：cliclick 未安装` | `_CLICLICK_PATH` 解析失败（None） | `brew install cliclick` |
+| `osascript 报错 1002「不允许发送按键」` | 旧版本（PR #7 之前） | 升级到 PR #7+（改用 cliclick） |
+| quick_clip 触发 + Chrome 在前台 + 但 Web Clipper 不响应 | **cliclick 缺 Accessibility 授权** | 上方「cliclick Accessibility 授权」步骤添加 |
+| `[诊断] quick_clip 触发时前台应用='ima.copilot'` | `activate_browser` 时机问题（部分文章） | 独立问题，不阻塞主流程 |
+
+---
+
 ## 浏览器快捷键
 
 | 浏览器 | Quick Clip | Clipper |

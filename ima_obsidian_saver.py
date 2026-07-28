@@ -384,6 +384,11 @@ def _find_cliclick() -> Optional[str]:
 
     显式检测常见安装路径 + shutil.which fallback（兼容非标准位置）。
 
+    ⚠️ 找到路径仅解决 launchd PATH 问题（避免 FileNotFoundError）；CGEventPost
+    仍需 cliclick 单独添加到「系统设置 → 隐私与安全性 → 辅助功能」（launchd 启动
+    的 cliclick 不继承用户 GUI session 的 Accessibility）。详见 send_keystroke
+    docstring 与 SAVER.md「Web Clipper 自动化依赖」章节。
+
     Returns:
         cliclick 绝对路径；未找到返回 None（调用方降级提示安装）。
     """
@@ -414,6 +419,18 @@ def send_keystroke(key: str, modifiers: list = None):
     因 osascript 完全不在 TCC 库；python3 有 Accessibility 但无 AppleEvents，
     授权不通用）。python3 已有 Accessibility TCC 授权，CGEventPost 通过
     CoreGraphics 路由，不走 Apple Event，绕过限制（systematic-debugging Phase 4）。
+
+    ⚠️ 双层 TCC 要求（PR #7 + follow-up）：
+    1. cliclick 走 CGEventPost 不走 Apple Event → 绕过 AppleEvents TCC（PR #7 修复）。
+    2. **但 CGEventPost 仍需 Accessibility 授权**——launchd 启动的 cliclick 不继承
+       用户 GUI session 的 Accessibility（与 iTerm 启动不同），事件会被 TCC 默默 drop
+       （rc=0 但事件无效，Web Clipper 不响应）。**必须在系统设置 → 隐私与安全性 →
+       辅助功能里手动添加 `/opt/homebrew/bin/cliclick`**（或 cliclick 实际安装路径，
+       见 `_find_cliclick` 候选列表）。详见 SAVER.md「Web Clipper 自动化依赖」章节。
+
+    已实证（2026-07-28 launchctl start 跑）：
+    - 修复前：0 成功 / 18 失败（cliclick 未在辅助功能里）
+    - 用户手动添加 cliclick 到辅助功能后：38+ 成功 / 2 失败（独立原因）
 
     cliclick 语法：`cliclick kd:<mods> t:<key> ku:<mods>`
     - kd: 修饰键 key down（alt/cmd/ctrl/shift/fn）

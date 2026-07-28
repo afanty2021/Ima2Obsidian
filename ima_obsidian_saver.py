@@ -725,14 +725,36 @@ def click_confirm(browser_app: str = "Google Chrome") -> bool:
     优先 getElementById('js_verify')——验证页「去验证」a 的稳定 id，不依赖 selector 时机
     （实测 selector 遍历在 saver 自动跑时偶发漏点）。js_verify 不在时退回 selector 文本匹配。
     execute_chrome_js 返回 '1' 表示点到。
+
+    诊断模式（systematic-debugging 假设 A9）：点击失败时 dump DOM 验证「去验证」按钮
+    是否在 iframe 内。已知矛盾：read_page_snapshot 用 body.innerText 能看到「去验证」，
+    但 getElementById/querySelectorAll 找不到——疑似 iframe 隔离。
     """
-    js = ("var v=document.getElementById('js_verify');"
-          "if(v){v.click();'1'}else{"
-          "var b=[...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')];"
-          "var k=['确认','继续访问','继续','确定','去验证'];"
-          "for(var e of b){var t=(e.textContent||e.value||'').trim();"
-          "if(k.some(function(x){return t.indexOf(x)>=0})){e.click();return '1'}}'0'}")
-    return execute_chrome_js(js, browser_app) == "1"
+    js_click = ("var v=document.getElementById('js_verify');"
+                "if(v){v.click();'1'}else{"
+                "var b=[...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')];"
+                "var k=['确认','继续访问','继续','确定','去验证'];"
+                "for(var e of b){var t=(e.textContent||e.value||'').trim();"
+                "if(k.some(function(x){return t.indexOf(x)>=0})){e.click();return '1'}}'0'}")
+    result = execute_chrome_js(js_click, browser_app)
+    if result == "1":
+        return True
+
+    # 诊断（systematic-debugging 假设 A9）：点击失败时 dump DOM，验证 iframe 假设
+    # 不改点击行为；收集到证据后此诊断可移除或 env 门控
+    js_diag = ("JSON.stringify({"
+               "js_verify_exists: !!document.getElementById('js_verify'),"
+               "iframe_count: document.querySelectorAll('iframe').length,"
+               "iframe_paths: [...document.querySelectorAll('iframe')].map(f => f.src || f.getAttribute('src') || '<no-src>').slice(0, 5),"
+               "iframe_texts: [...document.querySelectorAll('iframe')].map(f => { try { return ((f.contentDocument && f.contentDocument.body && f.contentDocument.body.innerText) || '').slice(0, 200) } catch(e) { return '<cross-origin>' } }),"
+               "iframe_has_quyanzheng: [...document.querySelectorAll('iframe')].some(f => { try { return ((f.contentDocument && f.contentDocument.body && f.contentDocument.body.innerText) || '').indexOf('去验证') >= 0 } catch(e) { return false } }),"
+               "clickable_texts: [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')].map(e => (e.textContent || e.value || '').trim()).filter(t => t).slice(0, 10),"
+               "body_text_snippet: ((document.body && document.body.innerText) || '').slice(0, 200)"
+               "})")
+    diag_raw = execute_chrome_js(js_diag, browser_app)
+    print(f"    [诊断 click_confirm 失败 DOM] {diag_raw}", flush=True)
+
+    return False
 
 
 def handle_verify_page(browser_app: str = "Google Chrome") -> bool:

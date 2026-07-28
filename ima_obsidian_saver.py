@@ -374,6 +374,38 @@ _CLICLICK_MOD_MAP = {
 }
 
 
+def _find_cliclick() -> Optional[str]:
+    """定位 cliclick 二进制绝对路径。
+
+    launchd 启动的 Python 进程不继承用户 shell 的 PATH——默认 PATH 仅
+    /usr/bin:/bin:/usr/sbin:/sbin，不含 Homebrew 路径（/opt/homebrew/bin
+    或 /usr/local/bin）。`subprocess.run(["cliclick", ...])` 在 launchd 下
+    会触发 FileNotFoundError（交互式终端正常，掩盖了该假设错误）。
+
+    显式检测常见安装路径 + shutil.which fallback（兼容非标准位置）。
+
+    Returns:
+        cliclick 绝对路径；未找到返回 None（调用方降级提示安装）。
+    """
+    import shutil
+    # 常见 Homebrew 安装路径（Apple Silicon + Intel）+ 系统路径
+    candidates = [
+        "/opt/homebrew/bin/cliclick",   # Apple Silicon Homebrew
+        "/usr/local/bin/cliclick",       # Intel Homebrew
+        "/usr/bin/cliclick",             # 系统级（罕见）
+    ]
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    # PATH fallback（交互式跑 / 非标准安装位置）
+    return shutil.which("cliclick")
+
+
+# 模块级缓存：import 时检测一次，避免每次 send_keystroke 重复 stat。
+# launchd 下若未找到，send_keystroke 走提前 return 降级路径。
+_CLICLICK_PATH: Optional[str] = _find_cliclick()
+
+
 def send_keystroke(key: str, modifiers: list = None):
     """模拟键盘事件触发 Web Clipper 等扩展快捷键。
 
@@ -391,25 +423,30 @@ def send_keystroke(key: str, modifiers: list = None):
     已实测（systematic-debugging Phase 3）：cliclick kd:alt,shift t:o ku:alt,shift
     能触发 Web Clipper，文件自动落盘 Clippings（无需用户确认对话框）。
 
+    路径解析（launchd 兼容）：cliclick 二进制路径在 import 时由 _find_cliclick()
+    检测并缓存到 _CLICLICK_PATH。launchd 启动的进程不继承用户 shell 的 PATH
+    （默认仅 /usr/bin:/bin:/usr/sbin:/sbin），故不能依赖 PATH 查找——必须用绝对
+    路径调用。未找到时打印诊断并提前 return（不抛异常）。
+
     诊断保留：cliclick 失败时打印 returncode + stderr（与原 osascript 诊断一致，
-    capture_output=True 保留以避免污染主流程 stdout）；cliclick 未装时优雅降级。
+    capture_output=True 保留以避免污染主流程 stdout）。
     """
+    if not _CLICLICK_PATH:
+        print(f"    ⚠️ send_keystroke 失败：cliclick 未安装（brew install cliclick）",
+              flush=True)
+        return
+
     modifiers = modifiers or []
     cliclick_mods = ",".join(_CLICLICK_MOD_MAP.get(m, m) for m in modifiers)
 
-    cmd = ["cliclick"]
+    cmd = [_CLICLICK_PATH]
     if cliclick_mods:
         cmd.append(f"kd:{cliclick_mods}")
     cmd.append(f"t:{key}")
     if cliclick_mods:
         cmd.append(f"ku:{cliclick_mods}")
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=5)
-    except FileNotFoundError:
-        print(f"    ⚠️ send_keystroke 失败：cliclick 未安装（brew install cliclick）",
-              flush=True)
-        return
+    result = subprocess.run(cmd, capture_output=True, timeout=5)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
         print(f"    ⚠️ send_keystroke(key={key!r}, mods={modifiers}) 失败 "

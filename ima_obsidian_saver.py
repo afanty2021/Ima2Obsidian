@@ -315,6 +315,32 @@ def get_stats(kb: str = None):
 
 # ==================== 浏览器自动化 ====================
 
+def get_frontmost_app() -> str:
+    """返回当前前台应用名（GUI session 诊断用）。
+
+    launchd 后台进程可能不在用户 Aqua session 中——osascript keystroke 即使 rc=0
+    也可能发到空上下文，Chrome 收不到（systematic-debugging 假设 A5）。本函数
+    在 quick_clip 触发时打印前台应用，对比 launchd vs 交互式差异。
+
+    失败返回占位字符串（不抛异常，避免污染主流程）。
+    """
+    try:
+        result = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to get name of '
+             'first application process whose frontmost is true'],
+            capture_output=True, timeout=2,
+        )
+        if result.returncode == 0:
+            return result.stdout.decode("utf-8", errors="replace").strip() or "<empty>"
+        err = result.stderr.decode("utf-8", errors="replace").strip()
+        return f"<rc={result.returncode}: {err[:100]}>"
+    except subprocess.TimeoutExpired:
+        return "<timeout>"
+    except Exception as e:
+        return f"<exception: {type(e).__name__}: {e}>"
+
+
 def activate_browser(browser_app: str):
     """激活浏览器到前台。osascript 失败时打印诊断（与 send_keystroke 一致）。
 
@@ -960,6 +986,10 @@ def save_one_article(
 
     if mode == "quick":
         print(f"    触发 quick_clip ({'+'.join(shortcut_mods)}+{QUICK_CLIP_KEY})...")
+        # 诊断（systematic-debugging 假设 A5）：打印当前前台应用，验证 launchd 跑时
+        # Chrome 是否真的获得焦点。预期：交互式跑 → 'Google Chrome'；launchd 跑若
+        # 返回其他值或 <empty>，则 A5 成立（GUI session 隔离）。
+        print(f"    [诊断] quick_clip 触发时前台应用={get_frontmost_app()!r}", flush=True)
         trigger_quick_clip(shortcut_mods)
     else:
         print(f"    触发 clipper (Cmd+Shift+{CLIPPER_KEY})...")

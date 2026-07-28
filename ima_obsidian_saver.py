@@ -726,24 +726,36 @@ def click_confirm(browser_app: str = "Google Chrome") -> bool:
     （实测 selector 遍历在 saver 自动跑时偶发漏点）。js_verify 不在时退回 selector 文本匹配。
     execute_chrome_js 返回 '1' 表示点到。
 
-    诊断模式（systematic-debugging 假设 A9）：点击失败时 dump DOM 验证「去验证」按钮
-    是否在 iframe 内。已知矛盾：read_page_snapshot 用 body.innerText 能看到「去验证」，
-    但 getElementById/querySelectorAll 找不到——疑似 iframe 隔离。
+    JS 用 IIFE（立即执行函数表达式）而非语句序列——Chrome AppleScript `execute javascript`
+    期望单一表达式，语句序列 `var v=...; if(v){v.click();'1'}else{...}` 的 '1' 没被作为
+    返回值（systematic-debugging 假设 A10 修复；commit 0babc10 诊断证实 js_verify 存在但
+    旧 JS 返回非 '1'）。IIFE `(function(){...})()` 明确 return，是单一表达式。
+
+    诊断（systematic-debugging 假设 A9）：点击失败时 dump DOM 验证「去验证」按钮是否在
+    iframe 内。已知矛盾：read_page_snapshot 用 body.innerText 能看到「去验证」，但
+    getElementById/querySelectorAll 找不到——疑似 iframe 隔离。修复 A10 后此分支应不再
+    触发（js_verify 存在 + IIFE 正确 return '1'）；若仍触发说明 A10 不完整或根因在别处。
     """
-    js_click = ("var v=document.getElementById('js_verify');"
-                "if(v){v.click();'1'}else{"
+    # IIFE：单一表达式，明确 return '1' / '0'
+    js_click = ("(function(){"
+                "var v=document.getElementById('js_verify');"
+                "if(v){v.click();return '1'}"
                 "var b=[...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')];"
                 "var k=['确认','继续访问','继续','确定','去验证'];"
                 "for(var e of b){var t=(e.textContent||e.value||'').trim();"
-                "if(k.some(function(x){return t.indexOf(x)>=0})){e.click();return '1'}}'0'}")
+                "if(k.some(function(x){return t.indexOf(x)>=0})){e.click();return '1'}}"
+                "return '0'"
+                "})()")
     result = execute_chrome_js(js_click, browser_app)
     if result == "1":
         return True
 
-    # 诊断（systematic-debugging 假设 A9）：点击失败时 dump DOM，验证 iframe 假设
-    # 不改点击行为；收集到证据后此诊断可移除或 env 门控
+    # 诊断（systematic-debugging）：点击失败时 dump DOM。修复 A10 后此分支应不再触发
+    # （js_verify 存在 + IIFE 正确 return '1'）；若仍触发说明 A10 不完整或根因在别处
+    # result_value 用 would-click-1 不触发二次点击（避免 v.click() 副作用）
     js_diag = ("JSON.stringify({"
                "js_verify_exists: !!document.getElementById('js_verify'),"
+               "result_value: (function(){var v=document.getElementById('js_verify');if(v){return 'would-click-1'}return '0'})(),"
                "iframe_count: document.querySelectorAll('iframe').length,"
                "iframe_paths: [...document.querySelectorAll('iframe')].map(f => f.src || f.getAttribute('src') || '<no-src>').slice(0, 5),"
                "iframe_texts: [...document.querySelectorAll('iframe')].map(f => { try { return ((f.contentDocument && f.contentDocument.body && f.contentDocument.body.innerText) || '').slice(0, 200) } catch(e) { return '<cross-origin>' } }),"

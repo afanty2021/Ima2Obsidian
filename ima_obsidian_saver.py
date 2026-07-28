@@ -363,23 +363,53 @@ def open_url(browser_app: str, url: str):
     subprocess.run(["open", "-a", browser_app, url], capture_output=True, timeout=10)
 
 
+# cliclick modifier 名称映射（saver 内部用 option/cmd/shift 等 osascript 风格，
+# cliclick 用 alt/cmd/shift —— CoreGraphics CGEventPost 命名约定）
+_CLICLICK_MOD_MAP = {
+    "option": "alt", "alt": "alt",
+    "cmd": "cmd", "command": "cmd",
+    "shift": "shift",
+    "ctrl": "ctrl", "control": "ctrl",
+    "fn": "fn",
+}
+
+
 def send_keystroke(key: str, modifiers: list = None):
     """模拟键盘事件触发 Web Clipper 等扩展快捷键。
 
-    诊断模式（systematic-debugging Phase 4 step）：osascript 失败时打印
-    returncode + stderr 片段——launchd 环境下 System Events keystroke 可能被
-    macOS TCC 拒绝，原 capture_output=True 静默吞错误导致 saver 误以为快捷键
-    已发送。capture_output=True 保留以避免污染主流程 stdout。
+    用 cliclick（CGEventPost，CoreGraphics）替代 osascript（Apple Event）——绕过
+    macOS TCC AppleEvents 限制（osascript 报错 1002「"osascript"不允许发送按键」，
+    因 osascript 完全不在 TCC 库；python3 有 Accessibility 但无 AppleEvents，
+    授权不通用）。python3 已有 Accessibility TCC 授权，CGEventPost 通过
+    CoreGraphics 路由，不走 Apple Event，绕过限制（systematic-debugging Phase 4）。
+
+    cliclick 语法：`cliclick kd:<mods> t:<key> ku:<mods>`
+    - kd: 修饰键 key down（alt/cmd/ctrl/shift/fn）
+    - t: 主键（任意可打印字符，触发按键事件）
+    - ku: 修饰键 key up
+
+    已实测（systematic-debugging Phase 3）：cliclick kd:alt,shift t:o ku:alt,shift
+    能触发 Web Clipper，文件自动落盘 Clippings（无需用户确认对话框）。
+
+    诊断保留：cliclick 失败时打印 returncode + stderr（与原 osascript 诊断一致，
+    capture_output=True 保留以避免污染主流程 stdout）；cliclick 未装时优雅降级。
     """
-    if modifiers:
-        parts = [f"{m} down" for m in modifiers]
-        mod_str = " using {" + ", ".join(parts) + "}"
-    else:
-        mod_str = ""
-    result = subprocess.run(
-        ["osascript", "-e", f'tell application "System Events" to keystroke "{key}"{mod_str}'],
-        capture_output=True, timeout=5,
-    )
+    modifiers = modifiers or []
+    cliclick_mods = ",".join(_CLICLICK_MOD_MAP.get(m, m) for m in modifiers)
+
+    cmd = ["cliclick"]
+    if cliclick_mods:
+        cmd.append(f"kd:{cliclick_mods}")
+    cmd.append(f"t:{key}")
+    if cliclick_mods:
+        cmd.append(f"ku:{cliclick_mods}")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+    except FileNotFoundError:
+        print(f"    ⚠️ send_keystroke 失败：cliclick 未安装（brew install cliclick）",
+              flush=True)
+        return
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
         print(f"    ⚠️ send_keystroke(key={key!r}, mods={modifiers}) 失败 "

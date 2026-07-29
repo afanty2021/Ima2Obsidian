@@ -154,6 +154,14 @@ def restart_ima():
     return launch_ima()
 
 
+# 单次 run 内最多 restart 一次的标志（fix/saver-restart-ima-fallback code review #3）。
+# main() 循环调 navigate_to_kb 处理多个 KB，若 GUI session 隔离持续，每个 KB 都走完
+# 5 attempts + restart ≈ 64s，5 KB 共 ~9.5 分钟浪费。第一次 restart 后此标志置 True，
+# 后续 KB 不再 restart（直接 return False，让 main 跳过该 KB——下次 launchd 跑再处理）。
+# main() 入口 reset 为 False 保证每次运行独立。
+_RESTARTED_IN_THIS_RUN = False
+
+
 def wait_for_ax_ready(min_elements: int = 5, timeout: int = 30) -> bool:
     """
     硬等待 IMA 窗口 AX 树就绪（AXStaticText 元素数超过阈值）
@@ -285,15 +293,25 @@ def activate_ima():
     time.sleep(2)
 
 
-def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
+def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = True) -> bool:
     """
     通过 cua-driver 自动导航到指定知识库
 
     在侧边栏找到知识库名称并点击切换，支持多次尝试和滚动查找。
     使用 scroll 工具定向滚动侧边栏区域。
 
+    Args:
+        kb_name: 目标知识库名称
+        max_attempts: 导航尝试次数（循环次数，与 restart 守卫解耦）
+        allow_restart: 是否允许所有 attempts 失败后强制 restart_ima 兜底。
+            递归调用传 False 防无限递归（替代旧版 max_attempts=1 守卫，解决
+            max_attempts 参数双重含义问题——code review #5）。
+
     返回: True 表示成功导航
     """
+    # 修复 #3：声明 global 才能在函数内读写模块级 _RESTARTED_IN_THIS_RUN
+    global _RESTARTED_IN_THIS_RUN
+
     import re
 
     window = get_ima_main_window()
@@ -468,16 +486,30 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
     # 兜底：所有导航尝试失败——可能是 bring_to_front 在 launchd 后台跑时未生效
     # （NSRunningApplication.activate 不在用户 GUI session 中），窗口仍未渲染。
     # 强制 restart_ima（quit + relaunch 重置窗口 + 强制渲染），再递归一次重试。
-    # 防无限递归：仅 max_attempts > 1 时触发兜底，递归调用传 max_attempts=1
-    # （递归调用再次到此处时 max_attempts=1 不满足守卫，直接 return False）。
-    if max_attempts > 1:
+    #
+    # PR review 4 项修复：
+    # - #1: restart_ima 单独 try/except，递归调用移到 try 外——避免递归内 run_cua/
+    #       json.loads 抛异常被误归因为「restart_ima 兜底失败」
+    # - #3: 单次 run 内最多 restart 一次（_RESTARTED_IN_THIS_RUN 模块级标志）——
+    #       main 循环处理多个 KB 时，第一次 restart 后后续 KB 不再 restart
+    # - #4: 检查 restart_ima() 返回值——launch 失败（30s 内未启动）直接 return False，
+    #       不再递归（避免无意义等待）
+    # - #5: 用 allow_restart 参数（递归传 False）替代 max_attempts>1 守卫——
+    #       解耦「循环次数」与「是否允许兜底」双重含义
+    if allow_restart and not _RESTARTED_IN_THIS_RUN:
         log(f"⚠️  {max_attempts} 次导航尝试都失败（疑似 launchd GUI session 隔离），强制 restart_ima 自愈...")
+        _RESTARTED_IN_THIS_RUN = True  # 修复 #3：本次 run 内不再 restart
         try:
-            restart_ima()  # 内部已调 launch_ima（含 wait_for_ax_ready 等渲染就绪）
-            # 递归一次，走完整的拿窗口+激活+读 AX+点击流程
-            return navigate_to_kb(kb_name, max_attempts=1)
+            restart_ok = restart_ima()  # 内部已调 launch_ima（含 wait_for_ax_ready 等渲染就绪）
         except Exception as e:
-            log(f"⚠️  restart_ima 兜底失败: {e}")
+            log(f"⚠️  restart_ima 异常: {e}")
+            return False
+        # 修复 #4：restart_ima 后 IMA 未启动则放弃递归
+        if not restart_ok:
+            log("⚠️  restart_ima 后 IMA 未在 30s 内启动，放弃重试")
+            return False
+        # 修复 #1：递归在 try 外——递归内异常不会再被误归因为 restart 失败
+        return navigate_to_kb(kb_name, max_attempts=max_attempts, allow_restart=False)
 
     return False
 
@@ -780,6 +812,10 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
 # ==================== 主函数 ====================
 
 def main():
+    # 修复 #3：reset 单次 run 内 restart 标志，保证每次 main 运行独立
+    global _RESTARTED_IN_THIS_RUN
+    _RESTARTED_IN_THIS_RUN = False
+
     # 文件锁防止并发执行
     lock_fd = open(LOCK_FILE, "w")
     try:

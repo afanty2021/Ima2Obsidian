@@ -314,6 +314,11 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
 
     import re
 
+    # 修复 #2：记录最后一次 AX 探测的 AXStaticText 数，用于兜底区分根因
+    # - 窗口未渲染（launchd GUI session 隔离）：AXStaticText < 5（仅菜单栏）→ restart 有效
+    # - 窗口正常渲染但找不到 KB：AXStaticText ≥ 5（完整 IMA UI）→ restart 无效，跳过
+    last_ax_text_count = 0
+
     window = get_ima_main_window()
     if not window:
         log("❌ 未找到 IMA 窗口，无法导航")
@@ -379,6 +384,7 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
 
         # 验证 AX Tree 是否包含窗口内容（未激活时只有菜单栏）
         static_text_count = len(re.findall(r'AXStaticText', md))
+        last_ax_text_count = static_text_count  # 修复 #2：记录首次探测值
         if static_text_count < 5:
             log(f"  ⚠️  AX Tree 不完整（仅 {static_text_count} 个元素），窗口可能未激活，等待重试...")
             time.sleep(3)
@@ -387,6 +393,7 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
             state = json.loads(state_result)
             md = state.get("tree_markdown", "")
             static_text_count = len(re.findall(r'AXStaticText', md))
+            last_ax_text_count = static_text_count  # 修复 #2：二次重试也更新（最后一次探测为准）
             if static_text_count < 5:
                 log(f"  ⚠️  AX Tree 仍不完整（{static_text_count} 个元素），跳过本次尝试")
                 continue
@@ -415,6 +422,8 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
                 time.sleep(3)
                 state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
                 md = json.loads(state_result).get("tree_markdown", "")
+                # 修复 #2：对话页导航后重新探测也更新 last_ax_text_count（覆盖此分支的最后探测）
+                last_ax_text_count = len(re.findall(r'AXStaticText', md))
 
         # 在全文查找知识库名称的 element_index
         # 匹配多种 AX 类型：AXStaticText, AXButton, AXLink 等
@@ -490,14 +499,19 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
     # PR review 4 项修复：
     # - #1: restart_ima 单独 try/except，递归调用移到 try 外——避免递归内 run_cua/
     #       json.loads 抛异常被误归因为「restart_ima 兜底失败」
+    # - #2: 兜底条件精确化——只在窗口未渲染（last_ax_text_count < min_elements）时才
+    #       restart，避免无差别 quit。窗口正常渲染时 quit 无效（KB 名错/UI 改版/cua-driver bug）
+    #       且交互运行时会丢失用户未保存的 IMA 状态。
     # - #3: 单次 run 内最多 restart 一次（_RESTARTED_IN_THIS_RUN 模块级标志）——
     #       main 循环处理多个 KB 时，第一次 restart 后后续 KB 不再 restart
     # - #4: 检查 restart_ima() 返回值——launch 失败（30s 内未启动）直接 return False，
     #       不再递归（避免无意义等待）
     # - #5: 用 allow_restart 参数（递归传 False）替代 max_attempts>1 守卫——
     #       解耦「循环次数」与「是否允许兜底」双重含义
-    if allow_restart and not _RESTARTED_IN_THIS_RUN:
-        log(f"⚠️  {max_attempts} 次导航尝试都失败（疑似 launchd GUI session 隔离），强制 restart_ima 自愈...")
+    min_elements = 5  # 与 attempts 完整性判断一致（line 382 static_text_count < 5）
+    if allow_restart and not _RESTARTED_IN_THIS_RUN and last_ax_text_count < min_elements:
+        log(f"⚠️  {max_attempts} 次导航尝试都失败，最后一次 AX 探测仅 {last_ax_text_count} 个元素"
+            f"（窗口未渲染，疑似 launchd GUI session 隔离），强制 restart_ima 自愈...")
         _RESTARTED_IN_THIS_RUN = True  # 修复 #3：本次 run 内不再 restart
         try:
             restart_ok = restart_ima()  # 内部已调 launch_ima（含 wait_for_ax_ready 等渲染就绪）
@@ -510,6 +524,12 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
             return False
         # 修复 #1：递归在 try 外——递归内异常不会再被误归因为 restart 失败
         return navigate_to_kb(kb_name, max_attempts=max_attempts, allow_restart=False)
+
+    # 修复 #2：窗口渲染正常但导航失败——restart 无效（KB 名错/UI 改版/cua-driver bug）
+    # 交互运行时 quit 会丢失用户未保存状态，故不重启；launchd 后台跑也不必（无人值守时无状态可丢）
+    if allow_restart and not _RESTARTED_IN_THIS_RUN:
+        log(f"❌ {max_attempts} 次导航尝试都失败，但窗口渲染正常（{last_ax_text_count} 个元素 ≥ {min_elements}）"
+            f"——restart 无效，跳过（疑似 KB 名错或 IMA UI 改版）")
 
     return False
 

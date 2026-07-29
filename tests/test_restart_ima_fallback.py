@@ -60,6 +60,26 @@ def _good_md_json():
     return json.dumps({"tree_markdown": md})
 
 
+def _rendered_md_without_target_kb_json():
+    """cua-driver 完整 AX Tree 响应：渲染正常但无目标 KB 'AI' 入口（element_index 缺失）
+
+    AXStaticText 数 = 6（≥5 通过完整性校验），但所有 AXStaticText 都不含 'AI'。
+    模拟场景：KB 名错 / IMA UI 改版 / 用户未创建 'AI' 知识库。
+    用于验证「窗口渲染正常时 restart_ima 不被触发」——修复 #2 核心断言。
+    """
+    md = (
+        '[0] AXWindow "某知识库 - ima.copilot"\n'
+        '[1] AXScrollArea\n'
+        '[2] AXStaticText = "知识库列表"\n'
+        '[3] AXStaticText = "通用知识库"\n'
+        '[4] AXStaticText = "技术笔记"\n'
+        '[5] AXStaticText = "产品文档"\n'
+        '[6] AXStaticText = "学习资料"\n'
+        '[7] AXStaticText = "项目记录"\n'
+    )
+    return json.dumps({"tree_markdown": md})
+
+
 def test_all_attempts_fail_triggers_restart_ima_fallback():
     """5 次 attempts 全失败（AX Tree 0 元素）→ 触发 restart_ima 兜底自愈
 
@@ -236,3 +256,73 @@ def test_fallback_only_once_per_run():
     assert result2 is False
     # 关键断言：跨两次 navigate_to_kb，restart_ima 只被调用 1 次（第一次触发，第二次被标志阻止）
     mock_restart.assert_called_once()
+
+
+# ==================== 修复 #2：兜底条件精确化（窗口未渲染才 restart） ====================
+
+
+def test_fallback_skipped_when_window_rendered_normally():
+    """#2 核心验证：窗口渲染正常（AXStaticText ≥ 5）但找不到 KB → 不触发 restart_ima
+
+    复现「KB 名错 / IMA UI 改版 / cua-driver bug」场景：cua-driver 返回完整 AX Tree
+    （≥5 个元素，含知识库列表等），但找不到目标 KB 'AI' 入口。旧版无差别 quit 会丢失
+    用户未保存状态；新版按 last_ax_text_count ≥ min_elements 跳过 restart。
+
+    测试矩阵：last_ax_text_count=6 ≥ 5，allow_restart=True，_RESTARTED_IN_THIS_RUN=False
+    预期：restart_ima 不调用，返回 False，日志含「窗口渲染正常」
+    """
+    # log() 只在 tty 下 print，pytest 下用 patch 拦截消息
+    log_messages = []
+    fake_log = lambda msg, print_too=True: log_messages.append(msg)
+
+    with patch("ima_incremental_update.get_ima_main_window", return_value=_win()), \
+         patch("ima_incremental_update.restart_ima") as mock_restart, \
+         patch("ima_incremental_update.run_cua",
+               return_value=_rendered_md_without_target_kb_json()) as mock_cua, \
+         patch("ima_incremental_update.subprocess.run"), \
+         patch("ima_incremental_update.time.sleep"), \
+         patch("ima_incremental_update.log", side_effect=fake_log):
+        result = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
+
+    # 核心断言 1：窗口渲染正常 → restart_ima 不被调用（避免丢失用户未保存状态）
+    mock_restart.assert_not_called()
+    # 核心断言 2：返回 False（导航失败，但不走 restart 兜底）
+    assert result is False
+    # 核心断言 3：日志含「窗口渲染正常」区分消息（便于运维定位根因）
+    combined = "\n".join(log_messages)
+    assert "窗口渲染正常" in combined, f"日志应含「窗口渲染正常」，实际: {combined}"
+    # 辅助断言：attempts 循环确实跑了 5 次（每次读 md + scroll）= 10 次 run_cua
+    # 验证 mock 数据未被误用——若未跑完 attempts 则 last_ax_text_count 不可信
+    assert mock_cua.call_count == 10, f"5 次 attempts × (读 md + scroll) 应=10 次，实际: {mock_cua.call_count}"
+
+
+def test_fallback_triggered_when_window_not_rendered():
+    """#2 对照验证：窗口未渲染（AXStaticText < 5）→ 触发 restart_ima
+
+    与 test_fallback_skipped_when_window_rendered_normally 形成对照：相同 allow_restart
+    和 _RESTARTED_IN_THIS_RUN，差异仅在 last_ax_text_count（< 5 vs ≥ 5）。验证阈值判断
+    的正确性——只有窗口真的未渲染（疑似 launchd GUI session 隔离）才 restart。
+
+    测试矩阵：last_ax_text_count=0 < 5，allow_restart=True，_RESTARTED_IN_THIS_RUN=False
+    预期：restart_ima 调用 1 次，递归 allow_restart=False 后仍失败 → 返回 False
+    """
+    log_messages = []
+    fake_log = lambda msg, print_too=True: log_messages.append(msg)
+
+    with patch("ima_incremental_update.get_ima_main_window",
+               side_effect=[_win(), _win()]), \
+         patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
+         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
+         patch("ima_incremental_update.subprocess.run"), \
+         patch("ima_incremental_update.time.sleep"), \
+         patch("ima_incremental_update.log", side_effect=fake_log):
+        result = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
+
+    # 核心断言 1：窗口未渲染 → restart_ima 触发自愈（与上一用例形成对照）
+    mock_restart.assert_called_once()
+    # 核心断言 2：递归层 allow_restart=False + 仍 0 元素 → 最终 False
+    assert result is False
+    # 核心断言 3：日志含「窗口未渲染」+ 触发原因（疑似 launchd GUI session 隔离）
+    combined = "\n".join(log_messages)
+    assert "窗口未渲染" in combined, f"日志应含「窗口未渲染」，实际: {combined}"
+    assert "launchd GUI session 隔离" in combined, f"日志应含根因说明，实际: {combined}"

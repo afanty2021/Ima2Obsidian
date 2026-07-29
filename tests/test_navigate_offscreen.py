@@ -2,6 +2,9 @@
 
 - y<-50（窗口被移到屏外，同 Space）：bring_to_front 只 activate 不移动位置，须 restart_ima 重置
 - is_on_screen=False（窗口在别的 Space/隐藏）：bring_to_front 切 Space 拉前台，不调 restart_ima
+
+注：所有用例传 max_attempts=1 隔离「末尾 launchd 兜底 restart」对前置窗口修复断言的干扰
+（末尾兜底由 test_restart_ima_fallback.py 覆盖）。
 """
 from unittest.mock import patch
 
@@ -21,7 +24,7 @@ def test_y_offscreen_calls_restart_ima():
          patch("ima_incremental_update.run_cua", return_value='{"tree_markdown":""}'), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
-        ima_incremental_update.navigate_to_kb("AI")
+        ima_incremental_update.navigate_to_kb("AI", max_attempts=1)
     mock_restart.assert_called_once()
 
 
@@ -33,7 +36,7 @@ def test_is_on_screen_false_uses_bring_to_front_not_restart():
          patch("ima_incremental_update.run_cua", return_value='{"tree_markdown":""}') as mock_cua, \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
-        ima_incremental_update.navigate_to_kb("AI")
+        ima_incremental_update.navigate_to_kb("AI", max_attempts=1)
     mock_restart.assert_not_called()
     # bring_to_front 经 run_cua 调用
     assert any("bring_to_front" in " ".join(str(a) for a in c.args) for c in mock_cua.call_args_list)
@@ -51,5 +54,5 @@ def test_combo_is_on_screen_false_and_y_offscreen_also_restarts():
          patch("ima_incremental_update.run_cua", return_value='{"tree_markdown":""}'), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
-        ima_incremental_update.navigate_to_kb("AI")
+        ima_incremental_update.navigate_to_kb("AI", max_attempts=1)
     mock_restart.assert_called_once()

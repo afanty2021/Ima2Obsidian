@@ -464,6 +464,21 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5) -> bool:
                 log(f"    滚动失败: {e}")
 
     log(f"❌ 导航到 '{kb_name}' 失败（已尝试 {max_attempts} 次）")
+
+    # 兜底：所有导航尝试失败——可能是 bring_to_front 在 launchd 后台跑时未生效
+    # （NSRunningApplication.activate 不在用户 GUI session 中），窗口仍未渲染。
+    # 强制 restart_ima（quit + relaunch 重置窗口 + 强制渲染），再递归一次重试。
+    # 防无限递归：仅 max_attempts > 1 时触发兜底，递归调用传 max_attempts=1
+    # （递归调用再次到此处时 max_attempts=1 不满足守卫，直接 return False）。
+    if max_attempts > 1:
+        log(f"⚠️  {max_attempts} 次导航尝试都失败（疑似 launchd GUI session 隔离），强制 restart_ima 自愈...")
+        try:
+            restart_ima()  # 内部已调 launch_ima（含 wait_for_ax_ready 等渲染就绪）
+            # 递归一次，走完整的拿窗口+激活+读 AX+点击流程
+            return navigate_to_kb(kb_name, max_attempts=1)
+        except Exception as e:
+            log(f"⚠️  restart_ima 兜底失败: {e}")
+
     return False
 
 

@@ -6,13 +6,29 @@
 - 旧代码所有 attempts 失败后直接 return False，无自愈。
 
 修复：所有 attempts 失败后强制 restart_ima + 递归一次重试。
-- 防无限递归：max_attempts > 1 守卫，递归调用传 max_attempts=1
+- 防无限递归：递归调用传 allow_restart=False（code review #5：解耦 max_attempts 双重含义）
 - restart_ima 异常 fail-soft 仍 return False（保留原契约）
+
+本测试覆盖 4 项 code review 修复：
+- #1: 宽泛 try/except 把递归异常误归因为 restart 失败 → restart 单独 try + 递归在外
+- #3: 多 KB 复合重启 → 模块级 _RESTARTED_IN_THIS_RUN 标志，单次 run 最多 restart 1 次
+- #4: restart_ima 返回值被忽略 → if not restart_ima(): return False
+- #5: max_attempts 双重含义 → 独立 allow_restart 参数解耦
 """
 import json
 from unittest.mock import patch
 
+import pytest
+
 import ima_incremental_update
+
+
+@pytest.fixture(autouse=True)
+def _reset_restarted_flag():
+    """每个用例前 reset 模块级 _RESTARTED_IN_THIS_RUN（修复 #3 配套）"""
+    ima_incremental_update._RESTARTED_IN_THIS_RUN = False
+    yield
+    ima_incremental_update._RESTARTED_IN_THIS_RUN = False
 
 
 def _win(is_on_screen=True, y=33):
@@ -52,31 +68,35 @@ def test_all_attempts_fail_triggers_restart_ima_fallback():
     """
     with patch("ima_incremental_update.get_ima_main_window",
                side_effect=[_win(), _win()]), \
-         patch("ima_incremental_update.restart_ima") as mock_restart, \
+         patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
          patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         result = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
-    # 兜底触发：restart_ima 被调用至少 1 次
-    assert mock_restart.call_count >= 1
-    # 递归调用 max_attempts=1，最终仍失败（AX Tree 0 元素）→ return False
+    # 兜底触发：restart_ima 被调用恰好 1 次
+    mock_restart.assert_called_once()
+    # 递归层 allow_restart=False，AX Tree 仍 0 元素 → 最终 return False
     assert result is False
 
 
-def test_fallback_uses_recursion_with_max_attempts_1_to_prevent_infinite_loop():
-    """兜底递归调用 navigate_to_kb(max_attempts=1) 防止无限循环
+def test_fallback_recursion_does_not_re_trigger_restart():
+    """兜底递归调用 navigate_to_kb(allow_restart=False) 防止无限循环
 
-    关键守卫：max_attempts > 1 才触发兜底。递归调用传 max_attempts=1 后，
-    即使再次全失败也不会再触发 restart_ima（避免 launchd 持续后台时无限重启）。
+    关键守卫：allow_restart=False 不再触发兜底。递归层即使再次全失败也不会再触发
+    restart_ima（避免 launchd 持续后台时无限重启）。
+
+    code review #5：旧版用 max_attempts=1 作为递归守卫，与「循环次数」语义耦合；
+    新版独立 allow_restart 参数解耦——递归层仍走完整 max_attempts 次循环提高成功率，
+    但不允许再次 restart。
     """
     with patch("ima_incremental_update.get_ima_main_window",
                side_effect=[_win(), _win()]), \
-         patch("ima_incremental_update.restart_ima") as mock_restart, \
+         patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
          patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
-    # 严格断言：只调 1 次（外层兜底），递归层 max_attempts=1 不再触发
+    # 严格断言：只调 1 次（外层兜底），递归层 allow_restart=False 不再触发
     mock_restart.assert_called_once()
 
 
@@ -87,12 +107,12 @@ def test_fallback_recursion_succeeds_returns_true():
     验证兜底路径能正常 return True，不被异常路径污染。
     """
     # 外层 5 次 attempts × 2 次读（首次 + retry）= 10 次 0 元素响应；
-    # 递归层 1 次 attempt：首次读 good_md（≥5 元素通过 + 命中 KB）→ 1 次 click
+    # 递归层 allow_restart=False，max_attempts=5：首次读 good_md（≥5 元素通过 + 命中 KB）→ 1 次 click
     cua_responses = [_empty_md_json()] * 10 + [_good_md_json(), '{"clicked": true}']
 
     with patch("ima_incremental_update.get_ima_main_window",
                side_effect=[_win(), _win()]), \
-         patch("ima_incremental_update.restart_ima") as mock_restart, \
+         patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
          patch("ima_incremental_update.run_cua", side_effect=cua_responses), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"), \
@@ -105,7 +125,10 @@ def test_fallback_recursion_succeeds_returns_true():
 
 
 def test_fallback_restart_ima_exception_returns_false():
-    """restart_ima 抛异常时被捕获，fail-soft 仍 return False（保留原契约）"""
+    """restart_ima 抛异常时被捕获，fail-soft 仍 return False（保留原契约）
+
+    code review #1：restart_ima 单独 try/except——异常不再吞掉后续递归调用。
+    """
     with patch("ima_incremental_update.get_ima_main_window",
                return_value=_win()), \
          patch("ima_incremental_update.restart_ima",
@@ -117,11 +140,11 @@ def test_fallback_restart_ima_exception_returns_false():
     assert result is False
 
 
-def test_max_attempts_1_does_not_trigger_fallback():
-    """max_attempts=1（递归调用场景）失败后不再触发 restart_ima（守卫正确）
+def test_allow_restart_false_does_not_trigger_fallback():
+    """allow_restart=False（递归调用场景）失败后不再触发 restart_ima（守卫正确）
 
-    防无限递归的关键：max_attempts=1 时即使全失败也直接 return False，
-    不进入兜底分支。这保证递归层不会再递归。
+    防无限递归的关键：allow_restart=False 时即使全失败也直接 return False，
+    不进入兜底分支。这保证递归层不会再递归。code review #5：替代旧版 max_attempts=1 守卫。
     """
     with patch("ima_incremental_update.get_ima_main_window",
                return_value=_win()), \
@@ -129,7 +152,87 @@ def test_max_attempts_1_does_not_trigger_fallback():
          patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
-        result = ima_incremental_update.navigate_to_kb("AI", max_attempts=1)
+        result = ima_incremental_update.navigate_to_kb(
+            "AI", max_attempts=5, allow_restart=False)
     assert result is False
-    # 守卫生效：max_attempts=1 时不能再调 restart_ima
+    # 守卫生效：allow_restart=False 时不能再调 restart_ima
     mock_restart.assert_not_called()
+
+
+# ==================== 新增测试（code review 4 项修复） ====================
+
+
+def test_fallback_recursion_exception_not_attributed_to_restart():
+    """#1 验证：递归调用内的异常不被误归因为 'restart_ima 兜底失败'
+
+    旧版宽泛 try/except 同时包了 restart_ima() 和递归 navigate_to_kb()——递归内
+    run_cua/json.loads 抛异常会被误归因为「restart_ima 兜底失败」（实际 restart 已成功）。
+    新版 restart_ima 单独 try，递归在 try 外——异常直接传播，不被误归因。
+
+    场景：restart_ima 成功返回 True（已自愈），但递归层第 1 次 run_cua 抛 RuntimeError
+    （模拟 cua-driver 网络错误/json 解析失败）。
+    """
+    # 外层 5 attempts × 2 次 = 10 次 0 元素响应；第 11 次调用（递归层首次 get_window_state）抛异常
+    cua_responses = [_empty_md_json()] * 10 + [RuntimeError("递归层 run_cua 网络异常")]
+
+    raised = None
+    try:
+        with patch("ima_incremental_update.get_ima_main_window",
+                   side_effect=[_win(), _win()]), \
+             patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
+             patch("ima_incremental_update.run_cua", side_effect=cua_responses), \
+             patch("ima_incremental_update.subprocess.run"), \
+             patch("ima_incremental_update.time.sleep"):
+            ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
+    except RuntimeError as e:
+        raised = e
+
+    # 断言 1（核心）：异常从 navigate_to_kb 传播出来（不被 except 误捕为 restart 失败）
+    assert raised is not None, "递归层异常应直接传播，不被 except 误捕"
+    assert "递归层" in str(raised)
+    # 断言 2：restart_ima 已成功调用（返回 True，未抛异常）——证明异常来自递归而非 restart
+    mock_restart.assert_called_once()
+
+
+def test_fallback_returns_false_when_restart_returns_false():
+    """#4 验证：restart_ima 返回 False（IMA 30s 内未启动）时 navigate_to_kb 不递归，直接 return False
+
+    旧版忽略 restart_ima() 返回值——launch 失败仍递归，叠加无意义 ~60s 等待。
+    新版检查返回值：launch 失败直接 return False。
+    """
+    with patch("ima_incremental_update.get_ima_main_window",
+               side_effect=[_win()]), \
+         patch("ima_incremental_update.restart_ima", return_value=False) as mock_restart, \
+         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()) as mock_cua, \
+         patch("ima_incremental_update.subprocess.run"), \
+         patch("ima_incremental_update.time.sleep") as mock_sleep:
+        result = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
+    # launch 失败 → 直接 return False，不递归
+    assert result is False
+    mock_restart.assert_called_once()
+    # 不递归的关键证据：run_cua 没有再被调用（外层已消费 10 次，递归层不再进入）
+    # 旧版会再调至少 1 次 get_window_state —— 这里严格断言总调用次数 == 外层 10 次
+    assert mock_cua.call_count == 10
+
+
+def test_fallback_only_once_per_run():
+    """#3 验证：单次 run 内最多 restart 一次——第二次 navigate_to_kb 不再 restart
+
+    场景：main() 循环处理多个 KB，第一个 KB 触发 restart 后 _RESTARTED_IN_THIS_RUN=True，
+    后续 KB 即使 5 attempts 全失败也不再 restart（避免 9.5min 复合重启浪费）。
+    """
+    # 模拟 main 循环：连续两次 navigate_to_kb（每次 5 attempts × 2 次 = 10 次 run_cua）
+    with patch("ima_incremental_update.get_ima_main_window", return_value=_win()), \
+         patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
+         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
+         patch("ima_incremental_update.subprocess.run"), \
+         patch("ima_incremental_update.time.sleep"):
+        # 第一次调用：5 attempts 失败 → 触发 restart → 递归 allow_restart=False 也失败 → False
+        result1 = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
+        # 第二次调用：_RESTARTED_IN_THIS_RUN 已 True，不再 restart
+        result2 = ima_incremental_update.navigate_to_kb("KB2", max_attempts=5)
+
+    assert result1 is False
+    assert result2 is False
+    # 关键断言：跨两次 navigate_to_kb，restart_ima 只被调用 1 次（第一次触发，第二次被标志阻止）
+    mock_restart.assert_called_once()

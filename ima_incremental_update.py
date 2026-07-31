@@ -182,6 +182,15 @@ def wait_for_ax_ready(min_elements: int = 5, timeout: int = 30) -> bool:
         if not window:
             time.sleep(1)
             continue
+        # 窗口不在当前 Space 时 AX 读不到内容（只有菜单栏，0 个 AXStaticText），
+        # osascript activate 无法跨 Space 拉窗口，须用 bring_to_front 切回当前 Space。
+        if not window.get("is_on_screen", True):
+            log("  ⚠️  窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到当前 Space...")
+            try:
+                run_cua(["call", "bring_to_front", json.dumps({"pid": window["pid"]})])
+                time.sleep(2)
+            except Exception as e:
+                log(f"  bring_to_front 失败: {e}")
         try:
             state_result = run_cua(
                 ["call", "get_window_state", json.dumps({
@@ -386,7 +395,18 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
         static_text_count = len(re.findall(r'AXStaticText', md))
         last_ax_text_count = static_text_count  # 修复 #2：记录首次探测值
         if static_text_count < 5:
-            log(f"  ⚠️  AX Tree 不完整（仅 {static_text_count} 个元素），窗口可能未激活，等待重试...")
+            log(f"  ⚠️  AX Tree 不完整（仅 {static_text_count} 个元素），窗口可能未激活或不在当前 Space...")
+            # 重新检查窗口可见性——入口检查后窗口可能脱离当前 Space（Electron 启动中
+            # 窗口状态变化 / launchd 后台 activate 间歇失效），osascript activate 无法跨
+            # Space 拉窗口，须用 bring_to_front（NSRunningApplication.activate）切回。
+            fresh_window = get_ima_main_window()
+            if fresh_window and not fresh_window.get("is_on_screen", True):
+                log(f"  ⚠️  窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到当前 Space...")
+                try:
+                    run_cua(["call", "bring_to_front", json.dumps({"pid": fresh_window["pid"]})])
+                    time.sleep(2)
+                except Exception as e:
+                    log(f"  ⚠️  bring_to_front 失败: {e}")
             time.sleep(3)
             # 再次获取
             state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])

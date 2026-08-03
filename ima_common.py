@@ -237,3 +237,43 @@ return ""
         return result.stdout.strip()
     except Exception:
         return ""
+
+
+def ensure_appnap_disabled() -> bool:
+    """确保 Obsidian 的 AppNap 已禁用（NSAppSleepDisabled=1）。
+
+    实测（2026-08-03）：设置后 Obsidian 后台 5 分钟 + 最小化，quick_clip 触发后
+    2s 落盘（对比 8/2 未设置时 17 分钟延迟）。一次性系统级设置，零运行时开销。
+
+    幂等：已设置时 no-op 返回 True；未设置时 defaults write 返回 False。
+
+    日志统一在函数内部处理（review v5 #2）：已设置=无日志；刚写入=提示重启；
+    失败=错误；超时=警告。调用方不重复打印。
+
+    Returns:
+      True = defaults 已是 1
+      False = 本次刚写入 / 写入失败 / 超时
+    """
+    try:
+        result = subprocess.run(
+            ["defaults", "read", "md.obsidian", "NSAppSleepDisabled"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "1":
+            return True  # 已设置
+        # 未设置：写入（review v4 #3：检查 returncode）
+        write_result = subprocess.run(
+            ["defaults", "write", "md.obsidian", "NSAppSleepDisabled", "-bool", "YES"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if write_result.returncode != 0:
+            err = write_result.stderr.strip() or "exit {}".format(write_result.returncode)
+            print("❌ defaults write NSAppSleepDisabled 失败: {}".format(err), flush=True)
+            return False
+        # review v5 #2：刚写入成功的日志在函数内统一打印
+        print("⚠️ NSAppSleepDisabled 本次刚写入，当前 Obsidian 进程未带标志。", flush=True)
+        print("   建议重启 Obsidian（quit + open）让本次 saver 也安全；否则靠 reclaim 兜底。", flush=True)
+        return False
+    except subprocess.TimeoutExpired:  # review v4 #6
+        print("⚠️ defaults read/write 超时（cfprefsd 锁？）", flush=True)
+        return False

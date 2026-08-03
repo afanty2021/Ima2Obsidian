@@ -105,7 +105,15 @@ def main():
 
     if not CLIPPINGS_DIR.exists():
         print(f"❌ Clippings 目录不存在: {CLIPPINGS_DIR}")
-        sys.exit(1)
+        import json as _json
+        _result = {
+            "matched": 0, "moved": 0, "marked": 0,
+            "no_match": 0, "no_folder": 0, "conflict": 0,
+            "batch_corrupt_skipped": 0, "rollback_failures": [],
+            "aborted": "CLIPPINGS_DIR not found: {}".format(CLIPPINGS_DIR),
+        }
+        print("RECLAIM_RESULT: " + _json.dumps(_result, ensure_ascii=False))
+        sys.exit(1)  # review v4 #8：CLI 退出码让运维/launchd 监控知道
 
     # 1. 取所有未保存文章，建标题索引
     # closing 包裹整个 DB 会话：SELECT、UPDATE、commit 全部走同一连接，
@@ -133,8 +141,18 @@ def main():
         # 2. 预建 KB 文件夹集合（只回收有对应文件夹的 KB）
         kb_folders = {p.name for p in VAULT_DIR.iterdir() if p.is_dir()} if VAULT_DIR.exists() else set()
 
+        aborted_reason = None  # review v4 #9：显式初始化
+
         # 3. 扫描 Clippings 文件
-        clip_files = sorted(CLIPPINGS_DIR.glob("*.md"))
+        # rglob 兼容 Web Clipper 畸形嵌套文件（bug id=2913，\n 进文件名 → 嵌套目录）
+        clip_files = sorted(CLIPPINGS_DIR.rglob("*.md"))
+
+        # md5 去重：跳过批量 flush 错乱副本（8/2 故障：23 文件同 md5 不同名）
+        batch_corrupt_skipped = _compute_batch_corrupt_skipped(clip_files)
+        if batch_corrupt_skipped:
+            print("md5 去重：跳过 {} 个批量错乱副本（疑似 Web Clipper 批量 flush 错乱）"
+                  .format(len(batch_corrupt_skipped)))
+
         print(f"Clippings 文件: {len(clip_files)} | DB 未保存文章: {len(unsaved)} | 模式: {'实跑' if args.apply else 'DRY-RUN'}")
         print("=" * 60)
 
@@ -142,6 +160,8 @@ def main():
         claimed_article_ids = set()  # 一篇文章只回收一次
 
         for f in clip_files:
+            if f in batch_corrupt_skipped:
+                continue
             stem_norm = normalize_stem(f.stem)
             # 优先精确（归一化标题）匹配，其次 sanitize 匹配
             row = None
@@ -261,6 +281,18 @@ def main():
                     rollback_failures.extend(_safe_rename_back(dst, src))
                 moved = 0
                 marked = 0
+                aborted_reason = "Phase 1 中断: {}: {}".format(type(e).__name__, e)
+                # raise 前先打印 JSON，让 saver subprocess 检测到 aborted
+                import json as _json_exc
+                _exc_result = {
+                    "matched": len(matched), "moved": 0, "marked": 0,
+                    "no_match": len(no_match), "no_folder": len(no_folder),
+                    "conflict": len(conflict),
+                    "batch_corrupt_skipped": len(batch_corrupt_skipped),
+                    "rollback_failures": [(str(d), str(s), str(e2)) for d, s, e2 in rollback_failures],
+                    "aborted": aborted_reason,
+                }
+                print("RECLAIM_RESULT: " + _json_exc.dumps(_exc_result, ensure_ascii=False))
                 raise
 
             # Phase 2: commit（独立 try，BaseException 不在此回滚文件）
@@ -284,6 +316,7 @@ def main():
     print(f"未匹配到未保存文章（保留 Clippings）: {len(no_match)}")
     print(f"匹配但 KB 无对应文件夹（保留）: {len(no_folder)}")
     print(f"目标已存在，跳过避免覆盖: {len(conflict)}")
+    print(f"批量错乱副本跳过（md5 去重）: {len(batch_corrupt_skipped)}")
     if args.apply:
         print(f"实际移动文件: {moved} | 标记已保存: {marked}")
         # dead-letter 汇总：commit/异常回滚时若有 rename 也失败，必须明确提示
@@ -294,6 +327,18 @@ def main():
                 print(f"     - 当前: {dst}")
                 print(f"       目标: {src}")
                 print(f"       错误: {err}")
+
+    # JSON 输出供 saver subprocess 解析（review v4 #1 方案 A：避免循环引用）
+    import json as _json
+    _result = {
+        "matched": len(matched), "moved": moved, "marked": marked,
+        "no_match": len(no_match), "no_folder": len(no_folder),
+        "conflict": len(conflict),
+        "batch_corrupt_skipped": len(batch_corrupt_skipped),
+        "rollback_failures": [(str(d), str(s), e) for d, s, e in rollback_failures],
+        "aborted": aborted_reason,
+    }
+    print("RECLAIM_RESULT: " + _json.dumps(_result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

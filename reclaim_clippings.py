@@ -14,6 +14,7 @@ Clippings 坟场回收脚本
 """
 
 import argparse
+import hashlib  # ← 新增（review plan #9，_compute_batch_corrupt_skipped 用）
 import os
 import re
 import sqlite3
@@ -34,6 +35,38 @@ def normalize_stem(s: str) -> str:
     s = s.strip()
     s = re.sub(r"\s+\d+$", "", s)  # 末尾的 " <数字>" 去重后缀
     return s
+
+
+def _compute_batch_corrupt_skipped(clip_files):
+    """计算批量 flush 错乱副本集合（md5 去重防御）。
+
+    8/2 故障模式：Web Clipper 批量 flush 积压请求时，用当时 Chrome 活跃标签
+    内容生成所有副本 → 多个文件 md5 相同（内容相同）+ 文件名不同（各请求
+    记录的标题）。同 md5 + 不同 normalize_stem → 判为批量错乱，整组跳过。
+
+    合法重 clip（同篇重抓）：同 md5 + normalize_stem 后同名 → 不跳过
+    （Web Clipper 加的 ' 1' 序号被 normalize_stem 剥掉）。
+
+    Args:
+      clip_files: list[Path]，Clippings 目录的 .md 文件列表
+    Returns:
+      set[Path]，应跳过的批量错乱副本路径集合
+    """
+    md5_groups = {}
+    for f in clip_files:
+        try:
+            digest = hashlib.md5(f.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        md5_groups.setdefault(digest, []).append(f)
+
+    skipped = set()
+    for digest, files in md5_groups.items():
+        if len(files) > 1:
+            stems = {normalize_stem(f.stem) for f in files}
+            if len(stems) > 1:  # 不同文章 + 同内容 → 批量 flush 错乱
+                skipped.update(files)
+    return skipped
 
 
 def mtime_yymmd(p: Path) -> str:

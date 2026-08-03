@@ -56,7 +56,7 @@ def _compute_batch_corrupt_skipped(clip_files):
     md5_groups = {}
     for f in clip_files:
         try:
-            digest = hashlib.md5(f.read_bytes()).hexdigest()
+            digest = hashlib.md5(f.read_bytes(), usedforsecurity=False).hexdigest()
         except OSError:
             continue
         md5_groups.setdefault(digest, []).append(f)

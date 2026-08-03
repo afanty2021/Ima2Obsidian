@@ -26,10 +26,12 @@ class TestComputeBatchCorruptSkipped(unittest.TestCase):
         self.assertEqual(skipped, {f1, f2, f3})
 
     def test_legitimate_reclip_same_md5_normalized_same_stem(self):
-        """合法重 clip：同内容 + 'Title' vs 'Title 1'（normalize_stem 剥序号）→ 不跳过"""
+        """合法重 clip：3 文件同内容 + normalize_stem 后同名（'文章'/'文章 1'/'文章 2'）→ 不跳过
+        阈值 ≥3 让组进入 stems 比较，验证 normalize_stem 剥序号生效（PR#11 #4 修正）"""
         f1 = self._make_file("文章.md", "same content")
         f2 = self._make_file("文章 1.md", "same content")
-        skipped = _compute_batch_corrupt_skipped([f1, f2])
+        f3 = self._make_file("文章 2.md", "same content")
+        skipped = _compute_batch_corrupt_skipped([f1, f2, f3])
         self.assertEqual(skipped, set())
 
     def test_unique_md5_not_skipped(self):

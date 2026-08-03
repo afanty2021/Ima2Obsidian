@@ -52,6 +52,20 @@ class TestEnsureAppNapDisabled(unittest.TestCase):
         result = ensure_appnap_disabled()
         self.assertFalse(result)
 
+    @patch("ima_common.subprocess.run")
+    def test_quiet_restart_hint_no_print(self, mock_run):
+        """quiet_restart_hint=True 时刚写入不打印"建议重启"（launch_obsidian 场景）"""
+        import io, contextlib
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = ensure_appnap_disabled(quiet_restart_hint=True)
+        self.assertFalse(result)
+        self.assertNotIn("建议重启", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

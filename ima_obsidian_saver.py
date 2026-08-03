@@ -1183,12 +1183,15 @@ def main():
     except StopIteration:
         pass  # Vault 空但可读，放行
 
+    # review PR#11 #3：saver 独立运行时也确保 AppNap 禁用（不依赖 incremental_update 预调）
+    from ima_common import ensure_appnap_disabled
+    ensure_appnap_disabled()
+
     init_database()
 
     # reclaim 兜底：subprocess 调 reclaim_clippings.py 认领滞留文件
     # （review v4 #1 方案 A：subprocess 避免 saver↔reclaim_clippings 循环引用）
     # review v4 #2 dry-run 门控
-    import json as _json
     _reclaim_cmd = [sys.executable, str(Path(__file__).parent / "reclaim_clippings.py")]
     if not args.dry_run:
         _reclaim_cmd.append("--apply")
@@ -1212,15 +1215,12 @@ def main():
         for _line in (_proc.stdout or "").splitlines():
             if _line.startswith("RECLAIM_RESULT: "):
                 try:
-                    _reclaim_stats = _json.loads(_line[len("RECLAIM_RESULT: "):])
-                except _json.JSONDecodeError:
+                    _reclaim_stats = json.loads(_line[len("RECLAIM_RESULT: "):])
+                except json.JSONDecodeError:
                     pass
                 break
-        if _reclaim_stats.get("matched", 0) > 0:
-            print("认领 {} 个滞留文件（移动 {}，标记 {}）".format(
-                _reclaim_stats["matched"],
-                _reclaim_stats.get("moved", 0),
-                _reclaim_stats.get("marked", 0)))
+        # review PR#11 #1+#6：删掉 saver 侧"认领 N 个"摘要打印——
+        # reclaim stdout 已含"匹配并移动: N"汇总，saver 再打印造成 matched/moved 矛盾 + 重复
         if _reclaim_stats.get("batch_corrupt_skipped"):
             print("跳过 {} 个批量错乱副本".format(_reclaim_stats["batch_corrupt_skipped"]))
         for _item in _reclaim_stats.get("rollback_failures") or []:

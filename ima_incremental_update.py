@@ -26,7 +26,7 @@ from pathlib import Path
 # 导入公共模块
 from ima_common import (
     CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running,
-    get_ima_main_window,
+    get_ima_main_window, ensure_appnap_disabled,
 )
 
 # ==================== 配置 ====================
@@ -605,6 +605,7 @@ def launch_obsidian(timeout: int = 30) -> bool:
     返回: True 表示就绪，False 表示启动超时
     """
     log("启动 Obsidian 应用...")
+    ensure_appnap_disabled()  # 写入 defaults，紧接着 open 的新进程自动带标志
     subprocess.run(
         ["open", "-a", "Obsidian"],
         capture_output=True, timeout=10
@@ -622,6 +623,10 @@ def launch_obsidian(timeout: int = 30) -> bool:
 def ensure_obsidian_ready() -> bool:
     """确保 Obsidian 已运行（未运行则自动启动），供保存器前置检查使用"""
     if is_obsidian_running():
+        # review v4 #2：Obsidian 已运行也要确保 AppNap 禁用（否则首次部署
+        # Obsidian 已在跑时 ensure 永不调用，8/2 故障复现）。
+        # review v5 #2：日志由 ensure_appnap_disabled 内部统一打印
+        ensure_appnap_disabled()
         return True
     return launch_obsidian()
 

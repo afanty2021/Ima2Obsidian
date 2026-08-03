@@ -15,6 +15,7 @@ Clippings 坟场回收脚本
 
 import argparse
 import hashlib  # ← 新增（review plan #9，_compute_batch_corrupt_skipped 用）
+import json
 import os
 import re
 import sqlite3
@@ -62,7 +63,7 @@ def _compute_batch_corrupt_skipped(clip_files):
 
     skipped = set()
     for digest, files in md5_groups.items():
-        if len(files) > 1:
+        if len(files) >= 3:  # 批量 flush 错乱通常 ≥3 副本；2 个同内容可能是合法错误页
             stems = {normalize_stem(f.stem) for f in files}
             if len(stems) > 1:  # 不同文章 + 同内容 → 批量 flush 错乱
                 skipped.update(files)
@@ -105,14 +106,13 @@ def main():
 
     if not CLIPPINGS_DIR.exists():
         print(f"❌ Clippings 目录不存在: {CLIPPINGS_DIR}")
-        import json as _json
         _result = {
             "matched": 0, "moved": 0, "marked": 0,
             "no_match": 0, "no_folder": 0, "conflict": 0,
             "batch_corrupt_skipped": 0, "rollback_failures": [],
             "aborted": "CLIPPINGS_DIR not found: {}".format(CLIPPINGS_DIR),
         }
-        print("RECLAIM_RESULT: " + _json.dumps(_result, ensure_ascii=False))
+        print("RECLAIM_RESULT: " + json.dumps(_result, ensure_ascii=False))
         sys.exit(1)  # review v4 #8：CLI 退出码让运维/launchd 监控知道
 
     # 1. 取所有未保存文章，建标题索引
@@ -145,7 +145,11 @@ def main():
 
         # 3. 扫描 Clippings 文件
         # rglob 兼容 Web Clipper 畸形嵌套文件（bug id=2913，\n 进文件名 → 嵌套目录）
-        clip_files = sorted(CLIPPINGS_DIR.rglob("*.md"))
+        try:
+            clip_files = sorted(CLIPPINGS_DIR.rglob("*.md"))
+        except PermissionError as e:
+            print("⚠️ Clippings 扫描权限错误（{}），本次跳过 reclaim".format(e))
+            clip_files = []
 
         # md5 去重：跳过批量 flush 错乱副本（8/2 故障：23 文件同 md5 不同名）
         batch_corrupt_skipped = _compute_batch_corrupt_skipped(clip_files)
@@ -283,7 +287,6 @@ def main():
                 marked = 0
                 aborted_reason = "Phase 1 中断: {}: {}".format(type(e).__name__, e)
                 # raise 前先打印 JSON，让 saver subprocess 检测到 aborted
-                import json as _json_exc
                 _exc_result = {
                     "matched": len(matched), "moved": 0, "marked": 0,
                     "no_match": len(no_match), "no_folder": len(no_folder),
@@ -292,7 +295,7 @@ def main():
                     "rollback_failures": [(str(d), str(s), str(e2)) for d, s, e2 in rollback_failures],
                     "aborted": aborted_reason,
                 }
-                print("RECLAIM_RESULT: " + _json_exc.dumps(_exc_result, ensure_ascii=False))
+                print("RECLAIM_RESULT: " + json.dumps(_exc_result, ensure_ascii=False))
                 raise
 
             # Phase 2: commit（独立 try，BaseException 不在此回滚文件）
@@ -307,6 +310,7 @@ def main():
                     rollback_failures.extend(_safe_rename_back(dst, src))
                 moved = 0
                 marked = 0
+                aborted_reason = "commit 失败: {}".format(e)
             # 注意：commit 成功后若发生 BaseException，让其在汇总前正常传播，
             # 文件保留在 KB（与已提交的 DB 一致），避免永久孤儿
 
@@ -329,7 +333,6 @@ def main():
                 print(f"       错误: {err}")
 
     # JSON 输出供 saver subprocess 解析（review v4 #1 方案 A：避免循环引用）
-    import json as _json
     _result = {
         "matched": len(matched), "moved": moved, "marked": marked,
         "no_match": len(no_match), "no_folder": len(no_folder),
@@ -338,7 +341,7 @@ def main():
         "rollback_failures": [(str(d), str(s), e) for d, s, e in rollback_failures],
         "aborted": aborted_reason,
     }
-    print("RECLAIM_RESULT: " + _json.dumps(_result, ensure_ascii=False))
+    print("RECLAIM_RESULT: " + json.dumps(_result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

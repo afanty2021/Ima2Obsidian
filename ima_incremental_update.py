@@ -625,8 +625,10 @@ def ensure_obsidian_ready() -> bool:
     if is_obsidian_running():
         # review v4 #2：Obsidian 已运行也要确保 AppNap 禁用（否则首次部署
         # Obsidian 已在跑时 ensure 永不调用，8/2 故障复现）。
-        # review v5 #2：日志由 ensure_appnap_disabled 内部统一打印
-        ensure_appnap_disabled()
+        # review v5 #2 + code-review #5：日志由调用方按场景打印
+        if not ensure_appnap_disabled():
+            log("⚠️  NSAppSleepDisabled 本次刚写入，当前 Obsidian 进程未带标志。")
+            log("   建议重启 Obsidian（quit + open）让本次 saver 也安全；否则靠 reclaim 兜底。")
         return True
     return launch_obsidian()
 

@@ -270,10 +270,8 @@ def ensure_appnap_disabled() -> bool:
             err = write_result.stderr.strip() or "exit {}".format(write_result.returncode)
             print("❌ defaults write NSAppSleepDisabled 失败: {}".format(err), flush=True)
             return False
-        # review v5 #2：刚写入成功的日志在函数内统一打印
-        print("⚠️ NSAppSleepDisabled 本次刚写入，当前 Obsidian 进程未带标志。", flush=True)
-        print("   建议重启 Obsidian（quit + open）让本次 saver 也安全；否则靠 reclaim 兜底。", flush=True)
+        # review v5 #2 + code-review #5："需重启"日志由调用方按场景打印
         return False
-    except subprocess.TimeoutExpired:  # review v4 #6
-        print("⚠️ defaults read/write 超时（cfprefsd 锁？）", flush=True)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print("⚠️ defaults read/write 失败（{}）".format(e), flush=True)
         return False

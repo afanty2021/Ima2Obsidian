@@ -45,6 +45,13 @@ class TestComputeBatchCorruptSkipped(unittest.TestCase):
         skipped = _compute_batch_corrupt_skipped([f1])
         self.assertEqual(skipped, set())
 
+    def test_two_different_articles_same_content_not_flagged(self):
+        """2 篇不同文章同内容（如错误页）+ 不同名 → 不判为批量错乱（阈值 ≥3）"""
+        f1 = self._make_file("文章A.md", "same error page content")
+        f2 = self._make_file("文章B.md", "same error page content")
+        skipped = _compute_batch_corrupt_skipped([f1, f2])
+        self.assertEqual(skipped, set())
+
 
 if __name__ == "__main__":
     unittest.main()

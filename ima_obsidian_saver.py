@@ -1184,6 +1184,48 @@ def main():
         pass  # Vault 空但可读，放行
 
     init_database()
+
+    # reclaim 兜底：subprocess 调 reclaim_clippings.py 认领滞留文件
+    # （review v4 #1 方案 A：subprocess 避免 saver↔reclaim_clippings 循环引用）
+    # review v4 #2 dry-run 门控
+    import json as _json
+    _reclaim_cmd = [sys.executable, str(Path(__file__).parent / "reclaim_clippings.py")]
+    if not args.dry_run:
+        _reclaim_cmd.append("--apply")
+    try:
+        _proc = subprocess.run(_reclaim_cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        _proc = None
+        print("⚠️ reclaim 超时（120s），跳过本次认领")
+    except OSError as _e:  # review plan #4：reclaim_clippings.py 缺失等
+        _proc = None
+        print("⚠️ reclaim 启动失败（{}），跳过本次认领".format(_e))
+    if _proc:
+        if _proc.stdout:
+            print(_proc.stdout, end="")
+        if _proc.stderr:
+            print(_proc.stderr, end="", file=sys.stderr)
+        # 解析 RECLAIM_RESULT JSON 行
+        _reclaim_stats = {}
+        for _line in (_proc.stdout or "").splitlines():
+            if _line.startswith("RECLAIM_RESULT: "):
+                try:
+                    _reclaim_stats = _json.loads(_line[len("RECLAIM_RESULT: "):])
+                except _json.JSONDecodeError:
+                    pass
+                break
+        if _reclaim_stats.get("matched", 0) > 0:
+            print("认领 {} 个滞留文件（移动 {}，标记 {}）".format(
+                _reclaim_stats["matched"],
+                _reclaim_stats.get("moved", 0),
+                _reclaim_stats.get("marked", 0)))
+        if _reclaim_stats.get("batch_corrupt_skipped"):
+            print("跳过 {} 个批量错乱副本".format(_reclaim_stats["batch_corrupt_skipped"]))
+        for _item in _reclaim_stats.get("rollback_failures") or []:
+            print("⚠️ reclaim 回滚失败（文件位置不可知）：{}".format(_item))
+        if _reclaim_stats.get("aborted"):
+            print("⚠️ reclaim 中止：{}（剩余滞留下次再认领）".format(_reclaim_stats["aborted"]))
+
     stats = get_stats(args.kb)
 
     print(f"\n数据库统计:")

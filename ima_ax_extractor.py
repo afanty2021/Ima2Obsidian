@@ -76,7 +76,9 @@ def normalize_url(url: str) -> str:
     # 先去除 #fragment（如微信 #rd），保证所有后续分支不必重复处理
     url = url.split('#', 1)[0]
 
-    if 'mp.weixin.qq.com' in url:
+    # hostname 精确匹配（与 save_article 白名单一致，review PR#12 #2：
+    # 子串匹配会让含 mp.weixin.qq.com 的非微信 URL 误入微信规范化分支）
+    if urlparse(url).hostname == 'mp.weixin.qq.com':
         # 短格式: /s/ARTICLE_ID — 去除所有查询参数
         if '/s/' in url:
             return url.split('?', 1)[0]

@@ -87,7 +87,7 @@ def test_all_attempts_fail_triggers_restart_ima_fallback():
     现有逻辑只能走完 max_attempts 然后 return False。修复后应强制 restart_ima 一次。
     """
     with patch("ima_incremental_update.get_ima_main_window",
-               side_effect=[_win(), _win()]), \
+               return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
          patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
@@ -110,7 +110,7 @@ def test_fallback_recursion_does_not_re_trigger_restart():
     但不允许再次 restart。
     """
     with patch("ima_incremental_update.get_ima_main_window",
-               side_effect=[_win(), _win()]), \
+               return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
          patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
@@ -131,7 +131,7 @@ def test_fallback_recursion_succeeds_returns_true():
     cua_responses = [_empty_md_json()] * 10 + [_good_md_json(), '{"clicked": true}']
 
     with patch("ima_incremental_update.get_ima_main_window",
-               side_effect=[_win(), _win()]), \
+               return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
          patch("ima_incremental_update.run_cua", side_effect=cua_responses), \
          patch("ima_incremental_update.subprocess.run"), \
@@ -198,7 +198,7 @@ def test_fallback_recursion_exception_not_attributed_to_restart():
     raised = None
     try:
         with patch("ima_incremental_update.get_ima_main_window",
-                   side_effect=[_win(), _win()]), \
+                   return_value=_win()), \
              patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
              patch("ima_incremental_update.run_cua", side_effect=cua_responses), \
              patch("ima_incremental_update.subprocess.run"), \
@@ -221,7 +221,7 @@ def test_fallback_returns_false_when_restart_returns_false():
     新版检查返回值：launch 失败直接 return False。
     """
     with patch("ima_incremental_update.get_ima_main_window",
-               side_effect=[_win()]), \
+               return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=False) as mock_restart, \
          patch("ima_incremental_update.run_cua", return_value=_empty_md_json()) as mock_cua, \
          patch("ima_incremental_update.subprocess.run"), \
@@ -310,7 +310,7 @@ def test_fallback_triggered_when_window_not_rendered():
     fake_log = lambda msg, print_too=True: log_messages.append(msg)
 
     with patch("ima_incremental_update.get_ima_main_window",
-               side_effect=[_win(), _win()]), \
+               return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
          patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \

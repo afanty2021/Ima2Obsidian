@@ -23,6 +23,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 # 导入公共模块
 from ima_common import (
@@ -75,7 +76,9 @@ def normalize_url(url: str) -> str:
     # 先去除 #fragment（如微信 #rd），保证所有后续分支不必重复处理
     url = url.split('#', 1)[0]
 
-    if 'mp.weixin.qq.com' in url:
+    # hostname 精确匹配（与 save_article 白名单一致，review PR#12 #2：
+    # 子串匹配会让含 mp.weixin.qq.com 的非微信 URL 误入微信规范化分支）
+    if urlparse(url).hostname == 'mp.weixin.qq.com':
         # 短格式: /s/ARTICLE_ID — 去除所有查询参数
         if '/s/' in url:
             return url.split('?', 1)[0]
@@ -143,6 +146,13 @@ def url_exists(url: str) -> bool:
 
 
 def save_article(url: str, title: str, kb: str) -> bool:
+    # 白名单：只接受微信公众号文章（hostname 精确匹配 mp.weixin.qq.com）。
+    # 排除 IMA 界面公告等非文章卡片被误识别（如"copilot 功能上线"→ github.com）。
+    # 用 hostname 精确匹配而非子串（review PR#12 #5：子串可被
+    # /path?redirect=mp.weixin.qq.com 绕过）。若未来知识库含其他平台文章，扩展此检查。
+    if urlparse(url).hostname != "mp.weixin.qq.com":
+        print("  ⚠️  跳过非微信 URL（疑似非文章卡片）：{}".format(url[:60]))
+        return False
     try:
         # 使用规范化后的 URL 进行保存
         normalized_url = normalize_url(url)
@@ -573,11 +583,18 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                     final_title = title_extracted or title
                     print(f"    ✅ 标题: {final_title[:60]}...")
 
-                    save_article(url, final_title, kb_name)
-                    total_new += 1
-                    page_new += 1
-                    consecutive_seen = 0
-                    print(f"    ✅ 新文章已保存 (总计: {total_new})")
+                    if save_article(url, final_title, kb_name):
+                        total_new += 1
+                        page_new += 1
+                        consecutive_seen = 0
+                        print(f"    ✅ 新文章已保存 (总计: {total_new})")
+                    else:
+                        # save_article 返回 False：白名单拒绝（非微信）或 DB 异常。
+                        # 两者靠函数内部打印区分（"跳过非微信" vs "保存失败"）。
+                        # review PR#12 #1：total_skipped 累加，汇总不矛盾
+                        total_skipped += 1
+                        page_skipped += 1
+                        print(f"    ⏭️  未保存（本页跳过: {page_skipped}）")
             finally:
                 # 无论成功/异常/continue/break，都关闭文章标签页（异常路径不再漏关）
                 cmd_w_close(article_url=article_url)

@@ -192,7 +192,7 @@ def test_save_article_closes_connection_on_exception(tracked_db):
 
     # sqlite3 是单例模块；patch sqlite3.connect 影响所有调用者
     with patch.object(sqlite3, "connect", faulty_connect):
-        save_article("https://example.com/x", "title", "AI")  # 内部捕获，返回 False
+        save_article("https://mp.weixin.qq.com/s?__biz=TestConn==&mid=1&idx=1&sn=conn", "title", "AI")  # 微信 URL 过白名单测异常关连接（review PR#12 #2）
 
     assert len(instances) >= 1, "应当打开过连接"
     for conn in instances:

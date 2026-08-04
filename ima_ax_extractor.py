@@ -143,6 +143,12 @@ def url_exists(url: str) -> bool:
 
 
 def save_article(url: str, title: str, kb: str) -> bool:
+    # 白名单：只接受微信公众号文章（IMA 知识库内容均为微信 mp.weixin.qq.com）。
+    # 排除 IMA 界面公告等非文章卡片被误识别（如"copilot 功能上线"→ github.com）。
+    # 若未来知识库含其他平台文章，扩展此检查。
+    if "mp.weixin.qq.com" not in url:
+        print("  ⚠️  跳过非微信 URL（疑似非文章卡片）：{}".format(url[:60]))
+        return False
     try:
         # 使用规范化后的 URL 进行保存
         normalized_url = normalize_url(url)

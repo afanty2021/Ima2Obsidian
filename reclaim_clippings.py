@@ -150,6 +150,7 @@ def main():
         except PermissionError as e:
             print("⚠️ Clippings 扫描权限错误（{}），本次跳过 reclaim".format(e))
             clip_files = []
+            aborted_reason = "Clippings 扫描权限错误: {}".format(e)
 
         # md5 去重：跳过批量 flush 错乱副本（8/2 故障：23 文件同 md5 不同名）
         batch_corrupt_skipped = _compute_batch_corrupt_skipped(clip_files)

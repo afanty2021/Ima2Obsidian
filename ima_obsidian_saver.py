@@ -51,7 +51,7 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import requests
 
-from ima_common import DB_FILE, init_database, now_saved_at
+from ima_common import DB_FILE, init_database, now_saved_at, ensure_appnap_disabled
 
 
 # ==================== 配置 ====================
@@ -1184,7 +1184,6 @@ def main():
         pass  # Vault 空但可读，放行
 
     # review PR#11 #3：saver 独立运行时也确保 AppNap 禁用（不依赖 incremental_update 预调）
-    from ima_common import ensure_appnap_disabled
     ensure_appnap_disabled()
 
     init_database()

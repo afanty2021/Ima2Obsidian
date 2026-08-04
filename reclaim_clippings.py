@@ -14,6 +14,8 @@ Clippings 坟场回收脚本
 """
 
 import argparse
+import hashlib  # ← 新增（review plan #9，_compute_batch_corrupt_skipped 用）
+import json
 import os
 import re
 import sqlite3
@@ -34,6 +36,38 @@ def normalize_stem(s: str) -> str:
     s = s.strip()
     s = re.sub(r"\s+\d+$", "", s)  # 末尾的 " <数字>" 去重后缀
     return s
+
+
+def _compute_batch_corrupt_skipped(clip_files):
+    """计算批量 flush 错乱副本集合（md5 去重防御）。
+
+    8/2 故障模式：Web Clipper 批量 flush 积压请求时，用当时 Chrome 活跃标签
+    内容生成所有副本 → 多个文件 md5 相同（内容相同）+ 文件名不同（各请求
+    记录的标题）。同 md5 + 不同 normalize_stem → 判为批量错乱，整组跳过。
+
+    合法重 clip（同篇重抓）：同 md5 + normalize_stem 后同名 → 不跳过
+    （Web Clipper 加的 ' 1' 序号被 normalize_stem 剥掉）。
+
+    Args:
+      clip_files: list[Path]，Clippings 目录的 .md 文件列表
+    Returns:
+      set[Path]，应跳过的批量错乱副本路径集合
+    """
+    md5_groups = {}
+    for f in clip_files:
+        try:
+            digest = hashlib.md5(f.read_bytes(), usedforsecurity=False).hexdigest()
+        except OSError:
+            continue
+        md5_groups.setdefault(digest, []).append(f)
+
+    skipped = set()
+    for digest, files in md5_groups.items():
+        if len(files) >= 3:  # 批量 flush 错乱通常 ≥3 副本；2 个同内容可能是合法错误页
+            stems = {normalize_stem(f.stem) for f in files}
+            if len(stems) > 1:  # 不同文章 + 同内容 → 批量 flush 错乱
+                skipped.update(files)
+    return skipped
 
 
 def mtime_yymmd(p: Path) -> str:
@@ -72,7 +106,14 @@ def main():
 
     if not CLIPPINGS_DIR.exists():
         print(f"❌ Clippings 目录不存在: {CLIPPINGS_DIR}")
-        sys.exit(1)
+        _result = {
+            "matched": 0, "moved": 0, "marked": 0,
+            "no_match": 0, "no_folder": 0, "conflict": 0,
+            "batch_corrupt_skipped": 0, "rollback_failures": [],
+            "aborted": "CLIPPINGS_DIR not found: {}".format(CLIPPINGS_DIR),
+        }
+        print("RECLAIM_RESULT: " + json.dumps(_result, ensure_ascii=False))
+        sys.exit(1)  # review v4 #8：CLI 退出码让运维/launchd 监控知道
 
     # 1. 取所有未保存文章，建标题索引
     # closing 包裹整个 DB 会话：SELECT、UPDATE、commit 全部走同一连接，
@@ -100,8 +141,23 @@ def main():
         # 2. 预建 KB 文件夹集合（只回收有对应文件夹的 KB）
         kb_folders = {p.name for p in VAULT_DIR.iterdir() if p.is_dir()} if VAULT_DIR.exists() else set()
 
+        aborted_reason = None  # review v4 #9：显式初始化
+
         # 3. 扫描 Clippings 文件
-        clip_files = sorted(CLIPPINGS_DIR.glob("*.md"))
+        # rglob 兼容 Web Clipper 畸形嵌套文件（bug id=2913，\n 进文件名 → 嵌套目录）
+        try:
+            clip_files = sorted(CLIPPINGS_DIR.rglob("*.md"))
+        except PermissionError as e:
+            print("⚠️ Clippings 扫描权限错误（{}），本次跳过 reclaim".format(e))
+            clip_files = []
+            aborted_reason = "Clippings 扫描权限错误: {}".format(e)
+
+        # md5 去重：跳过批量 flush 错乱副本（8/2 故障：23 文件同 md5 不同名）
+        batch_corrupt_skipped = _compute_batch_corrupt_skipped(clip_files)
+        if batch_corrupt_skipped:
+            print("md5 去重：跳过 {} 个批量错乱副本（疑似 Web Clipper 批量 flush 错乱）"
+                  .format(len(batch_corrupt_skipped)))
+
         print(f"Clippings 文件: {len(clip_files)} | DB 未保存文章: {len(unsaved)} | 模式: {'实跑' if args.apply else 'DRY-RUN'}")
         print("=" * 60)
 
@@ -109,6 +165,8 @@ def main():
         claimed_article_ids = set()  # 一篇文章只回收一次
 
         for f in clip_files:
+            if f in batch_corrupt_skipped:
+                continue
             stem_norm = normalize_stem(f.stem)
             # 优先精确（归一化标题）匹配，其次 sanitize 匹配
             row = None
@@ -228,6 +286,17 @@ def main():
                     rollback_failures.extend(_safe_rename_back(dst, src))
                 moved = 0
                 marked = 0
+                aborted_reason = "Phase 1 中断: {}: {}".format(type(e).__name__, e)
+                # raise 前先打印 JSON，让 saver subprocess 检测到 aborted
+                _exc_result = {
+                    "matched": len(matched), "moved": 0, "marked": 0,
+                    "no_match": len(no_match), "no_folder": len(no_folder),
+                    "conflict": len(conflict),
+                    "batch_corrupt_skipped": len(batch_corrupt_skipped),
+                    "rollback_failures": [(str(d), str(s), str(e2)) for d, s, e2 in rollback_failures],
+                    "aborted": aborted_reason,
+                }
+                print("RECLAIM_RESULT: " + json.dumps(_exc_result, ensure_ascii=False))
                 raise
 
             # Phase 2: commit（独立 try，BaseException 不在此回滚文件）
@@ -242,6 +311,7 @@ def main():
                     rollback_failures.extend(_safe_rename_back(dst, src))
                 moved = 0
                 marked = 0
+                aborted_reason = "commit 失败: {}".format(e)
             # 注意：commit 成功后若发生 BaseException，让其在汇总前正常传播，
             # 文件保留在 KB（与已提交的 DB 一致），避免永久孤儿
 
@@ -251,6 +321,7 @@ def main():
     print(f"未匹配到未保存文章（保留 Clippings）: {len(no_match)}")
     print(f"匹配但 KB 无对应文件夹（保留）: {len(no_folder)}")
     print(f"目标已存在，跳过避免覆盖: {len(conflict)}")
+    print(f"批量错乱副本跳过（md5 去重）: {len(batch_corrupt_skipped)}")
     if args.apply:
         print(f"实际移动文件: {moved} | 标记已保存: {marked}")
         # dead-letter 汇总：commit/异常回滚时若有 rename 也失败，必须明确提示
@@ -262,6 +333,28 @@ def main():
                 print(f"       目标: {src}")
                 print(f"       错误: {err}")
 
+    # JSON 输出供 saver subprocess 解析（review v4 #1 方案 A：避免循环引用）
+    _result = {
+        "matched": len(matched), "moved": moved, "marked": marked,
+        "no_match": len(no_match), "no_folder": len(no_folder),
+        "conflict": len(conflict),
+        "batch_corrupt_skipped": len(batch_corrupt_skipped),
+        "rollback_failures": [(str(d), str(s), e) for d, s, e in rollback_failures],
+        "aborted": aborted_reason,
+    }
+    print("RECLAIM_RESULT: " + json.dumps(_result, ensure_ascii=False))
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as _e:
+        # 兜底：sqlite3.connect/SELECT 等在 Phase 1 try 之前的异常（review PR#11 #1）
+        # 确保 saver subprocess 总能解析到 RECLAIM_RESULT（含 aborted 原因）
+        print("RECLAIM_RESULT: " + json.dumps({
+            "matched": 0, "moved": 0, "marked": 0,
+            "no_match": 0, "no_folder": 0, "conflict": 0,
+            "batch_corrupt_skipped": 0, "rollback_failures": [],
+            "aborted": "未捕获异常: {}: {}".format(type(_e).__name__, _e),
+        }, ensure_ascii=False))
+        sys.exit(1)

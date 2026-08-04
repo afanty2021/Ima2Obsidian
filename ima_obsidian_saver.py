@@ -51,7 +51,7 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import requests
 
-from ima_common import DB_FILE, init_database, now_saved_at
+from ima_common import DB_FILE, init_database, now_saved_at, ensure_appnap_disabled
 
 
 # ==================== 配置 ====================
@@ -1183,7 +1183,50 @@ def main():
     except StopIteration:
         pass  # Vault 空但可读，放行
 
+    # review PR#11 #3：saver 独立运行时也确保 AppNap 禁用（不依赖 incremental_update 预调）
+    ensure_appnap_disabled()
+
     init_database()
+
+    # reclaim 兜底：subprocess 调 reclaim_clippings.py 认领滞留文件
+    # （review v4 #1 方案 A：subprocess 避免 saver↔reclaim_clippings 循环引用）
+    # review v4 #2 dry-run 门控
+    _reclaim_cmd = [sys.executable, str(Path(__file__).parent / "reclaim_clippings.py")]
+    if not args.dry_run:
+        _reclaim_cmd.append("--apply")
+    try:
+        _proc = subprocess.run(_reclaim_cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        _proc = None
+        print("⚠️ reclaim 超时（120s），跳过本次认领")
+    except OSError as _e:  # review plan #4：reclaim_clippings.py 缺失等
+        _proc = None
+        print("⚠️ reclaim 启动失败（{}），跳过本次认领".format(_e))
+    if _proc:
+        if _proc.returncode != 0:
+            print("⚠️ reclaim 异常退出（code={}），检查以下输出".format(_proc.returncode))
+        if _proc.stdout:
+            print(_proc.stdout, end="")
+        if _proc.stderr:
+            print(_proc.stderr, end="", file=sys.stderr)
+        # 解析 RECLAIM_RESULT JSON 行
+        _reclaim_stats = {}
+        for _line in (_proc.stdout or "").splitlines():
+            if _line.startswith("RECLAIM_RESULT: "):
+                try:
+                    _reclaim_stats = json.loads(_line[len("RECLAIM_RESULT: "):])
+                except json.JSONDecodeError:
+                    pass
+                break
+        # review PR#11 #1+#6：删掉 saver 侧"认领 N 个"摘要打印——
+        # reclaim stdout 已含"匹配并移动: N"汇总，saver 再打印造成 matched/moved 矛盾 + 重复
+        if _reclaim_stats.get("batch_corrupt_skipped"):
+            print("跳过 {} 个批量错乱副本".format(_reclaim_stats["batch_corrupt_skipped"]))
+        for _item in _reclaim_stats.get("rollback_failures") or []:
+            print("⚠️ reclaim 回滚失败（文件位置不可知）：{}".format(_item))
+        if _reclaim_stats.get("aborted"):
+            print("⚠️ reclaim 中止：{}（剩余滞留下次再认领）".format(_reclaim_stats["aborted"]))
+
     stats = get_stats(args.kb)
 
     print(f"\n数据库统计:")

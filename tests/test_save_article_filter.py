@@ -35,14 +35,16 @@ def test_save_article_rejects_substring_bypass(seeded_db):
 
 
 def test_save_article_accepts_wechat_long_url(seeded_db):
-    """微信长格式 URL 正常存"""
+    """微信长格式 URL 正常存 + 写盘验证（review PR#12 #3：对称性）"""
     test_url = "https://mp.weixin.qq.com/s?__biz=MzTestFilter==&mid=123&idx=1&sn=abc-filter-test"
     result = save_article(test_url, "filter test wechat", "AI")
     assert result is True, "微信长格式 URL 应被接受"
+    assert url_exists(test_url), "微信长格式 URL 应已写盘"
 
 
 def test_save_article_accepts_wechat_short_url(seeded_db):
-    """微信短格式 URL 正常存"""
+    """微信短格式 URL 正常存 + 写盘验证"""
     test_url = "https://mp.weixin.qq.com/s/FilterTestUnique20260804"
     result = save_article(test_url, "filter test short", "AI")
     assert result is True, "微信短格式 URL 应被接受"
+    assert url_exists(test_url), "微信短格式 URL 应已写盘"

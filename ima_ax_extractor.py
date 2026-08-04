@@ -587,9 +587,12 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                         consecutive_seen = 0
                         print(f"    ✅ 新文章已保存 (总计: {total_new})")
                     else:
-                        # save_article 拒绝（如非微信 URL 被白名单过滤，review PR#12 #1）
+                        # save_article 返回 False：白名单拒绝（非微信）或 DB 异常。
+                        # 两者靠函数内部打印区分（"跳过非微信" vs "保存失败"）。
+                        # review PR#12 #1：total_skipped 累加，汇总不矛盾
+                        total_skipped += 1
                         page_skipped += 1
-                        print(f"    ⏭️  save_article 拒绝（本页跳过: {page_skipped}）")
+                        print(f"    ⏭️  未保存（本页跳过: {page_skipped}）")
             finally:
                 # 无论成功/异常/continue/break，都关闭文章标签页（异常路径不再漏关）
                 cmd_w_close(article_url=article_url)

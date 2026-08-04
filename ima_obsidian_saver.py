@@ -1205,7 +1205,7 @@ def main():
         print("⚠️ reclaim 启动失败（{}），跳过本次认领".format(_e))
     if _proc:
         if _proc.returncode != 0:
-            print("⚠️ reclaim 异常退出（code={}），本次跳过认领".format(_proc.returncode))
+            print("⚠️ reclaim 异常退出（code={}），检查以下输出".format(_proc.returncode))
         if _proc.stdout:
             print(_proc.stdout, end="")
         if _proc.stderr:

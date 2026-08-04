@@ -345,4 +345,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as _e:
+        # 兜底：sqlite3.connect/SELECT 等在 Phase 1 try 之前的异常（review PR#11 #1）
+        # 确保 saver subprocess 总能解析到 RECLAIM_RESULT（含 aborted 原因）
+        print("RECLAIM_RESULT: " + json.dumps({
+            "matched": 0, "moved": 0, "marked": 0,
+            "no_match": 0, "no_folder": 0, "conflict": 0,
+            "batch_corrupt_skipped": 0, "rollback_failures": [],
+            "aborted": "未捕获异常: {}: {}".format(type(_e).__name__, _e),
+        }, ensure_ascii=False))
+        sys.exit(1)

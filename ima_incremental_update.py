@@ -937,53 +937,67 @@ def main():
             sys.exit(1)
         log("✅ URL 规范化自检通过")
 
-    # 总计统计
-    total_new = 0
-    total_skipped = 0
-    total_saved = 0
-    total_failed = 0       # 保存失败（saver）
-    total_kb_failed = 0    # 知识库处理失败（导航/窗口/提取）
+    # caffeinate 保活：防止屏幕休眠致 AX 0 元素（8/5 故障根因——屏幕在启动后 6s 熄灭，
+    # 全部 KB 导航和 URL 提取均因窗口未渲染失败）。-d 阻止 display sleep assertion，
+    # 进程退出时自动释放。dry-run 不需要保活。
+    caffeinate_proc = None
+    if not args.dry_run:
+        caffeinate_proc = subprocess.Popen(
+            ["caffeinate", "-d"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
-    # 逐个处理知识库
-    for i, kb_name in enumerate(kbs, 1):
-        log(f"\n[{i}/{len(kbs)}] 处理知识库: {kb_name}")
+    try:
+        # 总计统计
+        total_new = 0
+        total_skipped = 0
+        total_saved = 0
+        total_failed = 0       # 保存失败（saver）
+        total_kb_failed = 0    # 知识库处理失败（导航/窗口/提取）
 
-        # 提取文章
-        stats = update_knowledge_base(kb_name, args.dry_run)
-        total_new += stats["new"]
-        total_skipped += stats["skipped"]
-        total_kb_failed += stats["failed"]
+        # 逐个处理知识库
+        for i, kb_name in enumerate(kbs, 1):
+            log(f"\n[{i}/{len(kbs)}] 处理知识库: {kb_name}")
 
-        # 触发保存：有新文章，或该 KB 有历史漏存（之前保存失败/超时未保存）。
-        # 后者让失败文章能在后续运行中自动重试，避免 new=0 时永久漏存。
-        unsaved = count_unsaved_articles(kb_name) if (not args.no_save and not args.dry_run) else 0
-        if (stats["new"] > 0 or unsaved > 0) and not args.no_save and not args.dry_run:
-            if stats["new"] == 0 and unsaved > 0:
-                log(f"检测到 {kb_name} 有 {unsaved} 篇历史漏存未保存，触发保存重试")
-            save_stats = save_to_obsidian(kb_name)
-            total_saved += save_stats["saved"]
-            total_failed += save_stats["failed"]
+            # 提取文章
+            stats = update_knowledge_base(kb_name, args.dry_run)
+            total_new += stats["new"]
+            total_skipped += stats["skipped"]
+            total_kb_failed += stats["failed"]
 
-        # 知识库之间等待
-        if i < len(kbs):
-            log(f"等待 {WAIT_BETWEEN_KB} 秒后处理下一个知识库...")
-            if not args.dry_run:
-                time.sleep(WAIT_BETWEEN_KB)
+            # 触发保存：有新文章，或该 KB 有历史漏存（之前保存失败/超时未保存）。
+            # 后者让失败文章能在后续运行中自动重试，避免 new=0 时永久漏存。
+            unsaved = count_unsaved_articles(kb_name) if (not args.no_save and not args.dry_run) else 0
+            if (stats["new"] > 0 or unsaved > 0) and not args.no_save and not args.dry_run:
+                if stats["new"] == 0 and unsaved > 0:
+                    log(f"检测到 {kb_name} 有 {unsaved} 篇历史漏存未保存，触发保存重试")
+                save_stats = save_to_obsidian(kb_name)
+                total_saved += save_stats["saved"]
+                total_failed += save_stats["failed"]
 
-    # 总结
-    log(f"\n{'='*60}")
-    log(f"增量更新完成")
-    log(f"{'='*60}")
-    log(f"总计新增: {total_new} 篇")
-    log(f"总计跳过: {total_skipped} 篇")
-    log(f"保存到 Obsidian: {total_saved} 篇")
-    log(f"保存失败: {total_failed} 篇")
-    log(f"知识库处理失败: {total_kb_failed} 个")
+            # 知识库之间等待
+            if i < len(kbs):
+                log(f"等待 {WAIT_BETWEEN_KB} 秒后处理下一个知识库...")
+                if not args.dry_run:
+                    time.sleep(WAIT_BETWEEN_KB)
 
-    # 退出码：保存失败或 KB 处理失败（如夜间锁屏致导航全跪）时非零退出，让 launchd 暴露静默失败（dry-run 不告警）
-    if (total_failed > 0 or total_kb_failed > 0) and not args.dry_run:
-        log(f"⚠️  存在失败（保存 {total_failed} 篇，KB 处理失败 {total_kb_failed} 个），非零退出以触发告警")
-        sys.exit(1)
+        # 总结
+        log(f"\n{'='*60}")
+        log(f"增量更新完成")
+        log(f"{'='*60}")
+        log(f"总计新增: {total_new} 篇")
+        log(f"总计跳过: {total_skipped} 篇")
+        log(f"保存到 Obsidian: {total_saved} 篇")
+        log(f"保存失败: {total_failed} 篇")
+        log(f"知识库处理失败: {total_kb_failed} 个")
+
+        # 退出码：保存失败或 KB 处理失败（如夜间锁屏致导航全跪）时非零退出，让 launchd 暴露静默失败（dry-run 不告警）
+        if (total_failed > 0 or total_kb_failed > 0) and not args.dry_run:
+            log(f"⚠️  存在失败（保存 {total_failed} 篇，KB 处理失败 {total_kb_failed} 个），非零退出以触发告警")
+            sys.exit(1)
+    finally:
+        if caffeinate_proc:
+            caffeinate_proc.terminate()
 
 
 if __name__ == "__main__":

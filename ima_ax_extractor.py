@@ -358,6 +358,15 @@ def cmd_w_close(article_url: Optional[str] = None, max_retries: int = 2) -> bool
     重试，避免标签堆积。
     """
     def send_cmd_w():
+        # extract_url_ax 点击地址栏读取完整 URL 后，地址栏（AXTextField）保留键盘焦点。
+        # System Events keystroke 发到聚焦的 AXTextField，被地址栏吞掉而非触发 Chromium
+        # 关标签页快捷键。先发 Escape 让地址栏失焦（焦点回到网页内容区），再发 Cmd+W。
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to tell process "ima.copilot" '
+             'to keystroke escape'],
+            capture_output=True, timeout=5
+        )
         subprocess.run(
             ["osascript", "-e",
              'tell application "System Events" to tell process "ima.copilot" '

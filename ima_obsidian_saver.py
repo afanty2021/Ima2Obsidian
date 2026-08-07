@@ -501,7 +501,7 @@ end tell
         try:
             result = subprocess.run(
                 ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=10
             )
             if result.returncode == 0:
                 stdout = result.stdout.strip().lower()
@@ -519,24 +519,53 @@ end tell
         except Exception as e:
             print(f"    ⚠️ AppleScript 异常: {e}")
 
-    # 降级方案：快捷键发到特定浏览器进程（而非全局）
+    # 降级方案：快捷键关闭
+    # 优先用 cliclick（CGEventPost，不走 Apple Event）——osascript keystroke 在
+    # launchd 后台被 TCC 拦截（osascript 不在 TCC 库，报 errAEEventNotPermitted /
+    # 退出码 1），cliclick 有 Accessibility 授权可绕过（与 send_keystroke 同理）。
     print(f"    → 尝试快捷键关闭...")
-    try:
-        if browser_app:
+    closed = False
+    if _CLICLICK_PATH:
+        try:
+            result = subprocess.run(
+                [_CLICLICK_PATH, "kd:cmd", "t:w", "ku:cmd"],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                print(f"    ✓ 标签页已关闭（cliclick）")
+                closed = True
+                time.sleep(0.5)
+            else:
+                err = result.stderr.decode("utf-8", errors="replace").strip()
+                print(f"    ⚠️ cliclick 关闭失败 rc={result.returncode}: {err[:200]}")
+        except subprocess.TimeoutExpired:
+            print(f"    ⚠️ cliclick 执行超时")
+        except Exception as e:
+            print(f"    ⚠️ cliclick 异常: {e}")
+    else:
+        print(f"    ⚠️ cliclick 未安装（brew install cliclick），跳过")
+
+    # 最后降级：osascript keystroke（仅交互式终端可用，launchd 下 TCC 拦截）
+    if not closed and browser_app:
+        try:
             r = subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to tell process "{browser_app}" to keystroke "w" using command down'],
                 capture_output=True, timeout=5
             )
-            if r.returncode != 0:
-                raise RuntimeError(f"osascript 退出码 {r.returncode}")
-        else:
-            send_keystroke("w", ["command"])
-        print(f"    ✓ 标签页已关闭（快捷键）")
-        time.sleep(0.5)
-    except Exception as e:
-        print(f"    ❌ 快捷键关闭失败: {e}")
+            if r.returncode == 0:
+                print(f"    ✓ 标签页已关闭（osascript 快捷键）")
+                closed = True
+                time.sleep(0.5)
+            else:
+                err = r.stderr.decode("utf-8", errors="replace").strip()
+                print(f"    ⚠️ osascript 快捷键失败 rc={r.returncode}: {err[:200]}")
+        except subprocess.TimeoutExpired:
+            print(f"    ⚠️ osascript 快捷键超时")
+        except Exception as e:
+            print(f"    ⚠️ osascript 快捷键异常: {e}")
 
+    if not closed:
         if retry_count < max_retries:
             print(f"    → 重试关闭 ({retry_count + 1}/{max_retries})...")
             time.sleep(1)

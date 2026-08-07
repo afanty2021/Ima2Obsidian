@@ -42,6 +42,21 @@ MAX_PAGES = 65
 MAX_CONSECUTIVE_SEEN = 10 # 连续遇到已存在文章后停止
 
 
+def _find_cliclick():
+    """定位 cliclick 二进制绝对路径（与 saver 同逻辑）。
+
+    launchd 启动的进程不继承用户 shell PATH（默认仅 /usr/bin:/bin 等），
+    须用绝对路径。详见 saver send_keystroke docstring。
+    """
+    import shutil
+    for p in ["/opt/homebrew/bin/cliclick", "/usr/local/bin/cliclick"]:
+        if Path(p).exists():
+            return p
+    return shutil.which("cliclick")
+
+_CLICLICK_PATH = _find_cliclick()
+
+
 # ==================== URL 规范化 ====================
 
 def normalize_url(url: str) -> str:
@@ -359,20 +374,32 @@ def cmd_w_close(article_url: Optional[str] = None, max_retries: int = 2) -> bool
     """
     def send_cmd_w():
         # extract_url_ax 点击地址栏读取完整 URL 后，地址栏（AXTextField）保留键盘焦点。
-        # System Events keystroke 发到聚焦的 AXTextField，被地址栏吞掉而非触发 Chromium
-        # 关标签页快捷键。先发 Escape 让地址栏失焦（焦点回到网页内容区），再发 Cmd+W。
-        subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to tell process "ima.copilot" '
-             'to keystroke escape'],
-            capture_output=True, timeout=5
-        )
-        subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to tell process "ima.copilot" '
-             'to keystroke "w" using command down'],
-            capture_output=True, timeout=5
-        )
+        # 先发 Escape 让地址栏失焦（焦点回到网页内容区），再发 Cmd+W。
+        # 用 cliclick（CGEventPost）替代 osascript keystroke——osascript 在 launchd
+        # 后台被 TCC 拦截（与 saver close_tab 同理），cliclick 有 Accessibility 授权。
+        if _CLICLICK_PATH:
+            subprocess.run(
+                [_CLICLICK_PATH, "kp:esc"],
+                capture_output=True, timeout=5
+            )
+            subprocess.run(
+                [_CLICLICK_PATH, "kd:cmd", "t:w", "ku:cmd"],
+                capture_output=True, timeout=5
+            )
+        else:
+            # 降级：osascript keystroke（仅交互式终端可用，launchd 下 TCC 拦截）
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to tell process "ima.copilot" '
+                 'to keystroke escape'],
+                capture_output=True, timeout=5
+            )
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to tell process "ima.copilot" '
+                 'to keystroke "w" using command down'],
+                capture_output=True, timeout=5
+            )
 
     def still_open() -> bool:
         time.sleep(WAIT_AFTER_CLOSE)
@@ -380,7 +407,8 @@ def cmd_w_close(article_url: Optional[str] = None, max_retries: int = 2) -> bool
             return extract_url_ax() == article_url   # 已知 URL：精确比对
         return extract_url_ax() is not None           # 未知 URL：仍有任意文章标签 → 未关
 
-    # 第 1 次：后台 keystroke（不激活，减少对用户的干扰）
+    # 第 1 次：激活 IMA + cliclick（cliclick 是全局按键，须 IMA 在前台）
+    activate_ima()
     send_cmd_w()
     if not still_open():
         return True

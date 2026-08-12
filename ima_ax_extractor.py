@@ -621,7 +621,6 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                     if save_article(url, final_title, kb_name):
                         total_new += 1
                         page_new += 1
-                        consecutive_seen = 0
                         print(f"    ✅ 新文章已保存 (总计: {total_new})")
                     else:
                         # save_article 返回 False：白名单拒绝（非微信）或 DB 异常。
@@ -639,6 +638,12 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             break
 
         print(f"\n  本页完成: 新增 {page_new}, 跳过 {page_skipped}")
+
+        # 本页没有新增或跳过，说明列表没有继续推进（通常是滚动卡住，
+        # 或页面内容已完全由本次运行处理过），避免无意义地跑满 MAX_PAGES。
+        if page_new == 0 and page_skipped == 0:
+            print("  ⚠️  本页无进展，停止继续滚动")
+            break
 
         # 滚动加载更多
         print("  滚动加载更多...")

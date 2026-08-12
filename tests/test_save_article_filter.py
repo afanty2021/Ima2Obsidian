@@ -17,6 +17,20 @@ def test_save_article_rejects_non_wechat_url(seeded_db):
     assert not url_exists(test_url), "非微信 URL 不应进入 DB"
 
 
+def test_url_exists_ignores_non_wechat_legacy_row(seeded_db, temp_db):
+    """历史污染的非微信 URL 不应参与提取器的连续命中计数。"""
+    import sqlite3
+
+    test_url = "https://github.com/legacy-pollution-unique"
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute(
+            "INSERT INTO articles (url, title, knowledge_base, status) VALUES (?, ?, ?, 'success')",
+            (test_url, "历史污染记录", "AI"),
+        )
+
+    assert not url_exists(test_url)
+
+
 def test_save_article_rejects_other_non_content_domains(seeded_db):
     """其他非内容域（如 twitter/youtube）也被拒绝"""
     for url in [

@@ -94,6 +94,71 @@ class TestMainEntryGuardCallsRealMain:
             except SystemExit as e:
                 assert e.code != 1, "已规范 DB 不应 exit 1"
 
+    def test_reclaim_runs_once_for_multiple_knowledge_bases(self, temp_db, tmp_path, monkeypatch):
+        """同一轮增量更新中，多个 KB 只允许首个 saver 执行 reclaim。"""
+        monkeypatch.setattr("ima_incremental_update.LOCK_FILE", tmp_path / "l.lock")
+        monkeypatch.setattr("ima_incremental_update.LOG_FILE", tmp_path / "l.log")
+        monkeypatch.setattr("ima_incremental_update.WAIT_BETWEEN_KB", 0)
+        init_database()
+
+        monkeypatch.setattr(
+            "sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest"],
+        )
+        monkeypatch.setattr("ima_incremental_update.ensure_daemon", lambda: True)
+        monkeypatch.setattr(
+            "ima_incremental_update.update_knowledge_base",
+            lambda _kb, _dry_run: {"new": 1, "skipped": 0, "failed": 0},
+        )
+        monkeypatch.setattr(
+            "ima_incremental_update.subprocess.Popen",
+            lambda *args, **kwargs: type("Caffeinate", (), {"terminate": lambda self: None})(),
+        )
+
+        calls = []
+
+        def fake_save(kb_name, dry_run=False, run_reclaim=True):
+            calls.append((kb_name, run_reclaim))
+            return {"saved": 0, "failed": 0}
+
+        monkeypatch.setattr("ima_incremental_update.save_to_obsidian", fake_save)
+        main()
+
+        assert calls == [("AI", True), ("Invest", False)]
+
+    def test_save_to_obsidian_passes_skip_reclaim(self, temp_db, tmp_path, monkeypatch):
+        """关闭 reclaim 时，saver 子进程必须收到 --skip-reclaim。"""
+        from ima_incremental_update import save_to_obsidian
+
+        monkeypatch.setattr("ima_incremental_update.ensure_obsidian_ready", lambda: True)
+
+        class FakeStream:
+            def readline(self):
+                return ""
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            stdout = FakeStream()
+            stderr = FakeStream()
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        commands = []
+
+        def fake_popen(cmd, **_kwargs):
+            commands.append(cmd)
+            return FakeProcess()
+
+        monkeypatch.setattr("ima_incremental_update.subprocess.Popen", fake_popen)
+
+        result = save_to_obsidian("AI", run_reclaim=False)
+
+        assert result == {"saved": 0, "failed": 0}
+        assert "--skip-reclaim" in commands[0]
+
 
 def _schema_exists(db_path):
     """确认 articles 表已建"""

@@ -1,6 +1,9 @@
 """#4: reclaim_clippings 必须用 closing 包裹连接，且 rename/UPDATE 失败时回滚"""
 import sqlite3
 import sys
+import io
+import runpy
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -60,6 +63,31 @@ def test_reclaim_closes_connection_in_apply_mode(temp_db, tmp_path, monkeypatch)
     assert len(instances) >= 1, "应当打开过连接"
     for conn in instances:
         assert conn.close_called, "reclaim 未在 --apply 路径关闭连接（fd 泄漏）"
+
+
+def test_reclaim_phase1_exception_emits_one_result_json(temp_db, tmp_path, monkeypatch):
+    """Phase 1 异常由 CLI 兜底一次性输出结果，不应重复输出 JSON。"""
+    vault, clip_dir = _setup_isolated_vault(tmp_path, temp_db)
+    (clip_dir / "测试文章A.md").write_text("正文\n*2026年1月2日 10:00*\n", encoding="utf-8")
+
+    import ima_obsidian_saver
+
+    monkeypatch.setattr(ima_obsidian_saver, "DB_FILE", temp_db)
+    monkeypatch.setattr(ima_obsidian_saver, "VAULT_DIR", vault)
+    monkeypatch.setattr(ima_obsidian_saver, "CLIPPINGS_DIR", clip_dir)
+    import reclaim_clippings
+    monkeypatch.setattr(reclaim_clippings, "DB_FILE", temp_db)
+    monkeypatch.setattr(reclaim_clippings, "VAULT_DIR", vault)
+    monkeypatch.setattr(reclaim_clippings, "CLIPPINGS_DIR", clip_dir)
+    monkeypatch.setattr(Path, "rename", lambda self, _target: (_ for _ in ()).throw(ValueError("phase1")))
+    monkeypatch.setattr(sys, "argv", ["reclaim_clippings.py", "--apply"])
+
+    output = io.StringIO()
+    with redirect_stdout(output), pytest.raises(SystemExit) as exc_info:
+        runpy.run_path("reclaim_clippings.py", run_name="__main__")
+
+    assert exc_info.value.code == 1
+    assert output.getvalue().count("RECLAIM_RESULT: ") == 1
 
 
 def test_reclaim_closes_connection_when_update_raises(temp_db, tmp_path, monkeypatch):

@@ -6,6 +6,8 @@ IMA 公共模块 — 共享函数和工具
 """
 
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 from contextlib import closing
@@ -17,6 +19,19 @@ from pathlib import Path
 CUA_DRIVER = "/Users/berton/.local/bin/cua-driver"
 IMA_APP_NAME = "ima.copilot"
 DB_FILE = Path(__file__).parent / "ima_articles.db"
+
+
+def find_cliclick():
+    """定位可执行的 cliclick，兼容 launchd 缺少 Homebrew PATH 的环境。"""
+    candidates = [
+        "/opt/homebrew/bin/cliclick",   # Apple Silicon Homebrew
+        "/usr/local/bin/cliclick",      # Intel Homebrew
+        "/usr/bin/cliclick",             # 系统级（罕见）
+    ]
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("cliclick")
 
 
 def now_saved_at() -> str:

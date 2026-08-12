@@ -249,6 +249,7 @@ def main():
         moved, marked = 0, 0
         rollback_failures = []  # 回滚 rename 失败的 (src, dst, err)，供 dead-letter 汇总
         renamed_pairs = []  # [(src_path, dst_path), ...] 已成功的 rename，供全量回滚
+        phase1_aborted = False
         if args.apply:
             # Phase 1: rename + UPDATE 循环
             # BaseException 在此期间触发 → commit 还没尝试 → 安全回滚
@@ -287,31 +288,25 @@ def main():
                 moved = 0
                 marked = 0
                 aborted_reason = "Phase 1 中断: {}: {}".format(type(e).__name__, e)
-                # raise 前先打印 JSON，让 saver subprocess 检测到 aborted
-                _exc_result = {
-                    "matched": len(matched), "moved": 0, "marked": 0,
-                    "no_match": len(no_match), "no_folder": len(no_folder),
-                    "conflict": len(conflict),
-                    "batch_corrupt_skipped": len(batch_corrupt_skipped),
-                    "rollback_failures": [(str(d), str(s), str(e2)) for d, s, e2 in rollback_failures],
-                    "aborted": aborted_reason,
-                }
-                print("RECLAIM_RESULT: " + json.dumps(_exc_result, ensure_ascii=False))
-                raise
+                # 交给 __main__ 统一输出错误 JSON，避免异常路径重复输出。
+                phase1_aborted = True
+                if not isinstance(e, Exception):
+                    raise
 
             # Phase 2: commit（独立 try，BaseException 不在此回滚文件）
             # sqlite3.Error 时 SQLite 已自动 rollback UPDATE，对应 (b)
             # 成功后 CPython 在 committed=True 之前的字节码窗口若被 BaseException
             # 中断，文件留在 KB + DB 标 saved（一致状态），不再回滚——对应 (d)
-            try:
-                conn.commit()
-            except sqlite3.Error as e:
-                print(f"  ❌ commit 失败：{e}，开始全量回滚 {len(renamed_pairs)} 个文件到 Clippings")
-                for src, dst in renamed_pairs:
-                    rollback_failures.extend(_safe_rename_back(dst, src))
-                moved = 0
-                marked = 0
-                aborted_reason = "commit 失败: {}".format(e)
+            if not phase1_aborted:
+                try:
+                    conn.commit()
+                except sqlite3.Error as e:
+                    print(f"  ❌ commit 失败：{e}，开始全量回滚 {len(renamed_pairs)} 个文件到 Clippings")
+                    for src, dst in renamed_pairs:
+                        rollback_failures.extend(_safe_rename_back(dst, src))
+                    moved = 0
+                    marked = 0
+                    aborted_reason = "commit 失败: {}".format(e)
             # 注意：commit 成功后若发生 BaseException，让其在汇总前正常传播，
             # 文件保留在 KB（与已提交的 DB 一致），避免永久孤儿
 
@@ -343,11 +338,12 @@ def main():
         "aborted": aborted_reason,
     }
     print("RECLAIM_RESULT: " + json.dumps(_result, ensure_ascii=False))
+    return 1 if aborted_reason else 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except Exception as _e:
         # 兜底：sqlite3.connect/SELECT 等在 Phase 1 try 之前的异常（review PR#11 #1）
         # 确保 saver subprocess 总能解析到 RECLAIM_RESULT（含 aborted 原因）

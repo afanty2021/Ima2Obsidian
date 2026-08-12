@@ -51,7 +51,7 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import requests
 
-from ima_common import DB_FILE, init_database, now_saved_at, ensure_appnap_disabled
+from ima_common import DB_FILE, init_database, now_saved_at, ensure_appnap_disabled, find_cliclick
 
 
 # ==================== 配置 ====================
@@ -374,41 +374,9 @@ _CLICLICK_MOD_MAP = {
 }
 
 
-def _find_cliclick() -> Optional[str]:
-    """定位 cliclick 二进制绝对路径。
-
-    launchd 启动的 Python 进程不继承用户 shell 的 PATH——默认 PATH 仅
-    /usr/bin:/bin:/usr/sbin:/sbin，不含 Homebrew 路径（/opt/homebrew/bin
-    或 /usr/local/bin）。`subprocess.run(["cliclick", ...])` 在 launchd 下
-    会触发 FileNotFoundError（交互式终端正常，掩盖了该假设错误）。
-
-    显式检测常见安装路径 + shutil.which fallback（兼容非标准位置）。
-
-    ⚠️ 找到路径仅解决 launchd PATH 问题（避免 FileNotFoundError）；CGEventPost
-    仍需 cliclick 单独添加到「系统设置 → 隐私与安全性 → 辅助功能」（launchd 启动
-    的 cliclick 不继承用户 GUI session 的 Accessibility）。详见 send_keystroke
-    docstring 与 SAVER.md「Web Clipper 自动化依赖」章节。
-
-    Returns:
-        cliclick 绝对路径；未找到返回 None（调用方降级提示安装）。
-    """
-    import shutil
-    # 常见 Homebrew 安装路径（Apple Silicon + Intel）+ 系统路径
-    candidates = [
-        "/opt/homebrew/bin/cliclick",   # Apple Silicon Homebrew
-        "/usr/local/bin/cliclick",       # Intel Homebrew
-        "/usr/bin/cliclick",             # 系统级（罕见）
-    ]
-    for path in candidates:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    # PATH fallback（交互式跑 / 非标准安装位置）
-    return shutil.which("cliclick")
-
-
 # 模块级缓存：import 时检测一次，避免每次 send_keystroke 重复 stat。
 # launchd 下若未找到，send_keystroke 走提前 return 降级路径。
-_CLICLICK_PATH: Optional[str] = _find_cliclick()
+_CLICLICK_PATH: Optional[str] = find_cliclick()
 
 
 def send_keystroke(key: str, modifiers: list = None):
@@ -426,7 +394,7 @@ def send_keystroke(key: str, modifiers: list = None):
        用户 GUI session 的 Accessibility（与 iTerm 启动不同），事件会被 TCC 默默 drop
        （rc=0 但事件无效，Web Clipper 不响应）。**必须在系统设置 → 隐私与安全性 →
        辅助功能里手动添加 `/opt/homebrew/bin/cliclick`**（或 cliclick 实际安装路径，
-       见 `_find_cliclick` 候选列表）。详见 SAVER.md「Web Clipper 自动化依赖」章节。
+       见 `ima_common.find_cliclick` 候选列表）。详见 SAVER.md「Web Clipper 自动化依赖」章节。
 
     已实证（2026-07-28 launchctl start 跑）：
     - 修复前：0 成功 / 18 失败（cliclick 未在辅助功能里）
@@ -440,7 +408,7 @@ def send_keystroke(key: str, modifiers: list = None):
     已实测（systematic-debugging Phase 3）：cliclick kd:alt,shift t:o ku:alt,shift
     能触发 Web Clipper，文件自动落盘 Clippings（无需用户确认对话框）。
 
-    路径解析（launchd 兼容）：cliclick 二进制路径在 import 时由 _find_cliclick()
+    路径解析（launchd 兼容）：cliclick 二进制路径在 import 时由 ima_common.find_cliclick()
     检测并缓存到 _CLICLICK_PATH。launchd 启动的进程不继承用户 shell 的 PATH
     （默认仅 /usr/bin:/bin:/usr/sbin:/sbin），故不能依赖 PATH 查找——必须用绝对
     路径调用。未找到时打印诊断并提前 return（不抛异常）。
@@ -1191,6 +1159,8 @@ def main():
                         help="Obsidian 目标文件夹名称（如 AI），文件将保存到该文件夹")
     parser.add_argument("--kb", default=None,
                         help="只保存指定知识库的文章（避免不同 KB 混入同一文件夹）")
+    parser.add_argument("--skip-reclaim", action="store_true",
+                        help="跳过启动时 reclaim（由增量更新流程用于避免重复扫描）")
     args = parser.parse_args()
 
     browser_config = BROWSERS[args.browser]
@@ -1217,44 +1187,44 @@ def main():
 
     init_database()
 
-    # reclaim 兜底：subprocess 调 reclaim_clippings.py 认领滞留文件
-    # （review v4 #1 方案 A：subprocess 避免 saver↔reclaim_clippings 循环引用）
-    # review v4 #2 dry-run 门控
-    _reclaim_cmd = [sys.executable, str(Path(__file__).parent / "reclaim_clippings.py")]
-    if not args.dry_run:
-        _reclaim_cmd.append("--apply")
-    try:
-        _proc = subprocess.run(_reclaim_cmd, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        _proc = None
-        print("⚠️ reclaim 超时（120s），跳过本次认领")
-    except OSError as _e:  # review plan #4：reclaim_clippings.py 缺失等
-        _proc = None
-        print("⚠️ reclaim 启动失败（{}），跳过本次认领".format(_e))
-    if _proc:
-        if _proc.returncode != 0:
-            print("⚠️ reclaim 异常退出（code={}），检查以下输出".format(_proc.returncode))
-        if _proc.stdout:
-            print(_proc.stdout, end="")
-        if _proc.stderr:
-            print(_proc.stderr, end="", file=sys.stderr)
-        # 解析 RECLAIM_RESULT JSON 行
-        _reclaim_stats = {}
-        for _line in (_proc.stdout or "").splitlines():
-            if _line.startswith("RECLAIM_RESULT: "):
-                try:
-                    _reclaim_stats = json.loads(_line[len("RECLAIM_RESULT: "):])
-                except json.JSONDecodeError:
-                    pass
-                break
-        # review PR#11 #1+#6：删掉 saver 侧"认领 N 个"摘要打印——
-        # reclaim stdout 已含"匹配并移动: N"汇总，saver 再打印造成 matched/moved 矛盾 + 重复
-        if _reclaim_stats.get("batch_corrupt_skipped"):
-            print("跳过 {} 个批量错乱副本".format(_reclaim_stats["batch_corrupt_skipped"]))
-        for _item in _reclaim_stats.get("rollback_failures") or []:
-            print("⚠️ reclaim 回滚失败（文件位置不可知）：{}".format(_item))
-        if _reclaim_stats.get("aborted"):
-            print("⚠️ reclaim 中止：{}（剩余滞留下次再认领）".format(_reclaim_stats["aborted"]))
+    if not args.skip_reclaim:
+        # reclaim 兜底：subprocess 调 reclaim_clippings.py 认领滞留文件
+        # （review v4 #1 方案 A：subprocess 避免 saver↔reclaim_clippings 循环引用）
+        # review v4 #2 dry-run 门控
+        _reclaim_cmd = [sys.executable, str(Path(__file__).parent / "reclaim_clippings.py")]
+        if not args.dry_run:
+            _reclaim_cmd.append("--apply")
+        try:
+            _proc = subprocess.run(_reclaim_cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            _proc = None
+            print("⚠️ reclaim 超时（120s），跳过本次认领")
+        except OSError as _e:  # review plan #4：reclaim_clippings.py 缺失等
+            _proc = None
+            print("⚠️ reclaim 启动失败（{}），跳过本次认领".format(_e))
+        if _proc:
+            if _proc.returncode != 0:
+                print("⚠️ reclaim 异常退出（code={}），检查以下输出".format(_proc.returncode))
+            if _proc.stdout:
+                print(_proc.stdout, end="")
+            if _proc.stderr:
+                print(_proc.stderr, end="", file=sys.stderr)
+            # 解析 RECLAIM_RESULT JSON 行
+            _reclaim_stats = {}
+            for _line in (_proc.stdout or "").splitlines():
+                if _line.startswith("RECLAIM_RESULT: "):
+                    try:
+                        _reclaim_stats = json.loads(_line[len("RECLAIM_RESULT: "):])
+                    except json.JSONDecodeError:
+                        pass
+                    break
+            # reclaim stdout 已含汇总，saver 只补充需要关注的异常信息。
+            if _reclaim_stats.get("batch_corrupt_skipped"):
+                print("跳过 {} 个批量错乱副本".format(_reclaim_stats["batch_corrupt_skipped"]))
+            for _item in _reclaim_stats.get("rollback_failures") or []:
+                print("⚠️ reclaim 回滚失败（文件位置不可知）：{}".format(_item))
+            if _reclaim_stats.get("aborted"):
+                print("⚠️ reclaim 中止：{}（剩余滞留下次再认领）".format(_reclaim_stats["aborted"]))
 
     stats = get_stats(args.kb)
 

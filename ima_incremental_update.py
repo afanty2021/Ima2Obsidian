@@ -631,7 +631,11 @@ def ensure_obsidian_ready() -> bool:
     return launch_obsidian()
 
 
-def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
+def save_to_obsidian(
+    kb_name: str = None,
+    dry_run: bool = False,
+    run_reclaim: bool = True,
+) -> dict:
     """
     调用 Obsidian 保存器（行级实时透传 saver 输出，避免长时间无输出被误判"卡死"）
 
@@ -660,6 +664,8 @@ def save_to_obsidian(kb_name: str = None, dry_run: bool = False) -> dict:
 
     if dry_run:
         cmd.append("--dry-run")
+    if not run_reclaim:
+        cmd.append("--skip-reclaim")
 
     try:
         proc = subprocess.Popen(
@@ -954,6 +960,7 @@ def main():
         total_saved = 0
         total_failed = 0       # 保存失败（saver）
         total_kb_failed = 0    # 知识库处理失败（导航/窗口/提取）
+        reclaim_done = False   # 同一轮增量更新只执行一次全量 reclaim
 
         # 逐个处理知识库
         for i, kb_name in enumerate(kbs, 1):
@@ -971,7 +978,8 @@ def main():
             if (stats["new"] > 0 or unsaved > 0) and not args.no_save and not args.dry_run:
                 if stats["new"] == 0 and unsaved > 0:
                     log(f"检测到 {kb_name} 有 {unsaved} 篇历史漏存未保存，触发保存重试")
-                save_stats = save_to_obsidian(kb_name)
+                save_stats = save_to_obsidian(kb_name, run_reclaim=not reclaim_done)
+                reclaim_done = True
                 total_saved += save_stats["saved"]
                 total_failed += save_stats["failed"]
 

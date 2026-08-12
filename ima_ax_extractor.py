@@ -21,14 +21,13 @@ from contextlib import closing
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 # 导入公共模块
 from ima_common import (
     DB_FILE, CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running, init_database,
-    get_ima_main_window, get_kb_window_title,
+    get_ima_main_window, get_kb_window_title, find_cliclick,
 )
 
 # ==================== 配置 ====================
@@ -42,19 +41,7 @@ MAX_PAGES = 65
 MAX_CONSECUTIVE_SEEN = 2 # 连续遇到已存在文章后停止
 
 
-def _find_cliclick():
-    """定位 cliclick 二进制绝对路径（与 saver 同逻辑）。
-
-    launchd 启动的进程不继承用户 shell PATH（默认仅 /usr/bin:/bin 等），
-    须用绝对路径。详见 saver send_keystroke docstring。
-    """
-    import shutil
-    for p in ["/opt/homebrew/bin/cliclick", "/usr/local/bin/cliclick"]:
-        if Path(p).exists():
-            return p
-    return shutil.which("cliclick")
-
-_CLICLICK_PATH = _find_cliclick()
+_CLICLICK_PATH = find_cliclick()
 
 
 # ==================== URL 规范化 ====================
@@ -151,7 +138,13 @@ def normalize_url(url: str) -> str:
 
 # ==================== 数据库 ====================
 
+def _is_wechat_url(url: str) -> bool:
+    """判断 URL 是否为允许写入/参与去重的微信公众号文章地址。"""
+    return urlparse(url).hostname == "mp.weixin.qq.com"
+
 def url_exists(url: str) -> bool:
+    if not _is_wechat_url(url):
+        return False
     # 使用规范化后的 URL 进行去重检查
     normalized_url = normalize_url(url)
     with closing(sqlite3.connect(DB_FILE)) as conn:
@@ -165,7 +158,7 @@ def save_article(url: str, title: str, kb: str) -> bool:
     # 排除 IMA 界面公告等非文章卡片被误识别（如"copilot 功能上线"→ github.com）。
     # 用 hostname 精确匹配而非子串（review PR#12 #5：子串可被
     # /path?redirect=mp.weixin.qq.com 绕过）。若未来知识库含其他平台文章，扩展此检查。
-    if urlparse(url).hostname != "mp.weixin.qq.com":
+    if not _is_wechat_url(url):
         print("  ⚠️  跳过非微信 URL（疑似非文章卡片）：{}".format(url[:60]))
         return False
     try:

@@ -562,6 +562,86 @@ VERIFY_KEYWORDS = ("当前环境异常", "验证后才能正常访问", "环境�
 VERIFY_CLICK_RETRIES = 4
 
 
+def ensure_chrome_js_enabled(browser_app: str = "Google Chrome") -> bool:
+    """确保 Chrome「允许 Apple 事件中的 JavaScript」已开启。
+
+    Chrome 更新后会重置此设置，导致 execute_chrome_js 全部失败（saver 0 落盘）。
+    检测到关闭时通过 cua-driver 自动开启（菜单项 AX 点击不生效，须 patch 偏好，
+    开启过程会退出并重启 Chrome）。非 Chrome 浏览器直接放行。
+
+    Returns True if JS execution ready（或非 Chrome），False if enabling failed。
+    """
+    if browser_app != "Google Chrome":
+        return True
+
+    # 确保 Chrome 至少有一个窗口（无窗口时 osascript 报 window 错而非 JS 错，无法判断）
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "{browser_app}" to if (count windows) = 0 then make new window'],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+    # 测试 JS 是否可执行
+    test_script = f'tell application "{browser_app}" to execute active tab of front window javascript "1"'
+    try:
+        r = subprocess.run(["osascript", "-e", test_script],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return True  # 已开启
+    except Exception:
+        pass
+
+    # JS 执行失败 → 通过 cua-driver 自动开启
+    print("⚠️  Chrome「允许 Apple 事件中的 JavaScript」未开启，正在自动开启...")
+    cua_driver = Path.home() / ".local" / "bin" / "cua-driver"
+    if not cua_driver.exists():
+        print("❌ 未找到 cua-driver，无法自动开启。")
+        print("   请手动开启：Chrome 菜单栏 → 查看 → 开发者 → 允许 Apple 事件中的 JavaScript")
+        return False
+
+    try:
+        r = subprocess.run(
+            [str(cua_driver), "call", "page",
+             json.dumps({"action": "enable_javascript_apple_events",
+                         "bundle_id": "com.google.Chrome",
+                         "user_has_confirmed_enabling": True})],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            print(f"❌ cua-driver 开启失败: {(r.stderr or r.stdout).strip()}")
+            return False
+    except subprocess.TimeoutExpired:
+        print("❌ cua-driver 开启超时")
+        return False
+    except Exception as e:
+        print(f"❌ cua-driver 开启异常: {e}")
+        return False
+
+    print("✅ Chrome JavaScript 已开启（Chrome 正在重启）")
+
+    # 等待 Chrome 重启，重新创建窗口并验证
+    time.sleep(5)
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'tell application "{browser_app}" to make new window'],
+            capture_output=True, text=True, timeout=5,
+        )
+        time.sleep(2)
+        r = subprocess.run(["osascript", "-e", test_script],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            print("✅ 验证通过：Chrome JS 执行正常")
+            return True
+        print(f"⚠️  开启后验证仍失败: {(r.stderr or r.stdout).strip()}")
+        return False
+    except Exception as e:
+        print(f"⚠️  开启后验证异常: {e}")
+        return False
+
+
 def execute_chrome_js(js: str, browser_app: str = "Google Chrome") -> Optional[str]:
     """通过 AppleScript 在 Chrome 当前标签页执行 JS，返回求值结果字符串。
 
@@ -1184,6 +1264,14 @@ def main():
 
     # review PR#11 #3：saver 独立运行时也确保 AppNap 禁用（不依赖 incremental_update 预调）
     ensure_appnap_disabled()
+
+    # Chrome「允许 Apple 事件中的 JavaScript」检查：Chrome 更新后会重置此设置，
+    # 导致 execute_chrome_js 全部失败（saver 0 落盘）。检测到关闭时自动通过
+    # cua-driver 开启。非交互模式下尤其关键（无法人工干预）。
+    if not args.dry_run:
+        if not ensure_chrome_js_enabled(browser_app):
+            print("❌ Chrome JS 执行不可用，保存将全部失败，终止。", file=sys.stderr)
+            sys.exit(1)
 
     init_database()
 

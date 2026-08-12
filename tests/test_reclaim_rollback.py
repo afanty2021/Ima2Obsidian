@@ -291,7 +291,7 @@ def test_reclaim_dead_letter_when_rollback_fails(temp_db, tmp_path, monkeypatch,
         f"汇总必须列 dead-letter，实际: {captured!r}"
 
 
-def test_reclaim_keyboard_interrupt_rolls_back_all(temp_db, tmp_path, monkeypatch):
+def test_reclaim_keyboard_interrupt_rolls_back_all(temp_db, tmp_path, monkeypatch, capsys):
     """KeyboardInterrupt（Ctrl+C）穿透循环时，已 rename 的文件必须全量回滚
 
     回归 #4：旧实现只 catch OSError(rename) 和 sqlite3.Error(UPDATE)，
@@ -352,6 +352,7 @@ def test_reclaim_keyboard_interrupt_rolls_back_all(temp_db, tmp_path, monkeypatc
     conn.close()
     assert saved_a == 0, "KeyboardInterrupt 时 file_a 对应 DB 行必须未标记（事务半）"
     assert saved_b == 0, "file_b 对应 DB 行必须未标记"
+    assert capsys.readouterr().out.count("RECLAIM_RESULT: ") == 1
 
 
 def test_reclaim_ctrl_c_during_commit_does_not_orphan(temp_db, tmp_path, monkeypatch):

@@ -118,7 +118,7 @@ class TestMainEntryGuardCallsRealMain:
 
         def fake_save(kb_name, dry_run=False, run_reclaim=True):
             calls.append((kb_name, run_reclaim))
-            return {"saved": 0, "failed": 0}
+            return {"saved": 0, "failed": 0, "started": True}
 
         monkeypatch.setattr("ima_incremental_update.save_to_obsidian", fake_save)
         main()
@@ -156,8 +156,41 @@ class TestMainEntryGuardCallsRealMain:
 
         result = save_to_obsidian("AI", run_reclaim=False)
 
-        assert result == {"saved": 0, "failed": 0}
+        assert result == {"saved": 0, "failed": 0, "started": True}
         assert "--skip-reclaim" in commands[0]
+
+    def test_failed_saver_does_not_consume_reclaim_for_next_kb(self, temp_db, tmp_path, monkeypatch):
+        """首个 saver 未启动时，后续 KB 仍必须执行 reclaim。"""
+        monkeypatch.setattr("ima_incremental_update.LOCK_FILE", tmp_path / "l.lock")
+        monkeypatch.setattr("ima_incremental_update.LOG_FILE", tmp_path / "l.log")
+        monkeypatch.setattr("ima_incremental_update.WAIT_BETWEEN_KB", 0)
+        init_database()
+        monkeypatch.setattr(
+            "sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest"],
+        )
+        monkeypatch.setattr("ima_incremental_update.ensure_daemon", lambda: True)
+        monkeypatch.setattr(
+            "ima_incremental_update.update_knowledge_base",
+            lambda _kb, _dry_run: {"new": 1, "skipped": 0, "failed": 0},
+        )
+        monkeypatch.setattr(
+            "ima_incremental_update.subprocess.Popen",
+            lambda *args, **kwargs: type("Caffeinate", (), {"terminate": lambda self: None})(),
+        )
+
+        calls = []
+
+        def fake_save(kb_name, dry_run=False, run_reclaim=True):
+            calls.append((kb_name, run_reclaim))
+            return {"saved": 0, "failed": 1, "started": False} if kb_name == "AI" \
+                else {"saved": 0, "failed": 0, "started": True}
+
+        monkeypatch.setattr("ima_incremental_update.save_to_obsidian", fake_save)
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1
+        assert calls == [("AI", True), ("Invest", True)]
 
 
 def _schema_exists(db_path):

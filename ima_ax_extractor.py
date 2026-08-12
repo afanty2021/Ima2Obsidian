@@ -544,6 +544,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
 
         page_new = 0
         page_skipped = 0
+        page_failed = 0
 
         should_stop = False
 
@@ -570,6 +571,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             print(f"    点击文章 (element {elem_idx})...")
             if not click_element(pid, window_id, elem_idx):
                 print("    ❌ 点击失败，刷新状态重试...")
+                page_failed += 1
                 # 点击失败时才重新获取状态并重新解析
                 state = get_window_state(pid, window_id)
                 if state and state.get("element_count", 0) > 100:
@@ -588,6 +590,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                 if not url:
                     print("    ⚠️  未提取到 URL")
                     total_failed += 1
+                    page_failed += 1
                     consecutive_seen = 0  # 失败时重置计数器
                     continue  # finally 负责关闭标签页
 
@@ -632,9 +635,10 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
 
         print(f"\n  本页完成: 新增 {page_new}, 跳过 {page_skipped}")
 
-        # 本页没有新增或跳过，说明列表没有继续推进（通常是滚动卡住，
-        # 或页面内容已完全由本次运行处理过），避免无意义地跑满 MAX_PAGES。
-        if page_new == 0 and page_skipped == 0:
+        # 本页没有新增、跳过或失败，说明列表没有继续推进（通常是滚动卡住，
+        # 或页面内容已完全由本次运行处理过）。有失败时继续尝试，避免 AX 临时
+        # 故障导致整页 URL 提取失败后被误判为列表已卡住。
+        if page_new == 0 and page_skipped == 0 and page_failed == 0:
             print("  ⚠️  本页无进展，停止继续滚动")
             break
 

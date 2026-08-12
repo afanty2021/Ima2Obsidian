@@ -288,9 +288,22 @@ def main():
                 moved = 0
                 marked = 0
                 aborted_reason = "Phase 1 中断: {}: {}".format(type(e).__name__, e)
-                # 交给 __main__ 统一输出错误 JSON，避免异常路径重复输出。
                 phase1_aborted = True
                 if not isinstance(e, Exception):
+                    # __main__ 的 except Exception 捕获不到 KeyboardInterrupt/SystemExit，
+                    # 因此在重新抛出前输出唯一一份结果 JSON。
+                    _exc_result = {
+                        "matched": len(matched), "moved": 0, "marked": 0,
+                        "no_match": len(no_match), "no_folder": len(no_folder),
+                        "conflict": len(conflict),
+                        "batch_corrupt_skipped": len(batch_corrupt_skipped),
+                        "rollback_failures": [
+                            (str(d), str(s), str(e2))
+                            for d, s, e2 in rollback_failures
+                        ],
+                        "aborted": aborted_reason,
+                    }
+                    print("RECLAIM_RESULT: " + json.dumps(_exc_result, ensure_ascii=False))
                     raise
 
             # Phase 2: commit（独立 try，BaseException 不在此回滚文件）

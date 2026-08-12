@@ -649,7 +649,7 @@ def save_to_obsidian(
     if not dry_run:
         if not ensure_obsidian_ready():
             log("❌ Obsidian 无法启动，跳过本次保存")
-            return {"saved": 0, "failed": 1}
+            return {"saved": 0, "failed": 1, "started": False}
 
     cmd = [
         "python3",
@@ -678,7 +678,7 @@ def save_to_obsidian(
         )
     except Exception as e:
         log(f"❌ 启动 Obsidian 保存器失败: {e}")
-        return {"saved": 0, "failed": 1}
+        return {"saved": 0, "failed": 1, "started": False}
 
     # 行级实时透传 saver stdout → 日志：替代 capture_output=True 的全量缓冲，
     # 让每篇文章的提取日期/触发 clipper/落盘轮询进度立即可见，
@@ -714,7 +714,7 @@ def save_to_obsidian(
         stdout_t.join(timeout=3)
         stderr_t.join(timeout=3)
         log(f"❌ Obsidian 保存超时（1800s），已终止 saver")
-        return {"saved": 0, "failed": 1}
+        return {"saved": 0, "failed": 1, "started": True}
 
     stdout_t.join(timeout=5)
     stderr_t.join(timeout=5)
@@ -739,7 +739,7 @@ def save_to_obsidian(
             log(f"错误: {chr(10).join(stderr_lines)}")
     else:
         log(f"✅ 保存完成: {saved_count} 篇")
-    return {"saved": saved_count, "failed": failed_count}
+    return {"saved": saved_count, "failed": failed_count, "started": True}
 
 
 def count_unsaved_articles(kb_name: str) -> int:
@@ -979,7 +979,8 @@ def main():
                 if stats["new"] == 0 and unsaved > 0:
                     log(f"检测到 {kb_name} 有 {unsaved} 篇历史漏存未保存，触发保存重试")
                 save_stats = save_to_obsidian(kb_name, run_reclaim=not reclaim_done)
-                reclaim_done = True
+                if save_stats.get("started", False):
+                    reclaim_done = True
                 total_saved += save_stats["saved"]
                 total_failed += save_stats["failed"]
 

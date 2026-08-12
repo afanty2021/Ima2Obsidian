@@ -123,6 +123,52 @@ def test_stalled_page_stops_after_overlapping_titles(temp_db, monkeypatch):
     assert len(parsed_pages) == 2
 
 
+def test_url_failure_does_not_trigger_stalled_page_stop(temp_db, monkeypatch):
+    """整页 URL 提取失败时，应继续尝试后续页面而不是误判为卡住。"""
+    init_database()
+    pages = [
+        [{"element_index": 1, "title": "临时失败文章"}],
+        [{"element_index": 2, "title": "后续正常文章"}],
+    ]
+    urls = iter([None, "https://mp.weixin.qq.com/s/retry-after-failure"])
+
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 2)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_AFTER_CLOSE", 0)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_SCROLL", 0)
+    monkeypatch.setattr(
+        ima_ax_extractor,
+        "get_window_state",
+        lambda _pid, _window_id: {"element_count": 100},
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor,
+        "parse_articles_from_tree",
+        lambda _state, _kb_name: pages.pop(0),
+    )
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
+    monkeypatch.setattr(
+        ima_ax_extractor,
+        "click_element",
+        lambda _pid, _window_id, _element_index: True,
+    )
+    monkeypatch.setattr(ima_ax_extractor, "extract_url_ax", lambda *_args: next(urls))
+    monkeypatch.setattr(ima_ax_extractor, "extract_title_ax", lambda: None)
+    monkeypatch.setattr(ima_ax_extractor, "cmd_w_close", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        ima_ax_extractor,
+        "scroll_down",
+        lambda _pid, _window_id, _amount: None,
+    )
+    monkeypatch.setattr(ima_ax_extractor.time, "sleep", lambda _seconds: None)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    with sqlite3.connect(temp_db) as conn:
+        saved_urls = {row[0] for row in conn.execute("SELECT url FROM articles")}
+    assert "https://mp.weixin.qq.com/s/retry-after-failure" in saved_urls
+
+
 def test_existing_urls_still_trigger_consecutive_stop(temp_db, monkeypatch):
     """连续命中数据库的文章仍应触发提前停止。"""
     init_database()

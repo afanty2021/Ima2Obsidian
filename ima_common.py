@@ -22,7 +22,13 @@ DB_FILE = Path(__file__).parent / "ima_articles.db"
 
 
 def find_cliclick():
-    """定位可执行的 cliclick，兼容 launchd 缺少 Homebrew PATH 的环境。"""
+    """定位可执行的 cliclick，兼容 launchd 缺少 Homebrew PATH 的环境。
+
+    找到路径只解决进程无法通过 PATH 启动的问题；cliclick 通过
+    CoreGraphics 发送按键，仍须在 macOS「系统设置 → 隐私与安全性 →
+    辅助功能」中单独授权实际返回的 cliclick 路径。尤其是 launchd 启动时，
+    cliclick 不会继承交互式终端或 Python 的辅助功能授权。
+    """
     candidates = [
         "/opt/homebrew/bin/cliclick",   # Apple Silicon Homebrew
         "/usr/local/bin/cliclick",      # Intel Homebrew

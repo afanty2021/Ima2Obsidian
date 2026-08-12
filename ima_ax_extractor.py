@@ -558,13 +558,9 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             elem_idx = article["element_index"]
             title = article["title"]
 
-            # 去重：本次运行内已处理过的标题直接跳过
+            # 去重：本次运行内已处理过的标题直接跳过。
+            # 标题重复只代表列表分页重叠，不参与数据库命中计数。
             if title in processed_titles:
-                consecutive_seen += 1
-                if consecutive_seen >= MAX_CONSECUTIVE_SEEN:
-                    print(f"\n  ⚠️  连续 {consecutive_seen} 篇已处理，可能已全部提取")
-                    should_stop = True
-                    break
                 continue
             processed_titles.add(title)
 
@@ -616,6 +612,8 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                         should_stop = True
                         break  # finally 负责关闭标签页
                 else:
+                    # 只有确认 URL 不在数据库中时，才打断连续命中计数。
+                    consecutive_seen = 0
                     title_extracted = extract_title_ax()
                     final_title = title_extracted or title
                     print(f"    ✅ 标题: {final_title[:60]}...")

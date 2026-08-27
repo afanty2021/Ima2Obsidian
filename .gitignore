@@ -31,10 +31,13 @@ Thumbs.db
 
 # Logs
 *.log
-incremental_update*.log
+incremental_update*.log*
 
 # Runtime lock files
 incremental_update.lock
+
+# Environment drift snapshot (runtime state)
+environment_snapshot.json
 
 # Claude Code memory
 MEMORY/

@@ -197,8 +197,12 @@ class TestHrefMatchesUrl:
         2026-08-27 用 osascript 在本机 Chrome 打开生产库真实短链观测：
         `complete|https://mp.weixin.qq.com/s/-36m-d7VURKgoEusIwvggQ`（无 HTTP 重定向；
         页面 og:url 即短链，history.replaceState 仅回放 location.href）。据此
-        弱前缀匹配可即时命中；若有朝一日本用例失败，说明微信开始改写地址——
-        届时需引入重定向预解析（reviews 曾误判此处存在永久失配）。
+        弱前缀匹配可即时命中（reviews 曾误判此处存在永久失配）。
+
+        注意：本用例是匹配器契约锚点（纯函数、不触网），只能防弱前缀分支被
+        改坏或跨形态误判；它检测不到微信侧改地址——若那发生，本测试仍绿，
+        生产会退化为每篇睡满 WAIT_PAGE_LOAD_MAX + 切页告警，需靠日志发现，
+        届时引入重定向预解析。真正的微信行为哨兵需网络标记测试，另行建设。
         """
         url = "https://mp.weixin.qq.com/s/-36m-d7VURKgoEusIwvggQ"
         assert saver._href_matches_url(url, url) is True            # 落点即短链

@@ -554,9 +554,10 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
 
             # 去重：本次运行内已处理过的标题直接跳过。
             # 标题重复只代表列表分页重叠，不参与数据库命中计数。
+            # 注意：仅在 URL 成功提取后才标记已处理（见下方 add），
+            # 点击/URL 失败的标题允许在后续页面重试。
             if title in processed_titles:
                 continue
-            processed_titles.add(title)
 
             print(f"\n  [{i}] {title[:60]}... (element {elem_idx})")
 
@@ -596,6 +597,9 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
 
                 print(f"    ✅ URL: {url[:80]}...")
                 article_url = url
+                # URL 成功提取后才标记已处理——点击/URL 失败的标题
+                # 不在此标记，允许分页重叠时在后续页面重试。
+                processed_titles.add(title)
 
                 if url_exists(url):
                     print("    ℹ️  已存在，跳过")

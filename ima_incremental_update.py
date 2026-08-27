@@ -163,13 +163,17 @@ def restart_ima():
 _RESTARTED_IN_THIS_RUN = False
 
 
-def wait_for_ax_ready(min_elements: int = 5, timeout: int = 30) -> bool:
+def wait_for_ax_ready(min_elements: int = 5, timeout: int = 12) -> bool:
     """
     硬等待 IMA 窗口 AX 树就绪（AXStaticText 元素数超过阈值）
 
     在启动 IMA 后调用，持续轮询主窗口 AX 树，
     直到 AXStaticText 数量 >= min_elements 或超时。
     阈值口径与 navigate_to_kb 的完整性判断一致（AXStaticText >= 5）。
+
+    timeout 默认 12s：2026-08-27 起生产日志显示该等待每天烧满旧预算 30s 超时降级，
+    而降级路径（导航→提取）随后全部正常——说明"达标才继续"在本环境从不达成，
+    等更久只是白等。预算从 30 压到 12 只省等，不改变任何后续行为。
 
     返回: True 表示就绪，False 表示超时（调用方应降级为原行为，不阻断）
     """

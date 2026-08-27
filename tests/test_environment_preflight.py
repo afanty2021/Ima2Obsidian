@@ -338,6 +338,7 @@ class TestFailureSignature:
             patch("ima_obsidian_saver.extract_publish_date",
                   return_value=datetime.now().strftime("%y%m%d")),
             patch("ima_obsidian_saver.extract_publish_date_js", return_value=None),
+            patch("ima_obsidian_saver.wait_page_ready", return_value=1.0),
             patch("ima_obsidian_saver.open_url"),
             patch("ima_obsidian_saver.handle_verify_page", return_value=False),
             patch("ima_obsidian_saver.read_page_snapshot",

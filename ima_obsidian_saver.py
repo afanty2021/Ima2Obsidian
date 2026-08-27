@@ -78,8 +78,11 @@ CLIPPER_KEY = "o"
 CLIPPER_MODS = ["command", "shift"]
 
 # 时间配置（秒）
-WAIT_PAGE_LOAD = 6.0
-WAIT_CLIP_SAVE = 4.0       # 触发 quick_clip 后起步等待（首次轮询前给 Clipper 一个窗口）
+WAIT_PAGE_LOAD_MAX = 6.0    # 页面加载自适应等待上限：readyState 轮询超时仍未 complete 则睡满兜底（原固定值 6s 每篇白等一半）
+WAIT_PAGE_POLL = 0.3        # readyState 轮询间隔
+WAIT_PAGE_SETTLE = 0.5      # complete 后微等：innerText/#publish_time 完整渲染补齐（微信服务端直出通常已就绪）
+WAIT_CLIP_SAVE = 1.0        # 首轮落盘轮询前的起步间隔；半成品文件由 _file_write_settled 双采样防护
+                            # （原固定 4s 起步窗已被稳定性检查替代——实测成功案例首轮即命中）
 WAIT_CLIP_TOTAL = 25.0     # 轮询等待文件落盘的总预算（修夜间慢盘时序竞争；交互式秒回）
 WAIT_CLIP_POLL = 1.5       # 落盘轮询间隔
 WAIT_CLOSE_TAB = 1.0
@@ -974,15 +977,97 @@ def execute_chrome_js(js: str, browser_app: str = "Google Chrome") -> Optional[s
 
 
 def read_page_snapshot(browser_app: str = "Google Chrome") -> Optional[dict]:
-    """读当前页 title + 正文前 800 字，供验证页检测与自取证。失败返回 None。"""
-    js = "JSON.stringify({title:document.title,text:(document.body&&document.body.innerText||'').slice(0,800)})"
+    """读当前页 title + 正文前 800 字 + #publish_time，供验证页/删除判定与发布日期共用。
+
+    publish_time 合并进同一次 AppleScript 往返（原 extract_publish_date_js 独立往返，
+    happy-path 每篇省一次 osascript 调用）。失败返回 None。
+    """
+    js = ("JSON.stringify({title:document.title,"
+          "text:(document.body&&document.body.innerText||'').slice(0,800),"
+          "publish_time:(document.getElementById('publish_time')||{}).textContent||''})")
     raw = execute_chrome_js(js, browser_app)
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        snap = json.loads(raw)
     except json.JSONDecodeError:
         return None
+    if isinstance(snap, dict) and "publish_time" not in snap:
+        snap["publish_time"] = ""  # mock 注入的旧格式快照兼容
+    return snap
+
+
+def wait_page_ready(browser_app: str, max_wait: float = None) -> float:
+    """open_url 后轮询 document.readyState 直到 complete，返回实际等待秒数。
+
+    微信页通常 2~3 秒就绪，替代原固定 sleep(6)。以下情况退化为睡满 max_wait
+    （行为不劣于旧版固定等待）：非 Chrome 内核（AppleScript execute JS 不可用）、
+    连续 4 次拿不到结果（权限丢失等环境异常）、到上限仍未 complete（慢渲染）。
+    """
+    if max_wait is None:
+        max_wait = WAIT_PAGE_LOAD_MAX
+    start = time.time()
+    if "Chrome" not in browser_app:
+        time.sleep(max_wait)
+        return max_wait
+    deadline = start + max_wait
+    misses = 0
+    while True:
+        raw = execute_chrome_js("document.readyState", browser_app)
+        if raw and "complete" in raw.lower():
+            time.sleep(WAIT_PAGE_SETTLE)
+            return time.time() - start
+        if raw is None:
+            misses += 1
+            if misses >= 4:  # 环境异常：不空转烧 CPU，直接把余量睡掉
+                remain = deadline - time.time()
+                if remain > 0:
+                    time.sleep(remain)
+                return time.time() - start
+        now = time.time()
+        if now >= deadline:
+            return now - start
+        time.sleep(min(WAIT_PAGE_POLL, deadline - now))
+
+
+def extract_date_from_snapshot(snapshot: Optional[dict]) -> Optional[str]:
+    """从 read_page_snapshot 的 publish_time 字段提取 YYMMDD（如 '2026年7月15日 09:56'→260715）。
+
+    非日期文本/字段缺失返回 None，让上游维持命名兜底日期。
+    """
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日",
+                  (snapshot or {}).get("publish_time") or "")
+    if not m:
+        return None
+    try:
+        dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+    return dt.strftime("%y%m%d")
+
+
+# Web Clipper 渐进写入保护：两次采样间隔。实测文章落盘 <1s，双采样一致即可安全认领。
+FILE_SETTLE_GAP = 0.35
+
+
+def _file_write_settled(path: Path, gap: float = None) -> bool:
+    """两次采样 size+mtime 一致才认为写盘完成，防认领半成品文件后 rename 撕裂内容。
+
+    取代原固定 WAIT_CLIP_SAVE=4s 起步窗——稳定性检查只在目标候选出现时才付 0.35s，
+    文件早已完整时总成本更低且对夜间慢盘同样安全。
+    """
+    if gap is None:
+        gap = FILE_SETTLE_GAP
+    try:
+        s1 = path.stat()
+    except OSError:
+        return False
+    time.sleep(gap)
+    try:
+        s2 = path.stat()
+    except OSError:
+        return False
+    return (s1.st_size, s1.st_mtime) == (s2.st_size, s2.st_mtime)
 
 
 # ==================== 渐进验证：body 长度 debug print 节流 ====================
@@ -1157,8 +1242,12 @@ def click_confirm(browser_app: str = "Google Chrome") -> bool:
     return False
 
 
-def handle_verify_page(browser_app: str = "Google Chrome") -> bool:
+def handle_verify_page(browser_app: str = "Google Chrome",
+                       initial_snap: Optional[dict] = None) -> bool:
     """检测并处理微信验证页。返回是否遇到过验证页（True=遇到过，False=非验证页）。
+
+    initial_snap：调用方若已持有 read_page_snapshot 快照则传入复用，首轮免一次
+    AppleScript 往返；不传时行为与旧版完全一致（自行探测）。注意传 None 与不传等价。
 
     在 quick_clip 前调用：非验证页直接放行；验证页则自动点「确认」，最多 2 轮（应对二次
     确认）。点不掉则放弃——quick_clip 会在验证页失败，save_one_article 返回 False，
@@ -1166,8 +1255,11 @@ def handle_verify_page(browser_app: str = "Google Chrome") -> bool:
     每次命中打印 title+text 片段用于自取证（迭代 VERIFY_KEYWORDS / click_confirm）。
     """
     encountered = False
+    pending_snap = initial_snap
     for attempt in range(2):
-        snap = read_page_snapshot(browser_app)
+        # 首轮可用调用方快照；此后页面可能因确认点击跳转，必须重新探测
+        snap = pending_snap if pending_snap is not None else read_page_snapshot(browser_app)
+        pending_snap = None
         if not snap or not is_verify_page(snap):
             return encountered  # 非验证页：首次则 False；点确认后离开则 True
         encountered = True
@@ -1272,6 +1364,7 @@ def find_and_rename_in_vault(
     existing_files: set,
     search_dirs: list = None,
     target_folder: str = None,
+    require_stable: bool = False,
 ):
     """
     在 Obsidian vault 中找到 Web Clipper 刚保存的文件，
@@ -1279,6 +1372,8 @@ def find_and_rename_in_vault(
 
     existing_files: set of (Path, mtime) tuples captured before opening article
     target_folder: 目标文件夹名称（如 "AI"），如果为 None 则保持在原位置
+    require_stable: True 时认领前用 _file_write_settled 双采样确认写盘完成，
+      半成品文件本轮跳过由外层轮询重试（save_one_article 传入；reclaim 等其他调用方不传保持旧行为）
 
     返回 (renamed: bool, actual_date_used: Optional[str])：
       - renamed=True 时 actual_date_used 是实际用于命名的日期
@@ -1333,6 +1428,9 @@ def find_and_rename_in_vault(
     if candidates:
         candidates.sort(key=lambda x: x[1], reverse=True)
         md_file = candidates[0][0]
+        if require_stable and not _file_write_settled(md_file):
+            print("    ⏳ 候选文件仍在写盘，本轮跳过待下轮轮询")
+            return False, None
         stem = md_file.stem
         # 从文件内容提取真实发布日期（Web Clipper 保留 *YYYY年M月D日*），覆盖降级值
         try:
@@ -1365,6 +1463,9 @@ def find_and_rename_in_vault(
             print(f"    ⚠️  发现 {len(new_files)} 个新文件，无法确定本文对应文件，跳过自动重命名")
             return False, None
         newest = new_files[0][0]
+        if require_stable and not _file_write_settled(newest):
+            print("    ⏳ 新文件仍在写盘，本轮跳过待下轮轮询")
+            return False, None
         # 从文件内容提取真实发布日期（Web Clipper 保留 *YYYY年M月D日*），覆盖降级值
         try:
             file_date = extract_date_from_content(newest.read_text(encoding="utf-8", errors="ignore"))
@@ -1426,10 +1527,13 @@ def save_one_article(
         print(f"    目标位置: {folder_info}{new_name[:60]}")
         return "saved", date_str
 
-    # 1. 提取发布日期
+    # 1. 命名兜底日期——不再 requests 预取：微信精简页对四种正则必失配（旧日志每篇
+    #    「未匹配到发布日期正则」都是这次白付的 HTTP，网络抖动还会触发指数退避）。
+    #    真实日期由打开页面后的 snapshot.publish_time 与文件内容 *YYYY年M月D日* 双级覆盖；
+    #    全部失败仍回落今日（与旧行为一致）。dry-run 预览仍走 extract_publish_date。
+    date_str = datetime.now().strftime("%y%m%d")
     print(f"  提取日期...")
-    date_str = extract_publish_date(url)
-    print(f"    发布日期: {date_str}")
+    print(f"    命名兜底日期: {date_str}（真实发布日期待页面/内容覆盖）")
 
     # 记录 vault 中当前 .md 文件列表（用于后续检测新文件）
     existing_files = set()
@@ -1447,11 +1551,19 @@ def save_one_article(
     # 2. 打开文章
     print(f"  打开: {title[:50]}...")
     open_url(browser_app, url)
-    time.sleep(WAIT_PAGE_LOAD)
+    waited = wait_page_ready(browser_app)
+    if waited >= WAIT_PAGE_LOAD_MAX - 0.05:
+        # 达上限才告警：readyState 提前 complete 时这里静默通过（省时的主路径）
+        print(f"    ⚠️ 页面就绪等待达上限 {waited:.1f}s（AppleScript 失败或慢渲染），降级继续")
 
-    # 2.5 微信验证页检测 + 自动确认（风控验证页会让 quick_clip 打在空页上 → 0 落盘）
+    # 2.5 快照一次到手：验证页检测、删除判定、发布日期共用同一次 AppleScript 往返
+    #   （原链路 handle_verify_page 自探测 + 独立 read_page_snapshot + extract_publish_date_js
+    #    共三次往返，happy-path 合并后仅一次）
+    snap = read_page_snapshot(browser_app)
+    # 2.5a 微信验证页检测 + 自动确认（风控验证页会让 quick_clip 打在空页上 → 0 落盘）
     #   is_verify_page 前置 _deleted_reason 排除，屏蔽/违规页不会被误判为验证页 → 不浪费重试
-    handle_verify_page(browser_app)
+    if handle_verify_page(browser_app, initial_snap=snap):
+        snap = read_page_snapshot(browser_app)  # 点确认跳转后复读真页面
 
     # 2.55 永久不可恢复页检测（发布者删除 / 违规不可查看 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
     #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
@@ -1484,11 +1596,11 @@ def save_one_article(
     if len(body) >= _DELETED_REASON_LEN_THRESHOLD:
         _log_possible_miss(body, url=url, title=title)
 
-    # 2.6 execute JS 读 #publish_time 覆盖日期（比 requests 预提取可靠；验证页/未加载则降级）
-    js_date = extract_publish_date_js(browser_app)
+    # 2.6 发布日期（同一快照内读 #publish_time，免单独 osascript 往返）
+    js_date = extract_date_from_snapshot(snap)
     if js_date:
         date_str = js_date
-        print(f"    发布日期(execute JS): {date_str}")
+        print(f"    发布日期(publish_time): {date_str}")
 
     # 3. 触发 Web Clipper
     activate_browser(browser_app)
@@ -1516,13 +1628,14 @@ def save_one_article(
     #    交互式通常 2-4s 落盘；launchd 夜间场景（屏幕休眠 / Chrome 后台）常 >6s，
     #    固定等待会误判"未找到"→ 文件稍后落盘滞留 Clippings。改为轮询：文件一到即认领。
     print(f"    查找并重命名（轮询等待落盘，最长 {WAIT_CLIP_TOTAL:g}s）...")
-    time.sleep(WAIT_CLIP_SAVE)  # 起步窗口，再开始轮询
+    time.sleep(WAIT_CLIP_SAVE)  # 起步间隔仅 1s：半成品由 require_stable 双采样防护
     renamed = False
-    actual_date = None  # find_and_rename_in_vault 可能从内容提取到真实日期覆盖降级值
+    actual_date = None  # find_and_rename 可能从内容提取到真实日期覆盖降级值
     deadline = time.time() + WAIT_CLIP_TOTAL
     while time.time() < deadline:
         renamed, actual_date = find_and_rename_in_vault(
             title, date_str, existing_files, target_folder=target_folder,
+            require_stable=True,
         )
         if renamed:
             break

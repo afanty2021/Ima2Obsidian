@@ -37,10 +37,19 @@
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `WAIT_PAGE_LOAD` | 6.0s | 页面加载等待时间 |
-| `WAIT_CLIP_SAVE` | 4.0s | Web Clipper 保存等待时间 |
+| `WAIT_PAGE_LOAD_MAX` | 6.0s | 页面加载自适应等待上限（readyState 轮询，微信页通常 2~3s 就绪） |
+| `WAIT_CLIP_SAVE` | 1.0s | 落盘首轮轮询前起步间隔；半成品由 `_file_write_settled` 双采样防护 |
 | `WAIT_FILE_APPEAR` | 2.0s | 文件出现等待时间 |
 | `DEFAULT_LIMIT` | 1300 | 每次最多处理文章数 |
+
+### 性能调优（2026-08-27）
+
+保存循环篇均 ~21s → 目标 ~12s 的五项调整：
+1. **跳过日期预取 HTTP**：requests 抓微信精简页对日期正则必失配（每篇白付一次请求），正式跑直接用页面快照的 `publish_time` 与文件内容日期覆盖
+2. **readyState 自适应加载**：`wait_page_ready` 轮询 `document.readyState`，AppleScript 失败/慢渲染退化为睡满上限
+3. **快照单次往返**：验证页检测、删除判定、发布日期共用一次 AppleScript 调用（原三次）
+4. **早轮询 + 稳定性检查**：`find_and_rename_in_vault(..., require_stable=True)` 用双采样 size+mtime 防半成品
+5. **AX 就绪预算 30s → 12s**：生产日志显示旧预算天天超时而降级路径正常，只省等不改变行为
 
 ---
 
@@ -190,7 +199,7 @@ brew install cliclick
 **未找到保存的文件**
 - 检查 Obsidian 是否运行
 - 确认 Web Clipper 已连接
-- 增加 `WAIT_CLIP_SAVE` 时间
+- 增大 `WAIT_CLIP_TOTAL`（落盘轮询总预算，默认 25s）
 
 **文件名过长**
 - 自动截断到 100 字符

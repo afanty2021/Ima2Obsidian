@@ -65,9 +65,16 @@ class TestIsVerifyPage:
 class TestReadPageSnapshot:
     def test_parse_json(self):
         with patch("ima_obsidian_saver.execute_chrome_js",
+                   return_value='{"title":"T","text":"正文","publish_time":"2026年7月15日"}'):
+            snap = saver.read_page_snapshot()
+        assert snap == {"title": "T", "text": "正文", "publish_time": "2026年7月15日"}
+
+    def test_old_format_snapshot_gets_empty_publish_time(self):
+        """旧格式（无 publish_time 字段，如外部 mock 注入）→ 补空串键，下游 .get 不炸"""
+        with patch("ima_obsidian_saver.execute_chrome_js",
                    return_value='{"title":"T","text":"正文"}'):
             snap = saver.read_page_snapshot()
-        assert snap == {"title": "T", "text": "正文"}
+        assert snap["publish_time"] == ""
 
     def test_none_when_js_fails(self):
         with patch("ima_obsidian_saver.execute_chrome_js", return_value=None):

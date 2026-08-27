@@ -191,6 +191,23 @@ class TestHrefMatchesUrl:
     def test_empty_href_never_matches(self):
         assert saver._href_matches_url("", "https://x.com/a?sn=1") is False
 
+    def test_real_short_link_lands_on_short_form(self):
+        """真实 Chrome 实测回归钉：/s/<token> 短链加载后 href 保持短链不变。
+
+        2026-08-27 用 osascript 在本机 Chrome 打开生产库真实短链观测：
+        `complete|https://mp.weixin.qq.com/s/-36m-d7VURKgoEusIwvggQ`（无 HTTP 重定向；
+        页面 og:url 即短链，history.replaceState 仅回放 location.href）。据此
+        弱前缀匹配可即时命中；若有朝一日本用例失败，说明微信开始改写地址——
+        届时需引入重定向预解析（reviews 曾误判此处存在永久失配）。
+        """
+        url = "https://mp.weixin.qq.com/s/-36m-d7VURKgoEusIwvggQ"
+        assert saver._href_matches_url(url, url) is True            # 落点即短链
+        # 切换前的旧页（无论长短形态）都不得放行
+        assert saver._href_matches_url(
+            "https://mp.weixin.qq.com/s?__biz=A&mid=1&idx=1&sn=deadbeef00", url) is False
+        assert saver._href_matches_url(
+            "https://mp.weixin.qq.com/s/differenttoken9999", url) is False
+
 
 class TestWaitPageReadyUrlGuard:
     """评审 Important 修复：就绪判定必须确认活动标签页已切到本篇。"""

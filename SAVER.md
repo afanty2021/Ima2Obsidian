@@ -46,7 +46,7 @@
 
 保存循环篇均 ~21s → 目标 ~12s 的调整：
 1. **跳过日期预取 HTTP**：requests 抓微信精简页对日期正则必失配（每篇白付一次请求），正式跑直接用页面快照的 `publish_time` 与文件内容日期覆盖
-2. **readyState 自适应加载**：`wait_page_ready` 轮询 `document.readyState`，带 `require_url` URL 守卫——`open -a` 后 Chrome 切换活动标签有延迟，complete 但 href 还停在上篇（按 `sn=` 唯一标识比对）不放行，防快照读到旧页面误判删除页
+2. **readyState 自适应加载**：`wait_page_ready` 轮询 `document.readyState`，带 `require_url` URL 守卫——`open -a` 后 Chrome 切换活动标签有延迟，complete 但 href 还停在上篇（按 `sn=` 唯一标识比对）不放行，防快照读到旧页面误判删除页。**短链说明**：约 47% 文章是 `/s/<token>` 短链，实机验证（2026-08-27，真实 Chrome + 生产库样本）加载后 href 保持短链形态、无重定向，弱前缀匹配即时命中；若未来微信改为跳转长链，守卫会退化为预算耗尽+告警（安全但变慢），届时需加重定向预解析
 3. **快照单次往返**：验证页检测、删除判定、发布日期共用一次 AppleScript 调用（原三次，`handle_verify_page` 复用调用方快照后 happy-path 真正只此一次）
 4. **早轮询 + 稳定性检查**：`find_and_rename_in_vault(..., require_stable=True)` 用双采样 size+mtime 防半成品
 5. **AX 就绪预算 30s → 12s**：生产日志显示旧预算天天超时而降级路径正常，只省等不改变行为

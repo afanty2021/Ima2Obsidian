@@ -347,7 +347,7 @@ def main():
         "no_match": len(no_match), "no_folder": len(no_folder),
         "conflict": len(conflict),
         "batch_corrupt_skipped": len(batch_corrupt_skipped),
-        "rollback_failures": [(str(d), str(s), e) for d, s, e in rollback_failures],
+        "rollback_failures": [(str(d), str(s), str(e)) for d, s, e in rollback_failures],
         "aborted": aborted_reason,
     }
     print("RECLAIM_RESULT: " + json.dumps(_result, ensure_ascii=False))

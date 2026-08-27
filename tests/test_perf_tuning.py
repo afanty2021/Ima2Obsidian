@@ -126,11 +126,19 @@ class TestWaitPageReady:
         assert len(sleeps) >= 1                   # 余量一次性睡掉（sleep 本身已被 mock）
 
     def test_times_out_on_eternal_loading(self):
-        """永远是 loading：到上限退出且不抛异常"""
-        with patch("ima_obsidian_saver.execute_chrome_js", return_value="loading"), \
+        """永远是 loading：受 MAX_PAGE_POLLS 硬上限约束，不无限打 osascript"""
+        # 注：sleep 被 mock 后轮询近零耗时，次数上限会比时间上限先到（生产中
+        # 单次 osascript ~100ms，60 次 ≈ 时间预算自然到期）
+        calls = {"n": 0}
+
+        def fake_js(*a):
+            calls["n"] += 1
+            return "loading"
+
+        with patch("ima_obsidian_saver.execute_chrome_js", side_effect=fake_js), \
              patch("ima_obsidian_saver.time.sleep"):
-            waited = saver.wait_page_ready("Google Chrome", max_wait=0.05)
-        assert waited >= 0.04
+            saver.wait_page_ready("Google Chrome", max_wait=6.0)
+        assert calls["n"] == saver.MAX_PAGE_POLLS
 
     def test_non_chrome_sleeps_full_budget(self):
         """Safari 等 AppleScript execute JS 不可用的浏览器：退化为固定等待"""
@@ -159,6 +167,161 @@ class TestExtractDateFromSnapshot:
     def test_none_on_invalid_values(self):
         assert saver.extract_date_from_snapshot({"publish_time": "微信公众平台"}) is None
         assert saver.extract_date_from_snapshot({"publish_time": "2026年13月40日"}) is None
+
+
+class TestHrefMatchesUrl:
+    """URL 守卫匹配规则：sn= 是微信文章唯一标识，路径相同不能作为新旧页判据。"""
+
+    def test_sn_param_is_strong_match(self):
+        url = "https://mp.weixin.qq.com/s?__biz=A&mid=1&idx=1&sn=abc123"
+        assert saver._href_matches_url(
+            "https://mp.weixin.qq.com/s?__biz=A&mid=1&idx=1&sn=abc123", url) is True
+
+    def test_same_path_different_sn_rejected(self):
+        """上一篇文章也停在 /s 路径——只认 sn 才能区分新旧页（本回归的根因）"""
+        url = "https://mp.weixin.qq.com/s?__biz=A&mid=1&idx=1&sn=NEW"
+        stale = "https://mp.weixin.qq.com/s?__biz=A&mid=99&idx=1&sn=OLD"
+        assert saver._href_matches_url(stale, url) is False
+
+    def test_no_sn_falls_back_to_full_prefix(self):
+        url = "https://example.com/articles/foo?id=7"
+        assert saver._href_matches_url("https://example.com/articles/foo?id=7", url) is True
+        assert saver._href_matches_url("https://other.com/x", url) is False
+
+    def test_empty_href_never_matches(self):
+        assert saver._href_matches_url("", "https://x.com/a?sn=1") is False
+
+
+class TestWaitPageReadyUrlGuard:
+    """评审 Important 修复：就绪判定必须确认活动标签页已切到本篇。"""
+
+    def test_blocks_on_complete_but_stale_tab(self):
+        """旧标签页也是 complete——不匹配 URL 就不能放行"""
+        url = "https://mp.weixin.qq.com/s?sn=fresh"
+        seq = iter([
+            f"complete|https://mp.weixin.qq.com/s?sn=stale",   # 还停在上篇
+            f"interactive|{url}",                              # 已切换未加载完
+            f"complete|{url}",                                 # 真正就绪
+        ])
+        sleeps = []
+        with patch("ima_obsidian_saver.execute_chrome_js",
+                   side_effect=lambda *a: next(seq)), \
+             patch("ima_obsidian_saver.time.sleep", side_effect=sleeps.append):
+            waited = saver.wait_page_ready("Google Chrome", max_wait=6.0,
+                                           require_url=url)
+        assert waited < 6.0
+        assert any(abs(s - saver.WAIT_PAGE_SETTLE) < 1e-9 for s in sleeps)
+
+    def test_blank_tab_delayed_switch(self):
+        """冷启动新标签页短暂为空标题：complete 不带本篇 href 同样拦下"""
+        url = "https://mp.weixin.qq.com/s?sn=x"
+        seq = iter(["complete|", f"complete|about:blank|", f"complete|{url}"])
+        with patch("ima_obsidian_saver.execute_chrome_js",
+                   side_effect=lambda *a: next(seq)), \
+             patch("ima_obsidian_saver.time.sleep"):
+            waited = saver.wait_page_ready("Google Chrome", max_wait=6.0,
+                                           require_url=url)
+        assert waited < 6.0
+
+    def test_never_matching_degrades_at_poll_cap(self):
+        """永不匹配：受 MAX_PAGE_POLLS 硬上限约束退出（同 eternal-loading 的 mock 语义）"""
+        url = "https://mp.weixin.qq.com/s?sn=x"
+        calls = {"n": 0}
+
+        def fake_js(*a):
+            calls["n"] += 1
+            return "complete|https://elsewhere/?sn=y"
+
+        with patch("ima_obsidian_saver.execute_chrome_js", side_effect=fake_js), \
+             patch("ima_obsidian_saver.time.sleep"):
+            saver.wait_page_ready("Google Chrome", max_wait=6.0, require_url=url)
+        assert calls["n"] == saver.MAX_PAGE_POLLS
+
+    def test_garbage_returns_capped_by_poll_budget(self):
+        """有返回但永不满足（垃圾字符串）：达 MAX_PAGE_POLLS 即止，不再无限打 osascript"""
+        calls = {"n": 0}
+
+        def fake_js(*a):
+            calls["n"] += 1
+            return "weird"
+
+        with patch("ima_obsidian_saver.execute_chrome_js", side_effect=fake_js), \
+             patch("ima_obsidian_saver.time.sleep"):
+            waited = saver.wait_page_ready("Google Chrome", max_wait=60.0)
+        assert calls["n"] == saver.MAX_PAGE_POLLS
+
+
+class TestPublishTimeRetry:
+    """发布日期两级来源 + 落空显式告警（评审 Important：冷启动静默按今日命名）。"""
+
+    def _run_impl(self, tmp_path, monkeypatch, snapshot):
+        """跑通 happy-path，返回 (status, date, slept, sleep_mock)。
+
+        extract_publish_date_js 不在此 patch——是否触发 JS 兜底是各用例的被测行为。
+        """
+        vault = tmp_path / "Vault"
+        clippings = vault / "Clippings"
+        target = vault / "AI"
+        target.mkdir(parents=True)
+        clippings.mkdir()
+        monkeypatch.setattr(saver, "VAULT_DIR", vault)
+        monkeypatch.setattr(saver, "CLIPPINGS_DIR", clippings)
+        monkeypatch.setattr(saver, "WAIT_CLIP_TOTAL", 5)
+
+        title = "这是一篇集成测试用的长标题文章 XYZ"
+        (clippings / f"{title}.md").write_text("无日期标记正文", encoding="utf-8")
+
+        article = {"id": 1, "url": "https://mp.weixin.qq.com/s?sn=q", "title": title}
+        cfg = {"app": "Google Chrome", "shortcut_mods": ["cmd", "shift"]}
+        base = [
+            patch("ima_obsidian_saver.requests.get",
+                  side_effect=AssertionError("正式跑不应发起 requests 预取")),
+            patch("ima_obsidian_saver.wait_page_ready", return_value=1.0),
+            patch("ima_obsidian_saver.open_url"),
+            patch("ima_obsidian_saver.read_page_snapshot", return_value=snapshot),
+            patch("ima_obsidian_saver.handle_verify_page", return_value=False),
+            patch("ima_obsidian_saver.activate_browser"),
+            patch("ima_obsidian_saver.get_frontmost_app", return_value="Chrome"),
+            patch("ima_obsidian_saver.trigger_clipper_with_receipt", return_value=True),
+            patch("ima_obsidian_saver.close_tab"),
+        ]
+        from contextlib import ExitStack
+        slept = []
+        with ExitStack() as stack:
+            for p in base:
+                stack.enter_context(p)
+            sleep_mock = stack.enter_context(patch(
+                "ima_obsidian_saver.time.sleep",
+                side_effect=lambda s: slept.append(s)))
+            status, date_str = saver.save_one_article(article, cfg, mode="clipper",
+                                                      target_folder="AI")
+        return status, date_str, slept, sleep_mock
+
+    def test_present_publish_time_skips_fallback(self, tmp_path, monkeypatch):
+        """快照已含日期：JS 兜底通道不应被触发（多余往返）"""
+        snapshot = {"title": "t", "text": "b", "publish_time": "2026年7月15日 09:00"}
+        with patch("ima_obsidian_saver.extract_publish_date_js",
+                   side_effect=AssertionError("publish_time 已命中，不应走 JS 兜底")):
+            status, date_str, _, _ = self._run_impl(tmp_path, monkeypatch, snapshot)
+        assert (status, date_str) == ("saved", "260715")
+
+    def test_empty_snap_falls_back_to_js_retry(self, tmp_path, monkeypatch):
+        """快照过早 publish_time 空 → 短等后 JS 兜底重读一次命中"""
+        snapshot = {"title": "t", "text": "b"}  # shim 补 publish_time=''
+        with patch("ima_obsidian_saver.extract_publish_date_js",
+                   return_value="260811") as mjs:
+            status, date_str, slept, _ = self._run_impl(tmp_path, monkeypatch, snapshot)
+        assert (status, date_str) == ("saved", "260811")
+        assert any(abs(s - saver.WAIT_PUBLISH_TIME_RETRY) < 1e-9 for s in slept)
+        assert mjs.call_count == 1
+
+    def test_both_sources_missing_warns_and_uses_today(self, tmp_path, monkeypatch, capsys):
+        snapshot = {"title": "t", "text": "b"}
+        with patch("ima_obsidian_saver.extract_publish_date_js", return_value=None):
+            status, date_str, _, _ = self._run_impl(tmp_path, monkeypatch, snapshot)
+        assert status == "saved"
+        assert date_str == datetime.now().strftime("%y%m%d")
+        assert "真实发布日期未取到" in capsys.readouterr().out
 
 
 class TestFileWriteSettled:

@@ -60,3 +60,19 @@ def seeded_db(temp_db):
     conn.commit()
     conn.close()
     return temp_db
+
+
+@pytest.fixture(autouse=True)
+def _stub_saver_execute_chrome_js(monkeypatch):
+    """默认隔离 saver 对本机真实 Chrome 的 osascript 调用（返回 None = 失败退化路径）。
+
+    背景：save_one_article 的旧用例大多只 patch 上层函数，未封 execute_chrome_js——
+    以前靠「osascript 快速失败」侥幸成立；wait_page_ready 就绪轮询引入后（562aa84
+    评审跟进），真实 Chrome 在跑时每篇会烧满 6s 预算，全量测试从 ~10s 涨到 ~165s。
+    测试内显式 patch execute_chrome_js / wait_page_ready 的用例不受影响。
+    """
+    try:
+        import ima_obsidian_saver as sv
+    except ImportError:
+        return
+    monkeypatch.setattr(sv, "execute_chrome_js", lambda *a, **k: None)

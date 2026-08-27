@@ -44,12 +44,16 @@
 
 ### 性能调优（2026-08-27）
 
-保存循环篇均 ~21s → 目标 ~12s 的五项调整：
+保存循环篇均 ~21s → 目标 ~12s 的调整：
 1. **跳过日期预取 HTTP**：requests 抓微信精简页对日期正则必失配（每篇白付一次请求），正式跑直接用页面快照的 `publish_time` 与文件内容日期覆盖
-2. **readyState 自适应加载**：`wait_page_ready` 轮询 `document.readyState`，AppleScript 失败/慢渲染退化为睡满上限
-3. **快照单次往返**：验证页检测、删除判定、发布日期共用一次 AppleScript 调用（原三次）
+2. **readyState 自适应加载**：`wait_page_ready` 轮询 `document.readyState`，带 `require_url` URL 守卫——`open -a` 后 Chrome 切换活动标签有延迟，complete 但 href 还停在上篇（按 `sn=` 唯一标识比对）不放行，防快照读到旧页面误判删除页
+3. **快照单次往返**：验证页检测、删除判定、发布日期共用一次 AppleScript 调用（原三次，`handle_verify_page` 复用调用方快照后 happy-path 真正只此一次）
 4. **早轮询 + 稳定性检查**：`find_and_rename_in_vault(..., require_stable=True)` 用双采样 size+mtime 防半成品
 5. **AX 就绪预算 30s → 12s**：生产日志显示旧预算天天超时而降级路径正常，只省等不改变行为
+
+评审跟进补充：publish_time 首读为空（冷启动渲染慢）时短等 2s 经 JS 兜底重读一次；两级日期来源都落空打显式告警（否则文件静默以今日命名）；轮询有 `MAX_PAGE_POLLS=60` 硬上限防垃圾返回空转。
+
+**测试注意**：conftest 有 autouse fixture 默认将 `ima_obsidian_saver.execute_chrome_js` 置为失败桩——save_one_article 旧用例若真连本机 Chrome，轮询会烧满就绪预算（全量测试曾因此从 ~10s 涨到 ~165s）。需要真实链路语义的用例在测试内显式 patch 即可。
 
 ---
 

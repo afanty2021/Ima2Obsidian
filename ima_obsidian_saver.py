@@ -81,6 +81,8 @@ CLIPPER_MODS = ["command", "shift"]
 WAIT_PAGE_LOAD_MAX = 6.0    # 页面加载自适应等待上限：readyState 轮询超时仍未 complete 则睡满兜底（原固定值 6s 每篇白等一半）
 WAIT_PAGE_POLL = 0.3        # readyState 轮询间隔
 WAIT_PAGE_SETTLE = 0.5      # complete 后微等：innerText/#publish_time 完整渲染补齐（微信服务端直出通常已就绪）
+MAX_PAGE_POLLS = 60         # readyState 轮询硬上限：垃圾返回等任何形态都不会无限打 osascript
+WAIT_PUBLISH_TIME_RETRY = 2.0  # publish_time 首读为空（冷启动渲染慢）时短等后经 JS 兜底重读
 WAIT_CLIP_SAVE = 1.0        # 首轮落盘轮询前的起步间隔；半成品文件由 _file_write_settled 双采样防护
                             # （原固定 4s 起步窗已被稳定性检查替代——实测成功案例首轮即命中）
 WAIT_CLIP_TOTAL = 25.0     # 轮询等待文件落盘的总预算（修夜间慢盘时序竞争；交互式秒回）
@@ -163,9 +165,10 @@ def extract_publish_date(url: str) -> str:
 def extract_publish_date_js(browser_app: str = "Google Chrome") -> Optional[str]:
     """execute JS 读微信文章页 #publish_time 元素的发布日期（如 '2026年7月15日 09:56'）→ YYMMDD。
 
-    requests 抓到的是微信精简页（无 create_time 字段，extract_publish_date 必失败）；
-    浏览器渲染后 #publish_time 才有发布日期，故 open 文章后用本函数读（更可靠）。
-    非日期文本/失败返回 None，让上游降级到 extract_publish_date 的值或 extract_date_from_content。
+    happy-path 不再单独调用（publish_time 已并入 read_page_snapshot 同一往返）；本函数
+    保留为快照落空的冷启动兜底——save_one_article 短等 WAIT_PUBLISH_TIME_RETRY 后经
+    此重读一次。requests 抓到的是微信精简页（无 create_time 字段，extract_publish_date
+    必失败）；浏览器渲染后 #publish_time 才有发布日期。非日期文本/失败返回 None。
     """
     js = "(document.getElementById('publish_time')||{}).textContent"
     raw = execute_chrome_js(js, browser_app)
@@ -997,12 +1000,34 @@ def read_page_snapshot(browser_app: str = "Google Chrome") -> Optional[dict]:
     return snap
 
 
-def wait_page_ready(browser_app: str, max_wait: float = None) -> float:
-    """open_url 后轮询 document.readyState 直到 complete，返回实际等待秒数。
+def _href_matches_url(href: str, url: str) -> bool:
+    """活动标签页 href 是否已切到目标文章。
 
-    微信页通常 2~3 秒就绪，替代原固定 sleep(6)。以下情况退化为睡满 max_wait
-    （行为不劣于旧版固定等待）：非 Chrome 内核（AppleScript execute JS 不可用）、
-    连续 4 次拿不到结果（权限丢失等环境异常）、到上限仍未 complete（慢渲染）。
+    强判据是微信文章唯一标识 sn=<hash>：open -a 之后 Chrome 切换活动标签页有延迟，
+    期间 href 停在上篇文章——而所有微信文章 path 同为 /s，仅比路径无法区分新旧页。
+    无 sn 的 URL 退化为「去协议后整体前缀命中」（best-effort：目标本身就是刚交给
+    Chrome 的地址，主要防的还是停在别的页）。
+    """
+    if not href:
+        return False
+    m = re.search(r"[?&]sn=([^&#]+)", url or "")
+    if m:
+        return f"sn={m.group(1)}" in href
+    canon = re.sub(r"^https?://", "", url or "", flags=re.I)
+    return bool(canon) and canon.lower() in href.lower()
+
+
+def wait_page_ready(browser_app: str, max_wait: float = None,
+                    require_url: str = None) -> float:
+    """open_url 后轮询直到页面就绪，返回实际等待秒数。
+
+    require_url 非空时（save_one_article 主路径），单次往返同取 readyState 和
+    location.href，就绪条件为 complete 且活动标签已切到本篇——否则首轮轮询可能打在
+    还没切走的上篇文章上（它必然 complete），后续快照读旧页面、删除判定有误伤风险。
+    require_url 为空保持只问 readyState 的轻量行为。
+
+    以下情况退化为睡满 max_wait（行为不劣于旧版固定等待）：非 Chrome 内核、连续
+    4 次拿不到结果（权限丢失等环境异常）、轮询达 MAX_PAGE_POLLS 硬上限或时间到上限。
     """
     if max_wait is None:
         max_wait = WAIT_PAGE_LOAD_MAX
@@ -1012,18 +1037,31 @@ def wait_page_ready(browser_app: str, max_wait: float = None) -> float:
         return max_wait
     deadline = start + max_wait
     misses = 0
+    polls = 0
+
+    def _degrade() -> float:
+        remain = deadline - time.time()
+        if remain > 0:
+            time.sleep(remain)
+        return time.time() - start
+
     while True:
-        raw = execute_chrome_js("document.readyState", browser_app)
-        if raw and "complete" in raw.lower():
+        polls += 1
+        js = ("document.readyState+'|'+location.href"
+              if require_url else "document.readyState")
+        raw = execute_chrome_js(js, browser_app)
+        state, _, href = (raw or "").partition("|")
+        ready = bool(state) and "complete" in state.lower()
+        matched = True if not require_url else _href_matches_url(href, require_url)
+        if ready and matched:
             time.sleep(WAIT_PAGE_SETTLE)
             return time.time() - start
         if raw is None:
             misses += 1
             if misses >= 4:  # 环境异常：不空转烧 CPU，直接把余量睡掉
-                remain = deadline - time.time()
-                if remain > 0:
-                    time.sleep(remain)
-                return time.time() - start
+                return _degrade()
+        elif polls >= MAX_PAGE_POLLS:  # 有返回但迟迟不满足（含垃圾字符串空转面）
+            return _degrade()
         now = time.time()
         if now >= deadline:
             return now - start
@@ -1551,14 +1589,15 @@ def save_one_article(
     # 2. 打开文章
     print(f"  打开: {title[:50]}...")
     open_url(browser_app, url)
-    waited = wait_page_ready(browser_app)
+    waited = wait_page_ready(browser_app, require_url=url)
     if waited >= WAIT_PAGE_LOAD_MAX - 0.05:
         # 达上限才告警：readyState 提前 complete 时这里静默通过（省时的主路径）
-        print(f"    ⚠️ 页面就绪等待达上限 {waited:.1f}s（AppleScript 失败或慢渲染），降级继续")
+        print(f"    ⚠️ 页面就绪等待达上限 {waited:.1f}s"
+              f"（AppleScript 失败/慢渲染/标签页未切换），降级继续")
 
     # 2.5 快照一次到手：验证页检测、删除判定、发布日期共用同一次 AppleScript 往返
     #   （原链路 handle_verify_page 自探测 + 独立 read_page_snapshot + extract_publish_date_js
-    #    共三次往返，happy-path 合并后仅一次）
+    #    共三次往返；合并 + URL 守卫保证读到的是本篇后，happy-path 真正只此一次）
     snap = read_page_snapshot(browser_app)
     # 2.5a 微信验证页检测 + 自动确认（风控验证页会让 quick_clip 打在空页上 → 0 落盘）
     #   is_verify_page 前置 _deleted_reason 排除，屏蔽/违规页不会被误判为验证页 → 不浪费重试
@@ -1567,7 +1606,6 @@ def save_one_article(
 
     # 2.55 永久不可恢复页检测（发布者删除 / 违规不可查看 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
     #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
-    snap = read_page_snapshot(browser_app)
     body = (snap or {}).get("text") or ""  # PR #6 review #5：提取一次，下游复用
     # 渐进验证：<_DELETED_REASON_LEN_THRESHOLD 字阈值对真实屏蔽/违规页是否有效（spec §5 + v7 §3.1）
     # 默认开启；运维嫌吵可设 IMA_DEBUG_BODY_LEN=0/false/no/off 关闭
@@ -1596,11 +1634,21 @@ def save_one_article(
     if len(body) >= _DELETED_REASON_LEN_THRESHOLD:
         _log_possible_miss(body, url=url, title=title)
 
-    # 2.6 发布日期（同一快照内读 #publish_time，免单独 osascript 往返）
+    # 2.6 发布日期（同一快照内读 #publish_time，免单独 osascript 往返）。
+    #     冷启动渲染慢时快照可能取到空 publish_time——短等后经 extract_publish_date_js
+    #     兜底重读一次；两级都落空必须显式告警，否则文件以今日命名且无任何信号。
     js_date = extract_date_from_snapshot(snap)
+    date_source = "publish_time"
+    if js_date is None and "Chrome" in browser_app:
+        time.sleep(WAIT_PUBLISH_TIME_RETRY)
+        js_date = extract_publish_date_js(browser_app)
+        date_source = "publish_time 重试"
     if js_date:
         date_str = js_date
-        print(f"    发布日期(publish_time): {date_str}")
+        print(f"    发布日期({date_source}): {date_str}")
+    else:
+        print("    ⚠️ 真实发布日期未取到（快照与 JS 兜底皆空），先按今日命名兜底；"
+              "文件内容含 *YYYY年M月D日* 时重命名阶段仍会覆盖")
 
     # 3. 触发 Web Clipper
     activate_browser(browser_app)

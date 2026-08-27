@@ -43,6 +43,9 @@ class TestMainEntryGuardCallsRealMain:
 
         monkeypatch.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI"])
         monkeypatch.setattr("ima_incremental_update.ensure_daemon", lambda: True)
+        # 环境快照读真实 Chrome 配置，测试内 mock 保持封闭
+        monkeypatch.setattr("ima_incremental_update.save_snapshot_and_report_drift",
+                            lambda *a, **kw: ([], {}))
         # 防回归：守卫失效时 main 会跑到这些函数，必须 mock 让其快速失败
         sentinel = AssertionError("守卫失效：main 进入 IMA 自动化路径")
         monkeypatch.setattr("ima_incremental_update.activate_ima",
@@ -67,6 +70,9 @@ class TestMainEntryGuardCallsRealMain:
 
         monkeypatch.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI"])
         monkeypatch.setattr("ima_incremental_update.ensure_daemon", lambda: True)
+        # 环境快照读真实 Chrome 配置，测试内 mock 保持封闭
+        monkeypatch.setattr("ima_incremental_update.save_snapshot_and_report_drift",
+                            lambda *a, **kw: ([], {}))
 
         with patch("ima_incremental_update.update_knowledge_base",
                    return_value={"new": 0, "skipped": 0, "failed": 0}):
@@ -86,6 +92,9 @@ class TestMainEntryGuardCallsRealMain:
         init_database()
         monkeypatch.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI"])
         monkeypatch.setattr("ima_incremental_update.ensure_daemon", lambda: True)
+        # 环境快照读真实 Chrome 配置，测试内 mock 保持封闭
+        monkeypatch.setattr("ima_incremental_update.save_snapshot_and_report_drift",
+                            lambda *a, **kw: ([], {}))
 
         with patch("ima_incremental_update.update_knowledge_base",
                    return_value={"new": 0, "skipped": 0, "failed": 0}):
@@ -105,6 +114,9 @@ class TestMainEntryGuardCallsRealMain:
             "sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest"],
         )
         monkeypatch.setattr("ima_incremental_update.ensure_daemon", lambda: True)
+        # 环境快照读真实 Chrome 配置，测试内 mock 保持封闭
+        monkeypatch.setattr("ima_incremental_update.save_snapshot_and_report_drift",
+                            lambda *a, **kw: ([], {}))
         monkeypatch.setattr(
             "ima_incremental_update.update_knowledge_base",
             lambda _kb, _dry_run: {"new": 1, "skipped": 0, "failed": 0},
@@ -169,6 +181,9 @@ class TestMainEntryGuardCallsRealMain:
             "sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest"],
         )
         monkeypatch.setattr("ima_incremental_update.ensure_daemon", lambda: True)
+        # 环境快照读真实 Chrome 配置，测试内 mock 保持封闭
+        monkeypatch.setattr("ima_incremental_update.save_snapshot_and_report_drift",
+                            lambda *a, **kw: ([], {}))
         monkeypatch.setattr(
             "ima_incremental_update.update_knowledge_base",
             lambda _kb, _dry_run: {"new": 1, "skipped": 0, "failed": 0},

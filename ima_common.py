@@ -202,6 +202,173 @@ def _is_article_tab_window(window: dict) -> bool:
         return False
 
 
+# ==================== Chrome 环境快照（预检 + 漂移预警） ====================
+#
+# 背景：2026-08-12 用户切换 Chrome 登录账号后，自动化标签页落到新 Profile，
+# 该 Profile 没装 Web Clipper，保存器连续 15 个运行日 0 落盘才被发现。
+# 本节提供"环境前提"的可读化：当前 Profile、扩展安装/启用/快捷键注册、输入法。
+
+CHROME_USER_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+WEB_CLIPPER_EXT_ID = "cnjifjpddelmedmihgijeibhnjfabmlf"
+SNAPSHOT_FILE = Path(__file__).parent / "environment_snapshot.json"
+
+# 会拦截 ⌥(option)+字母 组合的输入法关键字（命中即合成键盘事件到不了 Chrome 扩展层）。
+# macOS 内置中文输入法的 layout/bundle 均含这些关键字；ABC/英文不含。
+_IME_OPTION_BLOCKING_KEYWORDS = (
+    "pinyin", "scim", "tcim",          # 拼音（简/繁）
+    "cangjie", "wubi", "sucheng",      # 仓颉/五笔/速成
+    "jianyi", "zhuyin", "bopomofo",    # 简易/注音
+)
+
+
+def get_ime_source():
+    """当前键盘输入源（如 com.apple.keylayout.PinyinKeyboard），读不到返回 None。"""
+    try:
+        r = subprocess.run(
+            ["defaults", "read", "com.apple.HIToolbox",
+             "AppleCurrentKeyboardLayoutInputSourceID"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def ime_blocks_option_shortcuts(ime_source):
+    """中文等 CJK 输入法激活时，⌥+字母 组合在输入法层被消费，合成键盘事件
+    （cliclick / CGEventPost）永远到不了应用，⌘⇧ 组合不受影响。
+    2026-08-27 实测：SCIM 拼音下 ⇧⌘O 可打开剪藏器、⌥⇧O 无任何响应。"""
+    if not ime_source:
+        return False
+    src = ime_source.lower()
+    return any(k in src for k in _IME_OPTION_BLOCKING_KEYWORDS)
+
+
+def read_chrome_profile_info(chrome_dir=None):
+    """读 Local State 返回当前激活 Profile：{dir, name, user}。
+
+    Chrome 的扩展/快捷键按 Profile 隔离，自动化标签页落在激活 Profile 上
+    （AppleScript open/make tab 都作用于当前 Profile 的窗口），预检必须
+    读激活 Profile 而非 Default。读不到返回 {}（调用方降级处理）。
+    """
+    base = Path(chrome_dir) if chrome_dir else CHROME_USER_DIR
+    try:
+        data = json.loads((base / "Local State").read_text())
+    except Exception:
+        return {}
+    profiles = data.get("profile", {})
+    last_used = profiles.get("last_used") or "Default"
+    info = profiles.get("info_cache", {}).get(last_used, {})
+    return {
+        "dir": last_used,
+        "name": info.get("name", ""),
+        "user": info.get("user_name", ""),
+    }
+
+
+def read_web_clipper_status(profile_dir, chrome_dir=None):
+    """读指定 Profile 的 Secure Preferences，返回 Web Clipper 状态：
+    {installed, enabled, version, commands: {命令名: 快捷键}}。
+
+    enabled 判定：state 缺省视为启用（Chrome 只在禁用时写 state=0），
+    且 disable_reasons 为空。文件不可读/无记录 → installed=False。
+    """
+    empty = {"installed": False, "enabled": False, "version": None, "commands": {}}
+    base = Path(chrome_dir) if chrome_dir else CHROME_USER_DIR
+    try:
+        data = json.loads((base / str(profile_dir) / "Secure Preferences").read_text())
+    except Exception:
+        return dict(empty)
+    ext = data.get("extensions", {}).get("settings", {}).get(WEB_CLIPPER_EXT_ID)
+    if not isinstance(ext, dict):
+        return dict(empty)
+    commands = {}
+    for name, cmd in (ext.get("commands") or {}).items():
+        key = cmd.get("suggested_key")
+        if isinstance(key, dict):
+            # manifest 建议键形式 {"default": ..., "mac": ...}
+            commands[name] = key.get("mac") or key.get("default") or ""
+        else:
+            # 字符串形式：用户在 chrome://extensions/shortcuts 自定义绑定后
+            # Chrome 会把实际绑定直接写成字符串（真实 Profile 实测）
+            commands[name] = key or ""
+    enabled = ext.get("state") in (None, 1) and not ext.get("disable_reasons")
+    return {
+        "installed": True,
+        "enabled": enabled,
+        "version": (ext.get("manifest") or {}).get("version"),
+        "commands": commands,
+    }
+
+
+# 参与漂移对比的键（time 刻意排除——每次运行必然变化，无信号）
+_SNAPSHOT_DIFF_KEYS = (
+    "chrome_profile_dir", "chrome_profile_name", "chrome_profile_user",
+    "clipper_installed", "clipper_enabled", "clipper_version",
+    "ime_source",
+)
+
+
+def environment_snapshot(chrome_dir=None):
+    """采集一次环境快照（各子项失败不抛异常，值为 None）。"""
+    prof = read_chrome_profile_info(chrome_dir)
+    snap = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "ime_source": get_ime_source(),
+        "chrome_profile_dir": prof.get("dir"),
+        "chrome_profile_name": prof.get("name"),
+        "chrome_profile_user": prof.get("user"),
+    }
+    if prof:
+        clip = read_web_clipper_status(prof["dir"], chrome_dir)
+        snap.update({
+            "clipper_installed": clip["installed"],
+            "clipper_enabled": clip["enabled"],
+            "clipper_version": clip["version"],
+        })
+    else:
+        snap.update({"clipper_installed": None, "clipper_enabled": None,
+                     "clipper_version": None})
+    return snap
+
+
+def diff_snapshots(old, new):
+    """对比两次快照，返回人读的漂移描述列表（旧快照为空 → 无漂移）。"""
+    if not old:
+        return []
+    return [
+        f"{k}: {old.get(k)!r} → {new.get(k)!r}"
+        for k in _SNAPSHOT_DIFF_KEYS
+        if old.get(k) != new.get(k)
+    ]
+
+
+def save_snapshot_and_report_drift(snapshot_path=None, chrome_dir=None):
+    """落盘新快照并与上一份对比。返回 (drifts, snapshot)。
+
+    快照写失败不影响主流程（best effort）；首次运行（无旧快照）drifts 为空。
+    """
+    path = Path(snapshot_path) if snapshot_path else SNAPSHOT_FILE
+    old = {}
+    try:
+        old = json.loads(path.read_text())
+    except Exception:
+        pass
+    new = environment_snapshot(chrome_dir)
+    try:
+        # 原子写：先写 tmp 再 os.replace。直接 write_text 若被中断（崩溃/掉电），
+        # 会留下空/半截文件，下次运行读到坏 JSON → 当作"首次"→ 漂移基线静默重置。
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(new, ensure_ascii=False, indent=1))
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return diff_snapshots(old, new), new
+
+
 # ==================== AppleScript ====================
 
 def get_kb_window_title(kb_name: str = "") -> str:

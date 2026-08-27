@@ -54,6 +54,10 @@ python3 ima_obsidian_saver.py --des AI
 python3 ima_obsidian_saver.py --browser safari
 ```
 
+> **输入法提示**：中文等 CJK 输入法会拦截 ⌥+字母 组合，quick 模式（⌥⇧O）
+> 的按键到不了扩展——交互式运行请加 `--mode clipper`（⌘⇧O+弹窗确认，预检
+> 也会在 quick 模式下直接拦截并提示）。定时任务已默认 clipper 模式。
+
 ---
 
 ## 技术栈

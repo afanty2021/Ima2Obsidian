@@ -68,9 +68,52 @@
 
 ---
 
+## 环境预检与漂移预警（2026-08-27 新增）
+
+背景：2026-08-12 换 Chrome 登录账号后自动化标签页落到新 Profile（扩展不在那里），加上中文输入法拦截 ⌥ 组合键，保存器 0 落盘且 rc=0 无声，**静默失败 15 天**。为此引入三道防线：
+
+### 1. 启动预检（saver `preflight_clipper_env`，fail-closed）
+
+实跑前显式断言环境前提，任何硬性缺失直接终止并给出修复提示：
+
+| 检查项 | 判定 | 修复提示 |
+|---|---|---|
+| 激活 Profile 装有 Web Clipper | 读 `Local State` → `Secure Preferences` | 在**该 Profile** 重装扩展（扩展按 Profile 隔离） |
+| 扩展已启用 | `state≠0` 且无 `disable_reasons` | chrome://extensions 开启 |
+| 快捷键已绑定且键位一致 | clipper 模式查 `_execute_action`，quick 模式查 `quick_clip`，且与 saver 实际发送的键位（Command+Shift+O / Alt+Shift+O，由常量推导）比对 | chrome://extensions/shortcuts 改回键位，或同步修改 saver 常量 |
+| 输入法兼容 | quick 模式 + 中文输入法 → **fail-closed**（⌥+字母 被输入法层拦截，按键永远到不了扩展） | 改用 `--mode clipper`（⌘⇧O 不受影响） |
+
+`--skip-preflight` 可强制跳过；dry-run 只提示不阻断。Local State 读不到时仅警告放行。
+
+### 2. 弹窗回执 + AX 优先（clipper 模式 `trigger_clipper_with_receipt`）
+
+旧流程是"热键 fire-and-forget + 25s 文件轮询"，命令层没响应也要空等。新流程：
+
+1. 触发 ⇧⌘O 前记 Chrome 窗口基线，触发后轮询 `list_windows`（窗口层，不受 Chromium 渲染器 AX 按需开启影响）等待**新弹窗窗口**出现——命令层回执；
+2. 弹窗出现后优先 **AX 点击** 'Add to Obsidian'（cua-driver element_index，语义动作）；
+3. AX 树不含按钮（Chromium 常态：渲染器 AX 超时关闭，常只回菜单栏）→ 回退回车键（弹窗默认按钮即 Add，2026-08-27 实测可落盘）；
+4. 弹窗未出现 → **快速失败**（跳过 25s 轮询），签名 `popup_missing`。
+
+### 3. 同签名熔断（`ConsecutiveFailureBreaker`，阈值 3）
+
+同一失败签名连续 3 次说明是系统性环境故障而非单篇问题（扩展被禁用/输入法拦截/击键被 TCC 丢弃），熔断剩余批次并按签名打印排查指引——2026-08 曾一天 94 篇 × ~90s 全失败空转 1.5 小时。签名：`popup_missing`（命令层未响应）/ `file_not_found`（触发成功但未落盘）/ `exception`。成功或 deleted 重置计数。
+
+### 4. 环境漂移快照（incremental 主流程，`ima_common.environment_snapshot`）
+
+每次增量更新把 `{激活 Profile, 扩展版本/启用, 输入法}` 写入 `environment_snapshot.json`（已 gitignore），与上一份对比，漂移当天在日志告警：
+
+```
+⚠️  环境漂移（自动化前提可能失效，今日保存异常请优先排查此项）:
+     chrome_profile_dir: 'Default' → 'Profile 1'
+```
+
+2026-08 的两个根因（换 Profile、输入法拦截）有此快照均可在发生当天暴露。
+
+---
+
 ## Web Clipper 自动化依赖
 
-`save_one_article` 通过模拟 Option+Shift+O 快捷键触发 Chrome 的 Obsidian Web Clipper 扩展。该机制有 **双层 TCC 要求**（缺一不可）：
+`save_one_article` 通过模拟快捷键触发 Chrome 的 Obsidian Web Clipper 扩展（quick 模式 Option+Shift+O / clipper 模式 Cmd+Shift+O，见上节）。该机制有 **双层 TCC 要求**（缺一不可）：
 
 ### 1. cliclick 二进制（PR #7）
 

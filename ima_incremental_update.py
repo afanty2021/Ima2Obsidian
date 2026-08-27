@@ -26,6 +26,7 @@ from pathlib import Path
 # 导入公共模块
 from ima_common import (
     CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running,
+    save_snapshot_and_report_drift,
     get_ima_main_window, ensure_appnap_disabled,
 )
 
@@ -639,7 +640,7 @@ def save_to_obsidian(
     """
     调用 Obsidian 保存器（行级实时透传 saver 输出，避免长时间无输出被误判"卡死"）
 
-    返回统计信息: {saved, failed}
+    返回统计信息: {saved, failed, started}
     """
     log(f"\n{'─'*40}")
     log(f"保存到 Obsidian...")
@@ -656,6 +657,9 @@ def save_to_obsidian(
         "-u",  # 禁用输出缓冲，配合下面的行级透传实时显示保存进度
         Path(__file__).parent / "ima_obsidian_saver.py",
         "--limit", "1000",  # 每次最多保存 1000 篇
+        # quick 模式的 ⌥⇧O 会被中文输入法(SCIM)拦截，⌥组合键永远到不了扩展；
+        # clipper 模式(⌘⇧O+回车)不受输入法影响，2026-08-27 实测验证可落盘
+        "--mode", "clipper",
     ]
 
     # 指定知识库：只保存该 KB 的文章，并存入对应文件夹（避免不同 KB 混入同一文件夹）
@@ -942,6 +946,19 @@ def main():
             log(f"   请先运行: python3 migrate_normalize_urls.py")
             sys.exit(1)
         log("✅ URL 规范化自检通过")
+
+    # 环境漂移快照：Profile/扩展/输入法任一变化都意味着自动化前提可能失效。
+    # 背景：2026-08-12 换 Chrome 账号（扩展不在新 Profile）静默失败 15 天才被发现；
+    # 有快照后当天即会在日志中告警。首次运行只落盘基线，无漂移。
+    if not args.dry_run:
+        drifts, snap = save_snapshot_and_report_drift()
+        if drifts:
+            log("⚠️  环境漂移（自动化前提可能失效，今日保存异常请优先排查此项）:")
+            for d in drifts:
+                log(f"     {d}")
+        else:
+            log(f"✅ 环境快照无漂移: Profile='{snap.get('chrome_profile_name')}' "
+                f"扩展=v{snap.get('clipper_version')} 输入法={snap.get('ime_source')}")
 
     # caffeinate 保活：防止屏幕休眠致 AX 0 元素（8/5 故障根因——屏幕在启动后 6s 熄灭，
     # 全部 KB 导航和 URL 提取均因窗口未渲染失败）。-d 阻止 display sleep assertion，

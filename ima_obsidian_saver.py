@@ -51,7 +51,12 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import requests
 
-from ima_common import DB_FILE, init_database, now_saved_at, ensure_appnap_disabled, find_cliclick
+from ima_common import (
+    DB_FILE, init_database, now_saved_at, ensure_appnap_disabled, find_cliclick,
+    run_cua, get_ime_source, ime_blocks_option_shortcuts,
+    read_chrome_profile_info, read_web_clipper_status,
+    CUA_DRIVER, is_daemon_running,
+)
 
 
 # ==================== 配置 ====================
@@ -78,6 +83,17 @@ WAIT_CLIP_SAVE = 4.0       # 触发 quick_clip 后起步等待（首次轮询前
 WAIT_CLIP_TOTAL = 25.0     # 轮询等待文件落盘的总预算（修夜间慢盘时序竞争；交互式秒回）
 WAIT_CLIP_POLL = 1.5       # 落盘轮询间隔
 WAIT_CLOSE_TAB = 1.0
+
+# ---- clipper 模式弹窗回执 + 同签名熔断（CUA observe→act→verify 理念落地）----
+# 10s 而非 6s：Chrome 刚被 ensure_chrome_js_enabled 重启/冷启动时，扩展弹窗
+# 首次弹出偏慢（service worker 冷唤醒），过紧会在批前几篇误触发熔断
+WAIT_POPUP_APPEAR = 10.0    # 触发 ⇧⌘O 后等待剪藏器弹窗「窗口」出现的超时（秒）
+WAIT_POPUP_POLL = 0.5       # 弹窗窗口轮询间隔
+CONSECUTIVE_FAIL_ABORT = 3  # 同签名连续失败熔断阈值（跳过剩余批次，避免整批空转）
+
+# 弹窗确认按钮的匹配标签（小写子串匹配）。扩展弹窗 UI 目前为英文；若未来本地化，
+# 在此追加对应语言标签即可（匹配不到时已有回车键兜底，不会中断流程）
+ADD_BUTTON_LABELS = ("add to obsidian",)
 WAIT_BETWEEN = 1.5
 
 DEFAULT_LIMIT = 1300
@@ -547,9 +563,301 @@ def trigger_quick_clip(mods: list):
 
 
 def trigger_clipper_and_save(mods: list):
+    """非 Chrome 浏览器的 clipper 降级路径：热键 + 固定等待 + 回车（无回执）。"""
     send_keystroke(CLIPPER_KEY, CLIPPER_MODS)
     time.sleep(2.0)
     send_keystroke("return", [])
+
+
+# 最近一次失败签名（save_one_article 各失败路径写入，主循环熔断读取）：
+#   popup_missing  = 剪藏器弹窗未出现（快捷键/扩展/击键送达问题）
+#   file_not_found = 触发成功但 Vault 未落盘（Obsidian/Clipper 连接问题）
+#   exception      = 未预期异常（main 的 except 分支写入）
+_LAST_FAILURE_SIGNATURE = "unknown"
+
+
+def _cua_call(tool, params, timeout=15):
+    """cua-driver 调用 → dict | None。
+
+    空 stdout 且 exit 0 视为成功（{}）；超时/非零退出/坏 JSON 返回 None，
+    不抛异常（沿用提取器 run_cua_call 的容错口径，单次失败只降级不中断）。
+    """
+    try:
+        out = run_cua(["call", tool, json.dumps(params)], timeout=timeout)
+    except Exception as e:
+        print(f"    ⚠️ cua-driver {tool} 失败: {e}", flush=True)
+        return None
+    out = (out or "").strip()
+    if not out:
+        return {}
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+def _chrome_windows():
+    """list_windows → Chrome 窗口列表（跳过缺 window_id 的异常条目）。
+
+    list_windows 走窗口层（CGWindow）不遍历 AX 树，不受 Chromium 渲染器
+    AX「按需开启、超时关闭」的影响（get_window_state 常只回菜单栏元素），
+    所以弹窗回执以「窗口集合的增删」判定，稳定可靠。
+    """
+    try:
+        data = json.loads(run_cua(["list_windows"], timeout=10))
+    except Exception:
+        return []
+    out = []
+    for w in data.get("windows", []):
+        if "chrome" not in str(w.get("app_name", "")).lower():
+            continue
+        if w.get("window_id") is None or w.get("pid") is None:
+            continue  # 缺关键字段的脏条目，跳过避免下标崩溃
+        out.append(w)
+    return out
+
+
+def _find_clipper_popup(baseline_ids):
+    """在 Chrome 窗口中找剪藏器弹窗：基线之外新出现的窄窗口（实测约 364×554）。"""
+    for w in _chrome_windows():
+        if w["window_id"] in baseline_ids:
+            continue
+        b = w.get("bounds") or {}
+        if 150 <= b.get("width", 0) <= 700:
+            return w
+    return None
+
+
+def _ax_press_add_button(popup_win):
+    """AX 路径点击弹窗里的确认按钮（语义动作优先于回车键）。
+
+    标签按 ADD_BUTTON_LABELS 小写子串匹配（扩展 UI 本地化时追加常量即可）；
+    Chromium 渲染器 AX 按需开启——弹窗树可能为空或只回菜单栏，找不到按钮
+    时返回 False，由调用方回退回车键（弹窗默认按钮即 Add，实测可落盘）。
+    """
+    pid, window_id = popup_win.get("pid"), popup_win.get("window_id")
+    if pid is None or window_id is None:
+        return False
+    st = _cua_call("get_window_state",
+                   {"pid": pid, "window_id": window_id,
+                    "include_screenshot": False})
+    for el in (st or {}).get("elements", []):
+        label = str(el.get("label", "")).lower()
+        if (any(t in label for t in ADD_BUTTON_LABELS)
+                and "Button" in str(el.get("role", ""))):
+            clicked = _cua_call("click", {
+                "pid": pid, "window_id": window_id,
+                "element_index": el["element_index"],
+            })
+            return clicked is not None
+    return False
+
+
+def trigger_clipper_with_receipt():
+    """clipper 模式触发（⇧⌘O），带命令层回执（CUA observe→act→verify）：
+
+    1. 触发前记 Chrome 窗口基线，触发后轮询「新弹窗窗口」出现 → 命令已送达扩展；
+    2. 弹窗出现后优先 AX 点击 'Add to Obsidian'（语义动作）；
+    3. AX 树不含按钮（Chromium 常态）→ 回退回车键（默认按钮，2026-08-27 实测落盘）。
+
+    Returns:
+      True  = 保存动作已触发，调用方继续轮询落盘；
+      False = 弹窗未出现（快捷键未注册/扩展未响应/击键被 TCC 或输入法拦截），
+              写 _LAST_FAILURE_SIGNATURE='popup_missing'，调用方快速失败。
+    """
+    global _LAST_FAILURE_SIGNATURE
+
+    baseline = {w["window_id"] for w in _chrome_windows()}
+    send_keystroke(CLIPPER_KEY, CLIPPER_MODS)
+
+    popup = None
+    deadline = time.time() + WAIT_POPUP_APPEAR
+    while time.time() < deadline:
+        popup = _find_clipper_popup(baseline)
+        if popup:
+            break
+        time.sleep(WAIT_POPUP_POLL)
+
+    if not popup:
+        print(f"    ❌ 剪藏器弹窗 {WAIT_POPUP_APPEAR:g}s 内未出现——"
+              f"快捷键未注册 / 扩展未响应 / 击键未送达")
+        return False
+
+    print(f"    ✅ 剪藏器弹窗已出现（window {popup['window_id']}）")
+    if _ax_press_add_button(popup):
+        print("    ✅ 已 AX 点击 'Add to Obsidian'")
+    else:
+        print("    ⚠️ AX 树不含按钮（Chromium 渲染器 AX 按需开启），回退回车键确认")
+        time.sleep(1.5)
+        send_keystroke("return", [])
+    return True
+
+
+class ConsecutiveFailureBreaker:
+    """同签名连续失败熔断器（CUA「绝不盲目重放」的批处理版）。
+
+    同一失败签名连续达到 threshold 次说明是系统性环境故障而非单篇问题
+    （扩展被禁用/输入法拦截/击键被 TCC 丢弃），继续重试只会空转——
+    2026-08 曾一天 94 篇 × ~90s 全失败重试 1.5 小时才被发现。
+    """
+
+    def __init__(self, threshold=CONSECUTIVE_FAIL_ABORT):
+        self.threshold = threshold
+        self._sig = None
+        self._count = 0
+
+    def record_success(self):
+        """成功（或 deleted 这类确定性结局）重置计数。"""
+        self._sig = None
+        self._count = 0
+
+    def record_failure(self, signature):
+        """记录一次失败，返回是否应熔断（True=停止处理剩余文章）。"""
+        if signature == self._sig:
+            self._count += 1
+        else:
+            self._sig = signature
+            self._count = 1
+        return self._count >= self.threshold
+
+
+def _print_failure_remediation(signature):
+    """熔断时按失败签名给出可执行的排查指引（快速失败 + 可诊断）。"""
+    hints = {
+        "popup_missing": (
+            "弹窗未出现 → 检查 chrome://extensions/shortcuts 快捷键绑定、"
+            "chrome://extensions 扩展启用状态；\n"
+            "      launchd 运行还需确认 /opt/homebrew/bin/cliclick 在「系统设置→隐私与安全性→辅助功能」\n"
+            "      白名单内（TCC 拒绝时 cliclick rc=0 但事件被静默丢弃）"
+        ),
+        "file_not_found": (
+            "保存动作已触发但 Vault 未落盘 → 检查 Obsidian 是否运行并打开目标 Vault、\n"
+            "      剪藏器弹窗 Settings 中 Vault 连接是否指向本机 Vault"
+        ),
+        "exception": "查看上方错误信息",
+    }
+    print(f"      {hints.get(signature, '检查上方日志')}", flush=True)
+
+
+# Chrome Secure Preferences 里修饰键的存储名（saver 常量 → chrome://extensions/
+# shortcuts 显示名）：command→Command，option/alt→Alt（Chrome 在 mac 上称 Alt）
+_CHROME_MOD_NAME = {"command": "Command", "cmd": "Command",
+                    "option": "Alt", "alt": "Alt",
+                    "ctrl": "Ctrl", "control": "Ctrl", "shift": "Shift"}
+
+
+def _expected_chrome_binding(mods, key):
+    """由 saver 实际发送的修饰键/主键推导 Chrome 里应绑定的键位串。
+
+    键位比对必须从发送常量推导（单一事实来源）：改 saver 快捷键常量时期望值
+    自动跟随，不会出现"saver 发 ⌘⇧O、预检却断言 ⌃⌘O"的口径漂移。
+    """
+    parts = [_CHROME_MOD_NAME.get(str(m).lower(), str(m).capitalize()) for m in mods]
+    parts.append(str(key).upper())
+    return "+".join(parts)
+
+
+def _ensure_daemon_for_receipt():
+    """确保 cua-driver daemon 运行（clipper 弹窗回执的 list_windows 依赖它）。
+
+    增量更新流程调 saver 前已 ensure_daemon；单独跑 saver 时 daemon 可能没起，
+    不处理的话每篇要白等 ~WAIT_POPUP_APPEAR 秒弹窗超时才发现。best-effort
+    拉起并轮询确认；拉不起来返回 False（预检 fail-closed 处理）。
+    """
+    if is_daemon_running():
+        return True
+    print("⚠️ cua-driver daemon 未运行，尝试拉起...", flush=True)
+    try:
+        subprocess.Popen(
+            [CUA_DRIVER, "serve"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        print(f"❌ 拉起 daemon 失败: {e}", flush=True)
+        return False
+    for _ in range(8):
+        time.sleep(1)
+        if is_daemon_running():
+            print("✅ cua-driver daemon 已拉起", flush=True)
+            return True
+    return False
+
+
+def preflight_clipper_env(browser_app, mode, chrome_dir=None):
+    """保存前环境预检（fail-closed）：扩展安装/启用/快捷键注册/输入法兼容。
+
+    背景（2026-08）：换 Chrome 登录账号后扩展不在激活 Profile、quick_clip 的
+    ⌥ 组合被中文输入法拦截——两类故障都让保存 0 落盘且 rc=0 无声，静默了两周。
+    预检把环境前提变成显式断言：读得到前提但缺失 → False（main 终止），
+    附带可执行修复提示；Local State 读不到（Chrome 未装等罕见场景）仅警告放行。
+
+    Returns:
+      True  = 预检通过（或无法检查但已警告）
+      False = 存在硬性缺失，继续跑必然全失败
+    """
+    ok = True
+
+    # cua-driver daemon：clipper 弹窗回执（list_windows 窗口基线/轮询）硬依赖它。
+    # daemon 未起时每篇要白等 ~WAIT_POPUP_APPEAR 秒弹窗超时才失败，预检阶段拦下。
+    if mode == "clipper" and "Chrome" in browser_app:
+        if not _ensure_daemon_for_receipt():
+            print("❌ 预检失败：cua-driver daemon 未运行且自动拉起失败，"
+                  "弹窗回执依赖它", flush=True)
+            print("   手动启动: cua-driver serve &", flush=True)
+            ok = False
+        else:
+            print("✅ 预检：cua-driver daemon 运行中", flush=True)
+
+    if "Chrome" in browser_app:
+        prof = read_chrome_profile_info(chrome_dir)
+        if not prof:
+            print("⚠️ 无法读取 Chrome Profile 信息（Local State），跳过扩展预检", flush=True)
+        else:
+            desc = f"Profile '{prof['name']}'({prof['dir']})"
+            clip = read_web_clipper_status(prof["dir"], chrome_dir)
+            if not clip["installed"]:
+                print(f"❌ 预检失败：当前激活 {desc} 未安装 Obsidian Web Clipper", flush=True)
+                print("   扩展按 Profile 隔离，装在其他 Profile 无效（2026-08-12 换账号后", flush=True)
+                print("   即因扩展不在激活 Profile 静默失败 15 天）。请在【该 Profile 的窗口】重装：", flush=True)
+                print("   https://chromewebstore.google.com/detail/obsidian-web-clipper/", flush=True)
+                ok = False
+            elif not clip["enabled"]:
+                print(f"❌ 预检失败：{desc} 的 Web Clipper 已安装但未启用", flush=True)
+                print("   打开 chrome://extensions 开启该扩展", flush=True)
+                ok = False
+            else:
+                cmd_key = "_execute_action" if mode == "clipper" else "quick_clip"
+                binding = clip["commands"].get(cmd_key, "")
+                expected = (_expected_chrome_binding(CLIPPER_MODS, CLIPPER_KEY)
+                            if mode == "clipper"
+                            else _expected_chrome_binding(["option", "shift"], QUICK_CLIP_KEY))
+                if not binding:
+                    print(f"❌ 预检失败：{desc} 未绑定 '{cmd_key}' 快捷键", flush=True)
+                    print("   打开 chrome://extensions/shortcuts 重新绑定", flush=True)
+                    ok = False
+                elif binding != expected:
+                    # 键位被改绑：保存器仍按常量发送旧键位 → 每篇 popup_missing，
+                    # 熔断虽能 3 篇止损但当天批次已烧掉，预检阶段直接拦下
+                    print(f"❌ 预检失败：{desc} 的 '{cmd_key}' 键位为 {binding}，"
+                          f"但保存器发送的是 {expected}", flush=True)
+                    print("   打开 chrome://extensions/shortcuts 改回键位，"
+                          "或同步修改 saver 的快捷键常量", flush=True)
+                    ok = False
+                else:
+                    print(f"✅ 预检：{desc} Web Clipper v{clip['version']}，"
+                          f"{cmd_key}={binding}", flush=True)
+
+    ime = get_ime_source()
+    if mode == "quick" and ime_blocks_option_shortcuts(ime):
+        print(f"❌ 预检失败：当前输入法 {ime} 会拦截 ⌥+字母 组合，", flush=True)
+        print("   quick 模式(⌥⇧O)的按键永远到不了扩展。请改用 --mode clipper"
+              "（⌘⇧O 不受输入法影响）", flush=True)
+        ok = False
+    else:
+        print(f"ℹ️  输入法: {ime or '未知'}", flush=True)
+
+    return ok
 
 
 # ==================== 微信验证页检测 ====================
@@ -622,19 +930,22 @@ def ensure_chrome_js_enabled(browser_app: str = "Google Chrome") -> bool:
 
     print("✅ Chrome JavaScript 已开启（Chrome 正在重启）")
 
-    # 等待 Chrome 重启，重新创建窗口并验证
-    time.sleep(5)
+    # 等待 Chrome 重启（带标签页恢复时可能 >7s，单次验证会误判失败），重新创建窗口并验证
     try:
         subprocess.run(
             ["osascript", "-e", f'tell application "{browser_app}" to make new window'],
             capture_output=True, text=True, timeout=5,
         )
-        time.sleep(2)
-        r = subprocess.run(["osascript", "-e", test_script],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            print("✅ 验证通过：Chrome JS 执行正常")
-            return True
+        for i in range(5):
+            time.sleep(5)
+            try:
+                r = subprocess.run(["osascript", "-e", test_script],
+                                   capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    print(f"✅ 验证通过：Chrome JS 执行正常（第 {i + 1} 轮）")
+                    return True
+            except Exception:
+                pass
         print(f"⚠️  开启后验证仍失败: {(r.stderr or r.stdout).strip()}")
         return False
     except Exception as e:
@@ -1098,6 +1409,9 @@ def save_one_article(
     - 'deleted'：永久不可恢复页（发布者删除/违规不可查看/账号屏蔽），date_str=None（调用方调 mark_deleted）
     调用方据 status 分流：saved→mark_saved，deleted→mark_deleted，failed→仅计数。
     """
+    global _LAST_FAILURE_SIGNATURE
+    _LAST_FAILURE_SIGNATURE = "unknown"
+
     url = article["url"]
     title = article.get("title", "Unknown") or "Unknown"
     browser_app = browser_config["app"]
@@ -1186,6 +1500,14 @@ def save_one_article(
         # 返回其他值或 <empty>，则 A5 成立（GUI session 隔离）。
         print(f"    [诊断] quick_clip 触发时前台应用={get_frontmost_app()!r}", flush=True)
         trigger_quick_clip(shortcut_mods)
+    elif "Chrome" in browser_app:
+        print(f"    触发 clipper (Cmd+Shift+{CLIPPER_KEY})...")
+        if not trigger_clipper_with_receipt():
+            # 弹窗未出现：命令层未响应，文件轮询必然空等，快速失败止损
+            _LAST_FAILURE_SIGNATURE = "popup_missing"
+            close_tab(browser_app)
+            time.sleep(WAIT_CLOSE_TAB)
+            return "failed", None
     else:
         print(f"    触发 clipper (Cmd+Shift+{CLIPPER_KEY})...")
         trigger_clipper_and_save(shortcut_mods)
@@ -1209,6 +1531,7 @@ def save_one_article(
     if not renamed:
         folder_info = f"{target_folder}/" if target_folder else ""
         print(f"    ⚠️  未找到保存的文件，可能需要手动移动到: {folder_info}{date_str} {sanitize_filename(title)}.md")
+        _LAST_FAILURE_SIGNATURE = "file_not_found"
 
     # 5. 关闭标签页（尝试后台关闭，不激活浏览器）
     close_tab(browser_app)
@@ -1241,6 +1564,8 @@ def main():
                         help="只保存指定知识库的文章（避免不同 KB 混入同一文件夹）")
     parser.add_argument("--skip-reclaim", action="store_true",
                         help="跳过启动时 reclaim（由增量更新流程用于避免重复扫描）")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="跳过环境预检（扩展安装/启用/快捷键/输入法）")
     args = parser.parse_args()
 
     browser_config = BROWSERS[args.browser]
@@ -1271,6 +1596,15 @@ def main():
     if not args.dry_run:
         if not ensure_chrome_js_enabled(browser_app):
             print("❌ Chrome JS 执行不可用，保存将全部失败，终止。", file=sys.stderr)
+            sys.exit(1)
+
+    # 环境预检（fail-closed）：扩展安装/启用/快捷键注册/输入法兼容。
+    # dry-run 也执行（信息性输出）但仅在实跑时阻断；--skip-preflight 可强制跳过。
+    if not args.skip_preflight:
+        preflight_ok = preflight_clipper_env(browser_app, args.mode)
+        if preflight_ok is False and not args.dry_run:
+            print("❌ 环境预检未通过，继续跑必然全失败，终止。"
+                  "（修复后重试，或 --skip-preflight 强制运行）", file=sys.stderr)
             sys.exit(1)
 
     init_database()
@@ -1362,6 +1696,14 @@ def main():
     saved_count = 0
     failed_count = 0
     deleted_count = 0
+    aborted_by_breaker = False
+    breaker = ConsecutiveFailureBreaker()
+
+    def _abort_batch(sig):
+        """同签名连续失败熔断：打印指引并终止本批（剩余文章留待下次运行）。"""
+        print(f"\n⚠️  熔断：连续 {CONSECUTIVE_FAIL_ABORT} 篇同签名失败（{sig}），"
+              f"为系统性故障，跳过剩余文章")
+        _print_failure_remediation(sig)
 
     for i, article in enumerate(articles, 1):
         print(f"\n[{i}/{len(articles)}]", end=" ")
@@ -1375,25 +1717,36 @@ def main():
                     mark_saved(article["id"], published_date=date_str)
                 saved_count += 1
                 print(f"    ✅ 完成")
+                breaker.record_success()
             elif status == "deleted":
                 # 永久不可恢复页（发布者删除/违规/屏蔽）：永久跳过，不计 failed（避免触发上游告警）
                 if not args.dry_run:
                     mark_deleted(article["id"])
                 deleted_count += 1
                 print(f"    🗑️  已删除（标记 status='deleted' 永久跳过）")
+                breaker.record_success()  # 确定性结局，重置熔断计数
             else:  # failed
                 failed_count += 1
                 print(f"    ❌ 失败")
+                if breaker.record_failure(_LAST_FAILURE_SIGNATURE):
+                    aborted_by_breaker = True
+                    _abort_batch(_LAST_FAILURE_SIGNATURE)
+                    break
         except KeyboardInterrupt:
             print("\n\n⚠️  用户中断")
             break
         except Exception as e:
             failed_count += 1
             print(f"    ❌ 错误: {e}")
+            # 先关标签页再判熔断——熔断 break 后这篇的残留标签页无人清理
             try:
                 close_tab(browser_app)
             except Exception:
                 pass
+            if breaker.record_failure("exception"):
+                aborted_by_breaker = True
+                _abort_batch("exception")
+                break
 
         if i < len(articles):
             time.sleep(WAIT_BETWEEN)
@@ -1404,6 +1757,9 @@ def main():
     print("=" * 60)
     print(f"  本次成功: {saved_count} 篇")
     print(f"  本次失败: {failed_count} 篇")
+    if aborted_by_breaker:
+        print(f"  ⚠️  本批已熔断（连续 {CONSECUTIVE_FAIL_ABORT} 篇同签名失败），"
+              f"剩余文章留待修复环境后重试")
     print(f"  本次已删除: {deleted_count} 篇")
     print(f"  剩余待保存: {stats['unsaved']}")
     if stats.get("deleted"):

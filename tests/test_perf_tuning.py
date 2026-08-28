@@ -546,3 +546,63 @@ class TestAxReadyBudget:
         ok = inc.wait_for_ax_ready(min_elements=5, timeout=3)
         assert ok is True
         assert any(a[:2] == ["call", "bring_to_front"] for a in front_calls)
+
+
+class TestAxButtonPolling:
+    """弹窗按钮搜索须轮询等待 AX 就绪——"每轮第 1 篇必败"的根因修复回归。
+
+    Chromium 每轮首个弹窗 AX 树为空需 ~6s 开启（实测），一次探测即放弃会让
+    首篇走回车兜底且必然落盘失败（8/27、8/28 三天日志复现，与内容无关）。
+    """
+
+    def _popup(self):
+        return {"pid": 1, "window_id": 2}
+
+    def test_waits_until_button_appears(self, monkeypatch):
+        monkeypatch.setattr(saver, "WAIT_AX_BUTTONS", 5.0)
+        monkeypatch.setattr(saver.time, "sleep", lambda s: None)
+        probes = {"n": 0}
+        calls = []
+
+        def fake_cua(tool, params, timeout=15):
+            calls.append(tool)
+            if tool == "get_window_state":
+                probes["n"] += 1
+                if probes["n"] < 3:  # 前两轮：AX 未就绪，只有杂项元素
+                    return {"elements": [{"label": "Settings",
+                                          "role": "AXLink", "element_index": 1}]}
+                return {"elements": [{"label": "Add to Obsidian",
+                                      "role": "AXButton", "element_index": 7}]}
+            return {"ok": True}  # click
+
+        monkeypatch.setattr(saver, "_cua_call", fake_cua)
+        assert saver._ax_press_add_button(self._popup()) is True
+        assert probes["n"] == 3          # 空树被重试而非放弃
+        assert calls[-1] == "click"
+
+    def test_never_appearing_button_times_out(self, monkeypatch):
+        monkeypatch.setattr(saver, "WAIT_AX_BUTTONS", 0.4)
+        monkeypatch.setattr(saver.time, "sleep", lambda s: None)
+        probes = {"n": 0}
+
+        def fake_cua(tool, params, timeout=15):
+            if tool == "get_window_state":
+                probes["n"] += 1
+                return {"elements": []}
+            return {}
+
+        monkeypatch.setattr(saver, "_cua_call", fake_cua)
+        assert saver._ax_press_add_button(self._popup()) is False
+        assert probes["n"] >= 2          # 预算内多轮尝试后才交回车兜底
+
+    def test_missing_ids_short_circuits_before_polling(self):
+        """缺 pid/window_id 仍零探测短路（不烧预算）"""
+        calls = []
+
+        def fake_cua(tool, params, timeout=15):
+            calls.append(tool)
+            return {}
+
+        with patch.object(saver, "_cua_call", side_effect=fake_cua):
+            assert saver._ax_press_add_button({"pid": None, "window_id": None}) is False
+        assert calls == []

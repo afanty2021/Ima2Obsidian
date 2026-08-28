@@ -94,6 +94,9 @@ WAIT_CLOSE_TAB = 1.0
 # 首次弹出偏慢（service worker 冷唤醒），过紧会在批前几篇误触发熔断
 WAIT_POPUP_APPEAR = 10.0    # 触发 ⇧⌘O 后等待剪藏器弹窗「窗口」出现的超时（秒）
 WAIT_POPUP_POLL = 0.5       # 弹窗窗口轮询间隔
+WAIT_AX_BUTTONS = 8.0       # 弹窗 AX 按钮就绪等待：Chromium 每轮首个弹窗需数秒开启（实测 ~6s），
+                            # 一次探测即放弃会让"每轮第 1 篇"必然走回车且落盘失败（8/27-8/28 复现）
+WAIT_AX_BUTTONS_POLL = 0.5  # AX 按钮轮询间隔
 CONSECUTIVE_FAIL_ABORT = 3  # 同签名连续失败熔断阈值（跳过剩余批次，避免整批空转）
 
 # 弹窗确认按钮的匹配标签（小写子串匹配）。扩展弹窗 UI 目前为英文；若未来本地化，
@@ -637,26 +640,35 @@ def _find_clipper_popup(baseline_ids):
 def _ax_press_add_button(popup_win):
     """AX 路径点击弹窗里的确认按钮（语义动作优先于回车键）。
 
-    标签按 ADD_BUTTON_LABELS 小写子串匹配（扩展 UI 本地化时追加常量即可）；
-    Chromium 渲染器 AX 按需开启——弹窗树可能为空或只回菜单栏，找不到按钮
-    时返回 False，由调用方回退回车键（弹窗默认按钮即 Add，实测可落盘）。
+    标签按 ADD_BUTTON_LABELS 小写子串匹配（扩展 UI 本地化时追加常量即可）。
+    Chromium 渲染器 AX 按需开启：每轮批处理的**第 1 个弹窗**树为空、需数秒才
+    就绪（实测 ~6s）——此前"一次探测→立即回车"让每轮首篇必然落盘失败
+    （8/27-8/28 三天复现，与文章内容无关、纯位置问题）。现改为在
+    WAIT_AX_BUTTONS 预算内轮询；后续弹窗进程级 AX 已开启，首探即中零开销。
+    超时仍未出现按钮才交回车兜底。
+
+    返回 True=已点击；False=预算内未见按钮（或 pid/window_id 缺失）。
     """
     pid, window_id = popup_win.get("pid"), popup_win.get("window_id")
     if pid is None or window_id is None:
         return False
-    st = _cua_call("get_window_state",
-                   {"pid": pid, "window_id": window_id,
-                    "include_screenshot": False})
-    for el in (st or {}).get("elements", []):
-        label = str(el.get("label", "")).lower()
-        if (any(t in label for t in ADD_BUTTON_LABELS)
-                and "Button" in str(el.get("role", ""))):
-            clicked = _cua_call("click", {
-                "pid": pid, "window_id": window_id,
-                "element_index": el["element_index"],
-            })
-            return clicked is not None
-    return False
+    deadline = time.time() + WAIT_AX_BUTTONS
+    while True:
+        st = _cua_call("get_window_state",
+                       {"pid": pid, "window_id": window_id,
+                        "include_screenshot": False})
+        for el in (st or {}).get("elements", []):
+            label = str(el.get("label", "")).lower()
+            if (any(t in label for t in ADD_BUTTON_LABELS)
+                    and "Button" in str(el.get("role", ""))):
+                clicked = _cua_call("click", {
+                    "pid": pid, "window_id": window_id,
+                    "element_index": el["element_index"],
+                })
+                return clicked is not None
+        if time.time() >= deadline:
+            return False
+        time.sleep(WAIT_AX_BUTTONS_POLL)
 
 
 def trigger_clipper_with_receipt():
@@ -693,7 +705,7 @@ def trigger_clipper_with_receipt():
     if _ax_press_add_button(popup):
         print("    ✅ 已 AX 点击 'Add to Obsidian'")
     else:
-        print("    ⚠️ AX 树不含按钮（Chromium 渲染器 AX 按需开启），回退回车键确认")
+        print(f"    ⚠️ AX 树 {WAIT_AX_BUTTONS:g}s 内未出按钮（首个弹窗 AX 开启慢），回退回车键确认")
         time.sleep(1.5)
         send_keystroke("return", [])
     return True

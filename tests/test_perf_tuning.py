@@ -580,9 +580,14 @@ class TestAxButtonPolling:
         assert probes["n"] == 3          # 空树被重试而非放弃
         assert calls[-1] == "click"
 
-    def test_never_appearing_button_times_out(self, monkeypatch):
-        monkeypatch.setattr(saver, "WAIT_AX_BUTTONS", 0.4)
-        monkeypatch.setattr(saver.time, "sleep", lambda s: None)
+    def test_never_appearing_button_bounded_probes_fake_clock(self, monkeypatch):
+        """超时路径用假时钟精确钉住探测次数（旧版真时钟空转 ~11.8 万次、断言 >=2 过松）"""
+        monkeypatch.setattr(saver, "WAIT_AX_BUTTONS", 1.0)
+        # 时钟只在 sleep 时前进：deadline/started 等任意多次 time.time() 读取都是同刻度
+        clock = {"t": 0.0}
+        monkeypatch.setattr(saver.time, "time", lambda: clock["t"])
+        monkeypatch.setattr(saver.time, "sleep",
+                            lambda s: clock.__setitem__("t", clock["t"] + 0.35))
         probes = {"n": 0}
 
         def fake_cua(tool, params, timeout=15):
@@ -593,7 +598,25 @@ class TestAxButtonPolling:
 
         monkeypatch.setattr(saver, "_cua_call", fake_cua)
         assert saver._ax_press_add_button(self._popup()) is False
-        assert probes["n"] >= 2          # 预算内多轮尝试后才交回车兜底
+        assert probes["n"] == 4   # 检查点 0.35/0.70/1.05——第 4 轮探测后过 1.0s 预算退出
+
+    def test_hot_path_first_probe_hits_without_sleep(self, monkeypatch):
+        """热路径（AX 已开启，首探即中）：恰好 1 探测 + 1 点击、零 sleep 零额外延迟"""
+        sleeps = []
+        monkeypatch.setattr(saver.time, "sleep", lambda s: sleeps.append(s))
+        calls = []
+
+        def fake_cua(tool, params, timeout=15):
+            calls.append(tool)
+            if tool == "get_window_state":
+                return {"elements": [{"label": "Add to Obsidian",
+                                      "role": "AXButton", "element_index": 7}]}
+            return {"ok": True}
+
+        monkeypatch.setattr(saver, "_cua_call", fake_cua)
+        assert saver._ax_press_add_button(self._popup()) is True
+        assert calls == ["get_window_state", "click"]
+        assert sleeps == []
 
     def test_missing_ids_short_circuits_before_polling(self):
         """缺 pid/window_id 仍零探测短路（不烧预算）"""

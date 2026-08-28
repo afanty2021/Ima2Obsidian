@@ -94,8 +94,9 @@ WAIT_CLOSE_TAB = 1.0
 # 首次弹出偏慢（service worker 冷唤醒），过紧会在批前几篇误触发熔断
 WAIT_POPUP_APPEAR = 10.0    # 触发 ⇧⌘O 后等待剪藏器弹窗「窗口」出现的超时（秒）
 WAIT_POPUP_POLL = 0.5       # 弹窗窗口轮询间隔
-WAIT_AX_BUTTONS = 8.0       # 弹窗 AX 按钮就绪等待：Chromium 每轮首个弹窗需数秒开启（实测 ~6s），
-                            # 一次探测即放弃会让"每轮第 1 篇"必然走回车且落盘失败（8/27-8/28 复现）
+WAIT_AX_BUTTONS = 12.0      # 弹窗 AX 按钮就绪等待：Chromium 每轮首个弹窗需数秒开启（实测 ~6s），
+                            # 一次探测即放弃会让"每轮第 1 篇"必然走回车且落盘失败（8/27-8/28 复现）；
+                            # 12s 与 IMA 侧 wait_for_ax_ready 预算对齐，给冷缓存/繁忙机器留余量
 WAIT_AX_BUTTONS_POLL = 0.5  # AX 按钮轮询间隔
 CONSECUTIVE_FAIL_ABORT = 3  # 同签名连续失败熔断阈值（跳过剩余批次，避免整批空转）
 
@@ -653,6 +654,7 @@ def _ax_press_add_button(popup_win):
     if pid is None or window_id is None:
         return False
     deadline = time.time() + WAIT_AX_BUTTONS
+    started = time.time()
     while True:
         st = _cua_call("get_window_state",
                        {"pid": pid, "window_id": window_id,
@@ -661,6 +663,9 @@ def _ax_press_add_button(popup_win):
             label = str(el.get("label", "")).lower()
             if (any(t in label for t in ADD_BUTTON_LABELS)
                     and "Button" in str(el.get("role", ""))):
+                warmup = time.time() - started
+                if warmup > 1.5:  # 首个弹窗预热：记录真实分布，供调 WAIT_AX_BUTTONS 参考
+                    print(f"    ℹ️ AX 按钮等待 {warmup:.1f}s 就绪（首个弹窗预热）")
                 clicked = _cua_call("click", {
                     "pid": pid, "window_id": window_id,
                     "element_index": el["element_index"],
@@ -675,8 +680,10 @@ def trigger_clipper_with_receipt():
     """clipper 模式触发（⇧⌘O），带命令层回执（CUA observe→act→verify）：
 
     1. 触发前记 Chrome 窗口基线，触发后轮询「新弹窗窗口」出现 → 命令已送达扩展；
-    2. 弹窗出现后优先 AX 点击 'Add to Obsidian'（语义动作）；
-    3. AX 树不含按钮（Chromium 常态）→ 回退回车键（默认按钮，2026-08-27 实测落盘）。
+    2. 弹窗出现后优先 AX 点击 'Add to Obsidian'（语义动作）——按钮搜索在
+       WAIT_AX_BUTTONS 预算内轮询：Chromium 每轮**首个弹窗**的渲染器 AX 需数秒
+       开启（实测 ~6s），后续弹窗进程级已开启、首探即中；
+    3. 预算内未见按钮才回退回车键（最后手段）。
 
     Returns:
       True  = 保存动作已触发，调用方继续轮询落盘；
@@ -705,7 +712,7 @@ def trigger_clipper_with_receipt():
     if _ax_press_add_button(popup):
         print("    ✅ 已 AX 点击 'Add to Obsidian'")
     else:
-        print(f"    ⚠️ AX 树 {WAIT_AX_BUTTONS:g}s 内未出按钮（首个弹窗 AX 开启慢），回退回车键确认")
+        print(f"    ⚠️ AX 按钮 {WAIT_AX_BUTTONS:g}s 内未就绪，回退回车键确认")
         time.sleep(1.5)
         send_keystroke("return", [])
     return True

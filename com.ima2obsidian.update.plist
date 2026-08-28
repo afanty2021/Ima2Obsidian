@@ -53,6 +53,48 @@
             <key>Minute</key>
             <integer>10</integer>
         </dict>
+
+        <!-- 第二时槽：兜 16:10 逢显示器休眠/锁屏的失败（增量幂等，空跑无害） -->
+        <dict>
+            <key>Weekday</key>
+            <integer>1</integer>
+            <key>Hour</key>
+            <integer>17</integer>
+            <key>Minute</key>
+            <integer>10</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>2</integer>
+            <key>Hour</key>
+            <integer>17</integer>
+            <key>Minute</key>
+            <integer>10</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>3</integer>
+            <key>Hour</key>
+            <integer>17</integer>
+            <key>Minute</key>
+            <integer>10</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>4</integer>
+            <key>Hour</key>
+            <integer>17</integer>
+            <key>Minute</key>
+            <integer>10</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>5</integer>
+            <key>Hour</key>
+            <integer>17</integer>
+            <key>Minute</key>
+            <integer>10</integer>
+        </dict>
     </array>
 
     <key>StandardOutPath</key>

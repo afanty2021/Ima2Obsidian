@@ -41,7 +41,6 @@
 | `WAIT_POPUP_APPEAR` | 10.0s | 剪藏器弹窗窗口出现等待超时（超时即 popup_missing 快速失败） |
 | `WAIT_AX_BUTTONS` | 12.0s | 弹窗 AX 按钮就绪轮询预算（每轮首个弹窗预热实测 ~6s，12s 与 IMA 侧对齐） |
 | `WAIT_CLIP_SAVE` | 1.0s | 落盘首轮轮询前起步间隔；半成品由 `_file_write_settled` 双采样防护 |
-| `WAIT_FILE_APPEAR` | 2.0s | 文件出现等待时间 |
 | `DEFAULT_LIMIT` | 1300 | 每次最多处理文章数 |
 
 ### 性能调优（2026-08-27）
@@ -106,7 +105,7 @@
 
 1. 触发 ⇧⌘O 前记 Chrome 窗口基线，触发后轮询 `list_windows`（窗口层，不受 Chromium 渲染器 AX 按需开启影响）等待**新弹窗窗口**出现——命令层回执；
 2. 弹窗出现后优先 **AX 点击** 'Add to Obsidian'（cua-driver element_index，语义动作）——按钮搜索在 `WAIT_AX_BUTTONS` 预算内轮询：Chromium 每轮**首个弹窗**的渲染器 AX 需数秒开启（实测 ~6s，超 1.5s 会在日志记录实际预热时长），后续弹窗首探即中零开销；
-3. 预算内未见按钮才回退回车键（最后手段）；
+3. AX 点击未完成（预算内未见按钮 / 点击未确认）才回退回车键（最后手段）；
 4. 弹窗未出现 → **快速失败**（跳过 25s 轮询），签名 `popup_missing`。
 
 ### 3. 同签名熔断（`ConsecutiveFailureBreaker`，阈值 3）

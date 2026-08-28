@@ -648,7 +648,8 @@ def _ax_press_add_button(popup_win):
     WAIT_AX_BUTTONS 预算内轮询；后续弹窗进程级 AX 已开启，首探即中零开销。
     超时仍未出现按钮才交回车兜底。
 
-    返回 True=已点击；False=预算内未见按钮（或 pid/window_id 缺失）。
+    返回 True=已点击；False=点击未完成（预算内未见按钮 / 点击未确认 /
+    pid 或 window_id 缺失），失败原因已打印到日志。
     """
     pid, window_id = popup_win.get("pid"), popup_win.get("window_id")
     if pid is None or window_id is None:
@@ -663,15 +664,20 @@ def _ax_press_add_button(popup_win):
             label = str(el.get("label", "")).lower()
             if (any(t in label for t in ADD_BUTTON_LABELS)
                     and "Button" in str(el.get("role", ""))):
-                warmup = time.time() - started
-                if warmup > 1.5:  # 首个弹窗预热：记录真实分布，供调 WAIT_AX_BUTTONS 参考
-                    print(f"    ℹ️ AX 按钮等待 {warmup:.1f}s 就绪（首个弹窗预热）")
                 clicked = _cua_call("click", {
                     "pid": pid, "window_id": window_id,
                     "element_index": el["element_index"],
                 })
-                return clicked is not None
+                if clicked is None:
+                    # 与「未就绪」区分：按钮在、命令没送达，免得与后续日志自相矛盾
+                    print("    ⚠️ AX 按钮已就绪但点击未确认")
+                    return False
+                warmup = time.time() - started
+                if warmup > 1.5:  # 首个弹窗预热：记录真实分布，供调 WAIT_AX_BUTTONS 参考
+                    print(f"    ℹ️ AX 按钮等待 {warmup:.1f}s 就绪（首个弹窗预热）")
+                return True
         if time.time() >= deadline:
+            print(f"    ⚠️ AX 按钮 {WAIT_AX_BUTTONS:g}s 内未就绪")
             return False
         time.sleep(WAIT_AX_BUTTONS_POLL)
 
@@ -683,7 +689,7 @@ def trigger_clipper_with_receipt():
     2. 弹窗出现后优先 AX 点击 'Add to Obsidian'（语义动作）——按钮搜索在
        WAIT_AX_BUTTONS 预算内轮询：Chromium 每轮**首个弹窗**的渲染器 AX 需数秒
        开启（实测 ~6s），后续弹窗进程级已开启、首探即中；
-    3. 预算内未见按钮才回退回车键（最后手段）。
+    3. AX 点击未完成（未就绪 / 点击未确认）才回退回车键（最后手段）。
 
     Returns:
       True  = 保存动作已触发，调用方继续轮询落盘；
@@ -712,7 +718,7 @@ def trigger_clipper_with_receipt():
     if _ax_press_add_button(popup):
         print("    ✅ 已 AX 点击 'Add to Obsidian'")
     else:
-        print(f"    ⚠️ AX 按钮 {WAIT_AX_BUTTONS:g}s 内未就绪，回退回车键确认")
+        print("    ↩️ 回退回车键确认")  # 失败原因已由 _ax_press_add_button 打印
         time.sleep(1.5)
         send_keystroke("return", [])
     return True

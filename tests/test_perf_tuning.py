@@ -618,6 +618,22 @@ class TestAxButtonPolling:
         assert calls == ["get_window_state", "click"]
         assert sleeps == []
 
+    def test_click_failure_prints_distinct_reason(self, monkeypatch, capsys):
+        """按钮在但 click 未确认：原因须与「未就绪」可区分（曾有日志自相矛盾）"""
+        monkeypatch.setattr(saver.time, "sleep", lambda s: None)
+
+        def fake_cua(tool, params, timeout=15):
+            if tool == "get_window_state":
+                return {"elements": [{"label": "Add to Obsidian",
+                                      "role": "AXButton", "element_index": 7}]}
+            return None  # click 未确认
+
+        monkeypatch.setattr(saver, "_cua_call", fake_cua)
+        assert saver._ax_press_add_button(self._popup()) is False
+        out = capsys.readouterr().out
+        assert "点击未确认" in out
+        assert "未就绪" not in out
+
     def test_missing_ids_short_circuits_before_polling(self):
         """缺 pid/window_id 仍零探测短路（不烧预算）"""
         calls = []

@@ -39,5 +39,8 @@ incremental_update.lock
 # Environment drift snapshot (runtime state)
 environment_snapshot.json
 
+# Last run result for 17:10 gate (runtime state)
+last_incremental_run.json
+
 # Claude Code memory
 MEMORY/

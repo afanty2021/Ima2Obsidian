@@ -9,6 +9,7 @@
     <array>
         <string>/usr/bin/python3</string>
         <string>/Users/berton/Github/Myself/Ima2Obsidian/ima_incremental_update.py</string>
+        <string>--scheduled</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -54,7 +55,10 @@
             <integer>10</integer>
         </dict>
 
-        <!-- 第二时槽：兜 16:10 逢显示器休眠/锁屏的失败（增量幂等，空跑无害） -->
+        <!-- 第二时槽：兜 16:10 失败（息屏卡死/保存失败/AX 闪断）。--scheduled 使
+             17 点后的触发先做前置判断：无待保存残留且当天最近一次真实运行全成功
+             时空转退出（16:10 主槽永远全量跑）。状态文件 last_incremental_run.json
+             由每轮真实运行收尾时落盘。 -->
         <dict>
             <key>Weekday</key>
             <integer>1</integer>

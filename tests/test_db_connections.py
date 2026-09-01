@@ -216,7 +216,9 @@ def test_count_unsaved_articles_closes_connection_on_exception(tracked_db):
     with patch.object(sqlite3, "connect", faulty_connect):
         count = count_unsaved_articles("AI")
 
-    assert count == 0  # 异常时返回 0（向后兼容）
+    # 异常时返回 None（≠「确认为 0」），17:10 门控据此 fail-open；
+    # 不 skip 的调用方（main 保存重试触发）自行归零
+    assert count is None
     for conn in instances:
         assert conn.close_called, "count_unsaved_articles 异常路径未关闭连接（fd 泄漏）"
 

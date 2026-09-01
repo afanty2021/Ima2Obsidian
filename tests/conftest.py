@@ -35,6 +35,18 @@ def temp_db(tmp_path, monkeypatch):
     yield db_path
 
 
+@pytest.fixture(autouse=True)
+def _isolate_run_state_file(tmp_path, monkeypatch):
+    """测试不得触碰真实的 last_incremental_run.json（17:10 兜底槽前置判断依据）。
+
+    背景：write_run_state 加进 main 收尾后，跑到完整收尾的 main() 测试
+    （如 test_failed_saver_does_not_consume_reclaim_for_next_kb）曾把 mock 结果
+    写进真实状态文件，污染当晚的前置判断。
+    """
+    mod = importlib.import_module("ima_incremental_update")
+    monkeypatch.setattr(mod, "RUN_STATE_FILE", tmp_path / "last_incremental_run.json")
+
+
 @pytest.fixture
 def seeded_db(temp_db):
     """初始化 schema 并插入若干测试文章"""

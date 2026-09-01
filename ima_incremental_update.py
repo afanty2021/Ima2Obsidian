@@ -9,7 +9,10 @@ IMA 增量更新脚本 — 每日自动提取新增文章并保存到 Obsidian
   python3 ima_incremental_update.py                    # 更新所有知识库
   python3 ima_incremental_update.py --kb AI Python     # 只更新指定知识库
   python3 ima_incremental_update.py --dry-run          # 预览模式
-  python3 ima_incremental_update.py --no-save          # 只提取不保存到 Obsidian
+  python3 ima_incremental_update.py --no-save          # 只提取，不保存到 Obsidian
+  python3 ima_incremental_update.py --scheduled        # launchd 定时入口：
+                                                       #   17 点后的触发先做前置判断
+                                                       #   （无残留且当天已全成功则跳过）
 """
 
 import argparse
@@ -44,6 +47,9 @@ KNOWLEDGE_BASES = [
 LOG_FILE = Path(__file__).parent / "incremental_update.log"
 LOCK_FILE = Path(__file__).parent / "incremental_update.lock"
 LOG_MAX_BYTES = 2 * 1024 * 1024  # 日志文件最大 2MB
+# 最近一次真实运行的结果落盘（17:10 兜底槽前置判断用；dry-run 不写）。
+# 用状态文件而非解析日志：日志会轮转，且手动 dry-run 的汇总行会污染解析口径。
+RUN_STATE_FILE = Path(__file__).parent / "last_incremental_run.json"
 
 WAIT_BETWEEN_KB = 5.0  # 知识库之间等待时间
 
@@ -750,8 +756,13 @@ def save_to_obsidian(
     return {"saved": saved_count, "failed": failed_count, "started": True}
 
 
-def count_unsaved_articles(kb_name: str) -> int:
-    """统计该知识库未保存到 Obsidian 的微信文章数（含历史漏存，用于决定是否触发保存重试）"""
+def count_unsaved_articles(kb_name: str = None):
+    """统计未保存到 Obsidian 的微信文章数（含历史漏存，用于决定是否触发保存重试）
+
+    kb_name=None 时不限知识库（17:10 兜底槽前置判断用全库口径）。
+    DB 读异常返回 None（区别于「确实为 0」）：前置判断的 skip 必须建立在
+    确定的事实上，读不出来时按 fail-open 照跑；调用方不 skip 的可自行归零。
+    """
     import sqlite3
     from contextlib import closing
     try:
@@ -759,19 +770,122 @@ def count_unsaved_articles(kb_name: str) -> int:
         # closing 保证异常路径也关闭连接，避免 launchd 长跑累积 fd 泄漏
         with closing(sqlite3.connect(DB_FILE)) as conn:
             c = conn.cursor()
-            c.execute("""
+            if kb_name:
+                where_kb = "knowledge_base = ?"
+                params = (kb_name,)
+            else:
+                where_kb = "1=1"
+                params = ()
+            c.execute(f"""
                 SELECT COUNT(*) FROM articles
-                WHERE knowledge_base = ?
+                WHERE {where_kb}
                   AND status = 'success'
                   AND url LIKE '%mp.weixin.qq.com%'
                   AND (obsidian_saved = 0 OR obsidian_saved IS NULL)
-            """, (kb_name,))
+            """, params)
             return c.fetchone()[0]
     except Exception:
-        return 0
+        return None
+
+
+# ==================== 17:10 兜底槽前置判断 ====================
+# 第二时槽的目的是兜 16:10 的失败（息屏卡死 / 保存失败 / AX 闪断）。16:10 全成功时
+# 再空跑一轮无害但白占约 10 分钟无人值守机时——前置判断「有没有必要真跑」：
+# 有待保存残留、今天还没真实跑过、或今天最近一次真实运行有知识库失败，才真跑；
+# 否则跳过（退出 0）。拿不准一律照跑，最坏等于现状的一次幂等空跑。
+
+def write_run_state(total_kb_failed: int, total_failed: int, full: bool) -> None:
+    """真实运行结束时落盘结果，供下一次 --scheduled 触发的前置判断读取。
+
+    full=本次是否为全库扫描（args.kb is None）：手动 --kb 限定的运行只扫了
+    部分知识库，其「全成功」不构成跳过 17:10 的依据（2026-09-01 评审 Important #2）。
+    dry-run 不写（预览不代表真实扫描结果，见调用处）。
+    """
+    try:
+        now = datetime.now()
+        RUN_STATE_FILE.write_text(json.dumps({
+            "date": now.strftime("%Y-%m-%d"),
+            "kb_failed": total_kb_failed,
+            "save_failed": total_failed,
+            "full": bool(full),
+            "ts": now.isoformat(timespec="seconds"),
+        }, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        log(f"⚠️  运行状态文件写入失败（不影响本次运行）: {e}")
+
+
+def read_last_run_state():
+    try:
+        return json.loads(RUN_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def scheduled_gate_applies(now=None) -> bool:
+    """前置判断只挂在 17 点后的 scheduled 触发上；16:10 主槽永远全量跑。
+
+    兼容 launchd 错过日历点后补跑的场景：16:10 的火延迟到 17 点后触发时，
+    「今天还没有真实运行」分支会让它照常全量跑。
+    """
+    now = now or datetime.now()
+    return now.hour >= 17
+
+
+def scheduled_gate_decision(now=None):
+    """返回 (should_skip, reason)。"""
+    now = now or datetime.now()
+    residual = count_unsaved_articles()
+    if residual is None:
+        return False, "残留计数读取失败（DB 异常），保守照跑"
+    if residual > 0:
+        return False, "库内有 {} 篇待保存残留，需要重试保存".format(residual)
+    state = read_last_run_state()
+    if not state:
+        return False, "无运行状态文件（首次部署或被清理），保守照跑"
+    if state.get("date") != now.strftime("%Y-%m-%d"):
+        return False, "今天还没有真实运行（最近一次是 {}），保守照跑".format(state.get("date"))
+    if state.get("full") is not True:
+        return False, "今天最近一次运行不是全库扫描（--kb 限定），保守照跑"
+    kb_failed = state.get("kb_failed")
+    if isinstance(kb_failed, bool) or not isinstance(kb_failed, int) or kb_failed < 0:
+        return False, "状态文件字段异常，保守照跑"
+    if kb_failed > 0:
+        return False, "今天最近一次运行有 {} 个知识库失败，触发重扫".format(kb_failed)
+    return True, "今天最近一次真实运行全成功且无待保存残留"
 
 
 # ==================== 增量更新逻辑 ====================
+
+def _parse_extractor_stats(stdout):
+    """从提取器 stdout 解析「本次新增/跳过/失败」计数（同标签多次出现时取最后一次）。
+
+    「本次失败」必须参与解析：逐篇 URL/点击失败不入库（残留计数看不见它），
+    提取器退出码又是 0——漏掉它，前置判断会把「部分失败」误判成「全成功」
+    而跳过 17:10 补扫（2026-09-01 评审 Important #1）。
+    """
+    new_count = 0
+    skipped_count = 0
+    extract_failed = 0
+
+    for line in stdout.split("\n"):
+        if "本次新增" in line:
+            try:
+                new_count = int(line.split(":")[-1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif "本次跳过" in line:
+            try:
+                skipped_count = int(line.split(":")[-1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif "本次失败" in line:
+            try:
+                extract_failed = int(line.split(":")[-1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+
+    return {"new": new_count, "skipped": skipped_count, "failed": extract_failed}
+
 
 def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
     """
@@ -841,24 +955,17 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
                 log(f"错误: {result.stderr}")
             return {"new": 0, "skipped": 0, "failed": 1}
 
-        # 解析统计信息
-        new_count = 0
-        skipped_count = 0
-
-        for line in result.stdout.split("\n"):
-            if "本次新增" in line:
-                try:
-                    new_count = int(line.split(":")[-1].strip().split()[0])
-                except (ValueError, IndexError):
-                    pass
-            elif "本次跳过" in line:
-                try:
-                    skipped_count = int(line.split(":")[-1].strip().split()[0])
-                except (ValueError, IndexError):
-                    pass
+        # 解析统计信息（含「本次失败」——逐篇提取失败不计入会让门控误判全成功）
+        stats = _parse_extractor_stats(result.stdout)
+        new_count = stats["new"]
+        skipped_count = stats["skipped"]
+        extract_failed = stats["failed"]
 
         log(f"✅ {kb_name} 更新完成: 新增 {new_count}, 跳过 {skipped_count}")
-        return {"new": new_count, "skipped": skipped_count, "failed": 0}
+        if extract_failed:
+            log(f"⚠️  {kb_name} 有 {extract_failed} 篇提取失败（未入库），"
+                f"计入知识库处理失败以触发 17:10 补扫")
+        return {"new": new_count, "skipped": skipped_count, "failed": extract_failed}
 
     except subprocess.TimeoutExpired:
         log(f"❌ {kb_name} 提取超时")
@@ -904,6 +1011,12 @@ def main():
         action="store_true",
         help="只提取，不保存到 Obsidian"
     )
+    parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="launchd 定时入口：17 点后的触发先做前置判断，"
+             "有待保存残留、今天还没真实跑过、或最近一次运行有知识库失败才真跑，否则跳过"
+    )
     args = parser.parse_args()
 
     # 确定要处理的知识库
@@ -915,6 +1028,16 @@ def main():
     if not kbs:
         log("❌ 没有配置知识库，请使用 --kb 指定或在脚本中添加 KNOWLEDGE_BASES")
         sys.exit(1)
+
+    # 17:10 兜底槽前置判断：放在 banner 与一切预检之前，跳过时直接退出
+    # （非严格零副作用：此前已开锁文件、跑过日志轮转）。
+    # 16 点前的触发（含 16:10 主槽、手动运行）不受影响，永远全量跑。
+    if args.scheduled and scheduled_gate_applies():
+        should_skip, reason = scheduled_gate_decision()
+        log(f"[scheduled] 前置判断: {reason}")
+        if should_skip:
+            log("[scheduled] ⏭️  无需重跑，本次跳过（退出 0）")
+            return
 
     log(f"\n{'='*60}")
     log(f"IMA 增量更新开始")
@@ -996,6 +1119,10 @@ def main():
             # 触发保存：有新文章，或该 KB 有历史漏存（之前保存失败/超时未保存）。
             # 后者让失败文章能在后续运行中自动重试，避免 new=0 时永久漏存。
             unsaved = count_unsaved_articles(kb_name) if (not args.no_save and not args.dry_run) else 0
+            if unsaved is None:
+                # DB 读异常按 0 处理（原行为，只影响是否多触发一次保存重试）；
+                # 前置判断侧对 None 是 fail-open，与此处口径不同是刻意的
+                unsaved = 0
             if (stats["new"] > 0 or unsaved > 0) and not args.no_save and not args.dry_run:
                 if stats["new"] == 0 and unsaved > 0:
                     log(f"检测到 {kb_name} 有 {unsaved} 篇历史漏存未保存，触发保存重试")
@@ -1020,6 +1147,10 @@ def main():
         log(f"保存到 Obsidian: {total_saved} 篇")
         log(f"保存失败: {total_failed} 篇")
         log(f"知识库处理失败: {total_kb_failed} 个")
+
+        # 落盘运行结果供 17:10 兜底槽前置判断读取；dry-run 不代表真实扫描，不写
+        if not args.dry_run:
+            write_run_state(total_kb_failed, total_failed, full=(args.kb is None))
 
         # 退出码：保存失败或 KB 处理失败（如夜间锁屏致导航全跪）时非零退出，让 launchd 暴露静默失败（dry-run 不告警）
         if (total_failed > 0 or total_kb_failed > 0) and not args.dry_run:

@@ -1,5 +1,8 @@
 #!/bin/bash
 # IMA 增量更新定时任务安装脚本
+#
+# 注意：plist（com.ima2obsidian.update.plist）的任何改动，都要重跑本脚本
+# （或 launchctl bootout + bootstrap）才会生效——launchd 只在加载时读 plist。
 
 set -e
 
@@ -34,7 +37,8 @@ echo ""
 echo "✅ 安装完成！"
 echo ""
 echo "定时任务配置:"
-echo "  - 运行时间: 每天 11:50（白天运行，规避夜间锁屏致 AX 树读不到）"
+echo "  - 运行时间: 工作日 16:10 + 17:10（17:10 为兜底槽，带 --scheduled 前置判断："
+echo "    无待保存残留且当天最近一次全库运行全成功时跳过）"
 echo "  - 日志文件: $SCRIPT_DIR/incremental_update.log"
 echo "  - 错误日志: $SCRIPT_DIR/incremental_update_error.log"
 echo ""

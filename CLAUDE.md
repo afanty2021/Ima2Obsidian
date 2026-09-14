@@ -111,7 +111,8 @@ Ima2Obsidian/
 
 - **辅助功能**: macOS 需授权终端/Python 辅助功能权限；**launchd 跑 quick_clip 还需手动把 `/opt/homebrew/bin/cliclick` 加入「系统设置 → 隐私与安全性 → 辅助功能」**（详见 [SAVER.md](./SAVER.md) 「Web Clipper 自动化依赖」章节）
 - **浏览器**: Chrome/Edge/Safari 需安装 Obsidian Web Clipper
-- **Obsidian**: 必须保持运行并打开目标 Vault
+- **Obsidian**: 保存期间需运行并打开目标 Vault（更新脚本会自动拉起）
+- **运行收尾**: 更新结束后脚本自动退出 IMA/Obsidian/Chrome 及 cua-driver 守护进程（无人值守运行时；交互式终端手动跑或加 `--no-cleanup` 则不收尾；cua-driver 下次运行会自动拉起）
 - **快捷键**: 保存期间勿操作键盘鼠标
 
 ---

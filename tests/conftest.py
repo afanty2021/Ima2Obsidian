@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -58,6 +59,20 @@ def _isolate_run_log_file(tmp_path, monkeypatch):
     """
     mod = importlib.import_module("ima_incremental_update")
     monkeypatch.setattr(mod, "LOG_FILE", tmp_path / "incremental_update.log")
+
+
+@pytest.fixture(autouse=True)
+def _quiet_app_cleanup(monkeypatch):
+    """main() 收尾会退出真实 IMA/Obsidian/Chrome（osascript quit）——测试一律 no-op。
+
+    跑到完整收尾的 main() 用例若不隔离，会把用户正开着的浏览器/编辑器关掉。
+    需要断言收尾行为的用例从本夹具的 yield 值拿 MagicMock；对 quit 逻辑本身
+    的单元测试应在收集期绑定真实函数（from ... import 于模块顶层）。
+    """
+    mod = importlib.import_module("ima_incremental_update")
+    mock = MagicMock()
+    monkeypatch.setattr(mod, "cleanup_gui_apps", mock)
+    yield mock
 
 
 @pytest.fixture

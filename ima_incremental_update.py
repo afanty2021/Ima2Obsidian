@@ -975,6 +975,62 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
         return {"new": 0, "skipped": 0, "failed": 1}
 
 
+# ==================== 运行收尾 ====================
+
+# 自动化会拉起/使用的 GUI 应用，任务结束后退出（2026-09-14 用户要求收尾）。
+# 注意：应用若在任务前已被用户自己打开，也会一并退出（Chrome 重开时恢复标签页）
+# ——这是显式接受的权衡：launchd 无人值守槽收尾无条件执行；交互式（TTY）手动
+# 运行跳过收尾，避免强退正在使用的应用。浏览器写死 Chrome：saver 默认即 Chrome
+# （--browser safari/edge 未使用），换浏览器时再与 browser_config 耦合。
+GUI_APPS_TO_QUIT = ("ima.copilot", "Obsidian", "Google Chrome")
+
+
+def cleanup_gui_apps(interactive: bool = False):
+    """运行收尾：逐个退出 GUI 应用。
+
+    - interactive=True（TTY 手动运行）直接跳过，不强退用户正在用的应用；
+    - 退出前先 pgrep 探活：对未运行的应用发 `tell ... to quit` 会把它启动
+      （AppleScript 经典坑，2026-09-14 评审 Important）；
+    - 检查 osascript 返回码/stderr（TCC 自动化权限被拒时不能无感）；
+    - best-effort：单个失败不阻塞其余、不影响退出码。
+    """
+    if interactive:
+        log("🧹 收尾：交互模式跳过（避免强退正在使用的应用；无人值守运行不受影响）")
+        return
+    for app in GUI_APPS_TO_QUIT:
+        try:
+            probe = subprocess.run(["pgrep", "-x", app], capture_output=True)
+            if probe.returncode != 0:
+                log(f"🧹 收尾：{app} 未在运行，跳过")
+                continue
+            result = subprocess.run(
+                ["osascript", "-e", f'tell application "{app}" to quit'],
+                capture_output=True, timeout=15,
+            )
+            if result.returncode != 0:
+                stderr = (result.stderr or b"").decode(errors="replace").strip()
+                log(f"⚠️  收尾：退出 {app} 失败 rc={result.returncode} {stderr[:200]}")
+            else:
+                log(f"🧹 收尾：已请求退出 {app}")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"⚠️  收尾：退出 {app} 失败（不影响运行结果）: {e}")
+    # cua-driver serve 守护进程也一并收尾（2026-09-14 用户确认：本机仅本项目
+    # 使用，需要时 ensure_daemon 会自动重新拉起）。
+    try:
+        probe = subprocess.run(["pgrep", "-f", "cua-driver serve"], capture_output=True)
+        if probe.returncode != 0:
+            log("🧹 收尾：cua-driver 守护进程未在运行，跳过")
+            return
+        result = subprocess.run(["pkill", "-f", "cua-driver serve"], capture_output=True)
+        if result.returncode != 0:
+            stderr = (result.stderr or b"").decode(errors="replace").strip()
+            log(f"⚠️  收尾：退出 cua-driver 失败 rc={result.returncode} {stderr[:200]}")
+        else:
+            log("🧹 收尾：已退出 cua-driver 守护进程")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"⚠️  收尾：退出 cua-driver 失败（不影响运行结果）: {e}")
+
+
 # ==================== 主函数 ====================
 
 def main():
@@ -1016,6 +1072,11 @@ def main():
         action="store_true",
         help="launchd 定时入口：17 点后的触发先做前置判断，"
              "有待保存残留、今天还没真实跑过、或最近一次运行有知识库失败才真跑，否则跳过"
+    )
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="跳过运行收尾（不退出 IMA/Obsidian/Chrome）"
     )
     args = parser.parse_args()
 
@@ -1159,6 +1220,13 @@ def main():
     finally:
         if caffeinate_proc:
             caffeinate_proc.terminate()
+        # 运行收尾：退出自动化涉及的 GUI 应用（dry-run 没动它们，不收尾；
+        # gate 跳过路径在本 try 之前 return，不会到这里）。放在 finally：
+        # 失败退出（sys.exit(1)）/中断时也照常收尾。
+        # TTY 交互运行跳过收尾——手动跑时用户可能正在用这些应用
+        # （launchd/后台运行 isatty()=False，照常收尾）。
+        if not args.dry_run and not args.no_cleanup:
+            cleanup_gui_apps(interactive=sys.stdout.isatty())
 
 
 if __name__ == "__main__":

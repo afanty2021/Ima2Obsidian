@@ -160,6 +160,18 @@ brew install cliclick
 - 修复前（cliclick 未在辅助功能里）：0 成功 / 18 失败
 - 用户手动添加 cliclick 到辅助功能后：38+ 成功 / 2 失败（独立原因）
 
+### 3. Chrome「允许 Apple 事件中的 JavaScript」自动开启
+
+**用户可见行为：自动开启过程会退出并重启 Chrome**（标签页自动恢复，但窗口会闪断重开）。
+
+`execute_chrome_js` 依赖 Chrome 菜单「查看 → 开发者 → 允许 Apple 事件中的 JavaScript」，而 **Chrome 更新会重置该设置**（重置后 JS 执行全部失败，saver 0 落盘）。saver 实跑（非 dry-run）启动时执行 `ensure_chrome_js_enabled`：
+
+1. 先探测（`execute javascript "1"`），已开启则放行——Chrome 已在运行且含窗口时零副作用；冷启动/无窗口时探测前奏会先拉起 Chrome 或新开窗口（保存器本来就需要 Chrome，功能无害）；
+2. 未开启 → 通过 cua-driver patch Chrome 偏好自动开启——**此过程退出并重启 Chrome**，随后轮询重启完成并复验；
+3. 开启失败（cua-driver 缺失/超时）→ fail-closed 直接 `exit 1` 终止，不进入必全失败的保存流程。
+
+非 Chrome 浏览器直接放行。
+
 ### 故障排查
 
 | 现象 | 根因 | 修复 |

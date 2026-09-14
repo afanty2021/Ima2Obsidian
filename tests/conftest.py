@@ -47,6 +47,19 @@ def _isolate_run_state_file(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "RUN_STATE_FILE", tmp_path / "last_incremental_run.json")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_run_log_file(tmp_path, monkeypatch):
+    """测试不得写真实的 incremental_update.log（launchd 运行日志）。
+
+    背景：log() 无条件 append 到模块级 LOG_FILE（非 TTY 时不 print），
+    未 patch log 的用例（如 test_restart_ima_fallback 的兜底路径）会把
+    mock 运行的输出混进真实日志，干扰按日志定位线上问题。各测试内
+    显式 patch LOG_FILE 的写法保留不动（指向同一 tmp 语义，无害冗余）。
+    """
+    mod = importlib.import_module("ima_incremental_update")
+    monkeypatch.setattr(mod, "LOG_FILE", tmp_path / "incremental_update.log")
+
+
 @pytest.fixture
 def seeded_db(temp_db):
     """初始化 schema 并插入若干测试文章"""

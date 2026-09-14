@@ -1,12 +1,14 @@
 """运行收尾（cleanup_gui_apps / --no-cleanup）的单元与入口测试
 
-2026-09-14 用户要求：GUI 自动化任务完成后收尾，退出 IMA/Obsidian/Chrome。
-挂在 main 的 finally 上——失败退出（sys.exit(1)）/中断也照常收尾。
-同日评审修复：
-- Critical：TTY 交互运行跳过收尾（不强退用户正在用的应用）；
-  launchd/后台（非 TTY）无条件收尾——显式接受的权衡；
-- Important：pgrep 探活后再 quit（对未运行应用发 quit 会把它启动）；
-  检查 osascript 返回码/stderr（TCC 拒权不能无感）。
+2026-09-14 用户要求：GUI 自动化任务完成后收尾，退出 IMA/Obsidian/Chrome 及
+cua-driver。挂在 main 的 finally 上——失败退出（sys.exit(1)）/中断也照常收尾。
+
+评审修复记录：
+- Critical：TTY 交互运行跳过收尾；launchd/后台（非 TTY）无条件收尾；
+- Important：pgrep 探活后再 quit；检查 osascript 返回码/stderr；
+- 复审 Minor：守护进程正则锚定进程名开头；quit 后存活复查（确认框阻塞
+  只警告不强杀）；fake_run 按命令内容分发、不依赖调用顺序（旧写法
+  `"ima.copilot" in cmd` 对列表元素匹配恒 False，超时分支从未触发）。
 注意：模块顶层绑定的 real_cleanup 是真实函数对象；conftest 的 autouse
 只替换模块属性，不影响该引用。
 """
@@ -22,21 +24,25 @@ import ima_incremental_update as inc
 # 收集期绑定真实函数（conftest autouse 之后会把模块属性换成 no-op mock）
 from ima_incremental_update import cleanup_gui_apps as real_cleanup
 
+DAEMON_ANCHORED = r"^(.*/)?cua-driver serve"
+
 
 @pytest.fixture
 def quit_mock(monkeypatch):
     mock = MagicMock(return_value=MagicMock(returncode=0))
     monkeypatch.setattr(subprocess, "run", mock)
+    # 复查存活前有 sleep，单测里 no-op
+    monkeypatch.setattr(inc.time, "sleep", lambda s: None)
     return mock
 
 
 class TestCleanupGuiAppsUnit:
     def test_quits_running_apps_via_osascript(self, quit_mock):
-        def fake_run(cmd, **kwargs):
+        def fake_run(cmd, **kw):
+            # 按探活目标分发：Obsidian 未运行，其余在跑
             result = MagicMock(returncode=0)
-            if cmd[0] == "pgrep":
-                # Obsidian 未运行，其余在跑
-                result.returncode = 0 if cmd[2] != "Obsidian" else 1
+            if cmd[0] == "pgrep" and cmd[2] == "Obsidian":
+                result.returncode = 1
             return result
 
         quit_mock.side_effect = fake_run
@@ -49,6 +55,14 @@ class TestCleanupGuiAppsUnit:
         assert any('"Google Chrome"' in c for c in osascript_cmds)
         assert not any('"Obsidian"' in c for c in osascript_cmds)
 
+    def test_daemon_pattern_anchored(self, quit_mock):
+        # 复审 Minor：-f 匹配全文，必须锚定进程名开头防误匹配
+        real_cleanup()
+        daemon_calls = [c.args[0] for c in quit_mock.call_args_list
+                        if "cua-driver serve" in " ".join(c.args[0])]
+        assert daemon_calls, "应有守护进程探活"
+        assert all(DAEMON_ANCHORED in " ".join(c) for c in daemon_calls)
+
     def test_interactive_skips_all(self, quit_mock):
         real_cleanup(interactive=True)
         quit_mock.assert_not_called()
@@ -56,9 +70,9 @@ class TestCleanupGuiAppsUnit:
     def test_osascript_failure_logged_not_raised(self, quit_mock):
         # Important：rc!=0（如 TCC 拒权）不能无感，也不能中断收尾
         def fake_run(cmd, **kwargs):
-            if cmd[0] == "pgrep":
-                return MagicMock(returncode=0)
-            return MagicMock(returncode=1, stderr=b"execution error: Not authorized")
+            if cmd[0] == "osascript":
+                return MagicMock(returncode=1, stderr=b"execution error: Not authorized")
+            return MagicMock(returncode=0)
 
         quit_mock.side_effect = fake_run
         real_cleanup()  # 不抛异常，三个应用都尝试
@@ -66,10 +80,10 @@ class TestCleanupGuiAppsUnit:
                    if c.args[0][0] == "osascript") == 3
 
     def test_osascript_timeout_does_not_block_rest(self, quit_mock):
+        # 按内容分发：只让 ima.copilot 的 osascript 超时（旧写法列表元素
+        # 匹配恒 False，该分支从未真正触发）
         def fake_run(cmd, **kwargs):
-            if cmd[0] == "pgrep":
-                return MagicMock(returncode=0)
-            if "ima.copilot" in cmd:
+            if cmd[0] == "osascript" and "ima.copilot" in " ".join(cmd):
                 raise subprocess.TimeoutExpired(cmd=cmd, timeout=15)
             return MagicMock(returncode=0)
 
@@ -78,16 +92,24 @@ class TestCleanupGuiAppsUnit:
         assert sum(1 for c in quit_mock.call_args_list
                    if c.args[0][0] == "osascript") == 3
 
-    def test_daemon_killed_when_running(self, quit_mock):
+    def test_quit_blocked_shows_still_running_warning(self, quit_mock):
+        # 复审 Minor：确认框阻塞 quit 时复查要能发现——quit 后 pgrep 仍命中。
+        # 只警告不强杀：全程唯一的 pkill 只应是守护进程那一条
+        quit_mock.side_effect = lambda cmd, **kw: MagicMock(returncode=0)
         real_cleanup()
         pkill_cmds = [c.args[0] for c in quit_mock.call_args_list
                       if c.args[0][0] == "pkill"]
-        assert pkill_cmds == [["pkill", "-f", "cua-driver serve"]]
+        assert pkill_cmds == [["pkill", "-f", DAEMON_ANCHORED]]
+        # 每个应用两次 pgrep -x：quit 前探活 + quit 后存活复查
+        from collections import Counter
+        probed = Counter(c.args[0][2] for c in quit_mock.call_args_list
+                         if c.args[0][0] == "pgrep" and c.args[0][1] == "-x")
+        assert probed == {app: 2 for app in inc.GUI_APPS_TO_QUIT}
 
     def test_daemon_skipped_when_not_running(self, quit_mock):
         def fake_run(cmd, **kwargs):
             result = MagicMock(returncode=0)
-            if cmd[0] == "pgrep" and cmd[2] == "cua-driver serve":
+            if cmd[0] == "pgrep" and DAEMON_ANCHORED in " ".join(cmd):
                 result.returncode = 1
             return result
 

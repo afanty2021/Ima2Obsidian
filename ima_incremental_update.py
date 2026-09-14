@@ -984,6 +984,9 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
 # （--browser safari/edge 未使用），换浏览器时再与 browser_config 耦合。
 GUI_APPS_TO_QUIT = ("ima.copilot", "Obsidian", "Google Chrome")
 
+# quit 后等待进程退出再做存活复查的间隔（秒）
+CLEANUP_RECHECK_DELAY = 2.0
+
 
 def cleanup_gui_apps(interactive: bool = False):
     """运行收尾：逐个退出 GUI 应用。
@@ -1010,18 +1013,26 @@ def cleanup_gui_apps(interactive: bool = False):
             if result.returncode != 0:
                 stderr = (result.stderr or b"").decode(errors="replace").strip()
                 log(f"⚠️  收尾：退出 {app} 失败 rc={result.returncode} {stderr[:200]}")
-            else:
-                log(f"🧹 收尾：已请求退出 {app}")
+                continue
+            log(f"🧹 收尾：已请求退出 {app}")
+            # 存活复查：多标签确认框等可能阻塞 quit（2026-09-14 评审 Minor）。
+            # 只警告不强杀——强杀会丢用户未保存状态。
+            time.sleep(CLEANUP_RECHECK_DELAY)
+            still = subprocess.run(["pgrep", "-x", app], capture_output=True)
+            if still.returncode == 0:
+                log(f"⚠️  收尾：{app} 退出后仍在运行（可能有未保存/确认对话框阻塞），需手动处理")
         except (subprocess.TimeoutExpired, OSError) as e:
             log(f"⚠️  收尾：退出 {app} 失败（不影响运行结果）: {e}")
     # cua-driver serve 守护进程也一并收尾（2026-09-14 用户确认：本机仅本项目
-    # 使用，需要时 ensure_daemon 会自动重新拉起）。
+    # 使用，需要时 ensure_daemon 会自动重新拉起）。正则锚定进程名开头，
+    # 避免误匹配无关命令行（2026-09-14 复审 Minor）。
+    daemon_pattern = r"^(.*/)?cua-driver serve"
     try:
-        probe = subprocess.run(["pgrep", "-f", "cua-driver serve"], capture_output=True)
+        probe = subprocess.run(["pgrep", "-f", daemon_pattern], capture_output=True)
         if probe.returncode != 0:
             log("🧹 收尾：cua-driver 守护进程未在运行，跳过")
             return
-        result = subprocess.run(["pkill", "-f", "cua-driver serve"], capture_output=True)
+        result = subprocess.run(["pkill", "-f", daemon_pattern], capture_output=True)
         if result.returncode != 0:
             stderr = (result.stderr or b"").decode(errors="replace").strip()
             log(f"⚠️  收尾：退出 cua-driver 失败 rc={result.returncode} {stderr[:200]}")
@@ -1076,7 +1087,7 @@ def main():
     parser.add_argument(
         "--no-cleanup",
         action="store_true",
-        help="跳过运行收尾（不退出 IMA/Obsidian/Chrome）"
+        help="跳过运行收尾（不退出 IMA/Obsidian/Chrome，也不杀 cua-driver 守护进程）"
     )
     args = parser.parse_args()
 

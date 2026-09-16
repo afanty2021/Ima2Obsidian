@@ -10,12 +10,12 @@ from unittest.mock import patch
 import ima_common
 
 
-def _win(wid, title, height=885):
+def _win(wid, title, height=885, app_name="ima.copilot"):
     """构造一个 ima.copilot 窗口（width=1512，与实测一致）"""
     return {
         "window_id": wid,
         "pid": 65349,
-        "app_name": "ima.copilot",
+        "app_name": app_name,
         "title": title,
         "is_on_screen": True,
         "bounds": {"x": 0, "y": 0, "width": 1512, "height": height},
@@ -79,3 +79,23 @@ class TestGetImaMainWindow:
         with patch("ima_common.run_cua", side_effect=fake):
             mw = ima_common.get_ima_main_window()
         assert mw is not None  # 回退，不崩
+
+    def test_accepts_new_localized_app_name_ima(self):
+        """新版 ima（150.0.7871.5321 起）中文系统本地化进程名为 "ima"（InfoPlist.strings
+        覆盖 CFBundleName），list_windows 的 app_name 随之为 "ima"，必须仍能选中主窗口。
+
+        背景：9/15-9/16 连续两日全库跳过，根因即旧过滤 "ima.copilot" in app_name
+        对 "ima" 失配 → 0 候选 →「未找到 IMA 窗口」。
+        """
+        win_new_name = _win(663, "英语教与学", height=949, app_name="ima")
+        with patch("ima_common.run_cua", side_effect=_run_cua_with([win_new_name], set())):
+            mw = ima_common.get_ima_main_window()
+        assert mw is not None
+        assert mw["window_id"] == 663
+
+    def test_rejects_unrelated_app_with_ima_substring(self):
+        """英文 locale 的 "Image Capture" 含 "ima" 子串，但不是 ima 窗口，不得误选"""
+        unrelated = _win(100, "Image Capture", height=949, app_name="Image Capture")
+        with patch("ima_common.run_cua", side_effect=_run_cua_with([unrelated], set())):
+            mw = ima_common.get_ima_main_window()
+        assert mw is None

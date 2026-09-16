@@ -169,9 +169,15 @@ def get_ima_main_window():
         return None
 
     windows = data.get("windows", [])
+    # list_windows 的 app_name 是进程本地化名（kCGWindowOwnerName）。新版 ima
+    # （150.0.7871.5321 起）在 zh_CN/zh-Hans 的 InfoPlist.strings 里把
+    # CFBundleName/DisplayName 覆盖为 "ima"，中文系统上即由此得名；英文 locale
+    # 仍是 "ima.copilot"。用精确集合匹配两个名字，避免宽松子串误伤 Image Capture
+    # 这类英文 app 名。
+    ima_app_names = {IMA_APP_NAME.lower(), "ima"}
     ima_windows = [
         w for w in windows
-        if IMA_APP_NAME.lower() in w.get("app_name", "").lower()
+        if w.get("app_name", "").lower() in ima_app_names
         and w.get("bounds", {}).get("height", 0) > 400
     ]
 

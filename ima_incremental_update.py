@@ -236,7 +236,7 @@ def get_ax_window_title() -> str:
     用 cua-driver AX API 读取 IMA 主窗口标题
 
     Electron 应用（IMA）的窗口标题对 System Events 不可靠（冷启动后常读空），
-    AX API 能稳定读到 AXWindow 标题。供导航判断使用，替代 get_kb_window_title。
+    AX API 能稳定读到 AXWindow 标题。供导航判断使用。
 
     返回: 窗口标题字符串（如 "AI - ima.copilot"），失败返回 ""
     """

@@ -99,3 +99,25 @@ class TestGetImaMainWindow:
         with patch("ima_common.run_cua", side_effect=_run_cua_with([unrelated], set())):
             mw = ima_common.get_ima_main_window()
         assert mw is None
+
+
+class TestIsImaAppName:
+    """统一谓词 is_ima_app_name：精确集合两形态，直接锁定（此前仅经 list_windows 路径间接覆盖）"""
+
+    def test_both_localized_forms_match(self):
+        assert ima_common.is_ima_app_name("ima")
+        assert ima_common.is_ima_app_name("ima.copilot")
+
+    def test_case_insensitive_match(self):
+        assert ima_common.is_ima_app_name("IMA")
+        assert ima_common.is_ima_app_name("Ima.Copilot")
+
+    def test_ima_substring_lookalikes_rejected(self):
+        # "Image Capture" 宽松子串会误伤的典型；"imac" 是前缀近似；Helper 是子进程名
+        assert not ima_common.is_ima_app_name("Image Capture")
+        assert not ima_common.is_ima_app_name("imac")
+        assert not ima_common.is_ima_app_name("ima.copilot Helper")
+
+    def test_empty_and_none_rejected(self):
+        assert not ima_common.is_ima_app_name("")
+        assert not ima_common.is_ima_app_name(None)

@@ -306,15 +306,16 @@ def click_element(pid: int, window_id: int, element_index: int) -> bool:
     return result is not None
 
 
-# 定向滚轮的窗口局部坐标缓存（窗口尺寸整个会话恒定，算一次即可）
-_SCROLL_LOCAL_COORDS: Optional[dict] = None
+# 定向滚轮的窗口局部坐标缓存（单窗口尺寸整个会话恒定，算一次即可）；
+# 按 window_id 键控——同会话换窗口/重开窗口时不得复用旧尺寸
+_SCROLL_LOCAL_COORDS: dict = {}
 
 
 def _scroll_local_coords(window_id: int) -> dict:
     """取定向滚轮的窗口局部坐标：宽度中点、y≈45%（列表区，避开左侧 KB 侧边栏）。"""
-    global _SCROLL_LOCAL_COORDS
-    if _SCROLL_LOCAL_COORDS:
-        return _SCROLL_LOCAL_COORDS
+    cached = _SCROLL_LOCAL_COORDS.get(window_id)
+    if cached:
+        return cached
     width, height = 1400, 900  # 兜底（自动化窗口长期为 1512x949）
     try:
         wins = json.loads(run_cua(["list_windows"]))["windows"]
@@ -325,8 +326,8 @@ def _scroll_local_coords(window_id: int) -> dict:
                 break
     except Exception:
         pass
-    _SCROLL_LOCAL_COORDS = {"x": int(width * 0.5), "y": int(height * 0.45)}
-    return _SCROLL_LOCAL_COORDS
+    _SCROLL_LOCAL_COORDS[window_id] = {"x": int(width * 0.5), "y": int(height * 0.45)}
+    return _SCROLL_LOCAL_COORDS[window_id]
 
 
 def scroll_down(pid: int, window_id: int, amount: int = 3):

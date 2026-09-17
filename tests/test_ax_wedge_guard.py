@@ -58,8 +58,6 @@ def _patch_common(monkeypatch):
     monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
     monkeypatch.setattr(ima_ax_extractor, "cmd_w_close", lambda **_kw: None)
     monkeypatch.setattr(ima_ax_extractor, "scroll_down", lambda *_a: None)
-    monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
-    monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
     monkeypatch.setattr(ima_ax_extractor.time, "sleep", lambda _s: None)
 
 
@@ -142,7 +140,7 @@ def test_scroll_down_uses_targeted_wheel_path(monkeypatch):
     captured = {}
     monkeypatch.setattr(ima_ax_extractor, "run_cua_call",
                         lambda tool, params: captured.update(tool=tool, params=params) or {})
-    monkeypatch.setattr(ima_ax_extractor, "_SCROLL_LOCAL_COORDS", None)
+    monkeypatch.setattr(ima_ax_extractor, "_SCROLL_LOCAL_COORDS", {})
     monkeypatch.setattr(
         ima_ax_extractor, "run_cua",
         lambda *_a: json.dumps({"windows": [

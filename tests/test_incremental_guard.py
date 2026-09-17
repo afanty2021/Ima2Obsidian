@@ -3,6 +3,7 @@
 第二轮的测试手抄 main 逻辑、用截断 stdout 把 bug 藏住了。这一版直接调 main()，
 并复刻真实 extractor 行为（守卫通过 → 后续步骤失败 → exit 1）。
 """
+import contextlib
 import sqlite3
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+import ima_incremental_update
 from ima_common import init_database, verify_urls_canonical
 from ima_incremental_update import update_knowledge_base, main
 
@@ -263,13 +265,13 @@ class TestExtractorFailureHandling:
 class TestExtractorStreamingBranches:
     """流式改造（Popen + threading.Timer 预算）的异常分支"""
 
+    @contextlib.contextmanager
     def _flow_patches(self):
-        return [
-            patch("ima_incremental_update.activate_ima"),
-            patch("ima_incremental_update.ensure_ima_ready", return_value=True),
-            patch("ima_incremental_update.get_ima_main_window",
-                  return_value={"pid": 1, "window_id": 1, "bounds": {}}),
-        ]
+        with patch("ima_incremental_update.activate_ima"), \
+             patch("ima_incremental_update.ensure_ima_ready", return_value=True), \
+             patch("ima_incremental_update.get_ima_main_window",
+                   return_value={"pid": 1, "window_id": 1, "bounds": {}}):
+            yield
 
     def test_budget_kill_returncode_minus9_counts_failed(self, temp_db):
         """3600s 预算强杀（SIGKILL → returncode=-9）→ 计知识库失败，不抛异常"""
@@ -278,27 +280,25 @@ class TestExtractorStreamingBranches:
         fake_proc.stdout = iter(["✅ URL 规范化自检通过", "  识别到 5 篇文章"])
         fake_proc.returncode = -9
 
-        with patch("ima_incremental_update.subprocess.Popen", return_value=fake_proc), \
-             patch("ima_incremental_update.threading.Timer") as fake_timer, \
-             patch("ima_incremental_update.activate_ima"), \
-             patch("ima_incremental_update.ensure_ima_ready", return_value=True), \
-             patch("ima_incremental_update.get_ima_main_window",
-                   return_value={"pid": 1, "window_id": 1, "bounds": {}}):
+        with self._flow_patches(), \
+             patch("ima_incremental_update.subprocess.Popen", return_value=fake_proc), \
+             patch("ima_incremental_update.threading.Timer") as fake_timer:
             stats = update_knowledge_base("AI", dry_run=False)
 
         assert stats == {"new": 0, "skipped": 0, "failed": 1}
         # 预算看门狗确实启动过（start 在 Timer(...) 的返回实例上调用）
         fake_timer.return_value.start.assert_called_once()
+        # -9 专属分支的超时诊断日志（通用 exit≠0 分支不产生它）——
+        # 删掉 -9 elif 分支本断言即红，防止测试退化为只锁约定
+        assert "已强制终止" in ima_incremental_update.LOG_FILE.read_text(
+            encoding="utf-8")
 
     def test_popen_spawn_failure_counts_failed(self, temp_db):
         """Popen 启动失败（如 python 缺失）→ 计知识库失败，不抛异常"""
         init_database()
-        with patch("ima_incremental_update.subprocess.Popen",
-                   side_effect=OSError("spawn failed")), \
-             patch("ima_incremental_update.activate_ima"), \
-             patch("ima_incremental_update.ensure_ima_ready", return_value=True), \
-             patch("ima_incremental_update.get_ima_main_window",
-                   return_value={"pid": 1, "window_id": 1, "bounds": {}}):
+        with self._flow_patches(), \
+             patch("ima_incremental_update.subprocess.Popen",
+                   side_effect=OSError("spawn failed")):
             stats = update_knowledge_base("AI", dry_run=False)
 
         assert stats["failed"] == 1

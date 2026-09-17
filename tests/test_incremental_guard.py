@@ -258,3 +258,47 @@ class TestExtractorFailureHandling:
                 f"不应返回 {forbidden_key}（入口预检已替代）；stats={stats}"
         assert stats["failed"] == 1, "应当作为普通失败计数"
         # main 据此 stats 不会跳过下个 KB（验证 stats 里没有让 main 短路的字段）
+
+
+class TestExtractorStreamingBranches:
+    """流式改造（Popen + threading.Timer 预算）的异常分支"""
+
+    def _flow_patches(self):
+        return [
+            patch("ima_incremental_update.activate_ima"),
+            patch("ima_incremental_update.ensure_ima_ready", return_value=True),
+            patch("ima_incremental_update.get_ima_main_window",
+                  return_value={"pid": 1, "window_id": 1, "bounds": {}}),
+        ]
+
+    def test_budget_kill_returncode_minus9_counts_failed(self, temp_db):
+        """3600s 预算强杀（SIGKILL → returncode=-9）→ 计知识库失败，不抛异常"""
+        init_database()
+        fake_proc = MagicMock()
+        fake_proc.stdout = iter(["✅ URL 规范化自检通过", "  识别到 5 篇文章"])
+        fake_proc.returncode = -9
+
+        with patch("ima_incremental_update.subprocess.Popen", return_value=fake_proc), \
+             patch("ima_incremental_update.threading.Timer") as fake_timer, \
+             patch("ima_incremental_update.activate_ima"), \
+             patch("ima_incremental_update.ensure_ima_ready", return_value=True), \
+             patch("ima_incremental_update.get_ima_main_window",
+                   return_value={"pid": 1, "window_id": 1, "bounds": {}}):
+            stats = update_knowledge_base("AI", dry_run=False)
+
+        assert stats == {"new": 0, "skipped": 0, "failed": 1}
+        # 预算看门狗确实启动过（start 在 Timer(...) 的返回实例上调用）
+        fake_timer.return_value.start.assert_called_once()
+
+    def test_popen_spawn_failure_counts_failed(self, temp_db):
+        """Popen 启动失败（如 python 缺失）→ 计知识库失败，不抛异常"""
+        init_database()
+        with patch("ima_incremental_update.subprocess.Popen",
+                   side_effect=OSError("spawn failed")), \
+             patch("ima_incremental_update.activate_ima"), \
+             patch("ima_incremental_update.ensure_ima_ready", return_value=True), \
+             patch("ima_incremental_update.get_ima_main_window",
+                   return_value={"pid": 1, "window_id": 1, "bounds": {}}):
+            stats = update_knowledge_base("AI", dry_run=False)
+
+        assert stats["failed"] == 1

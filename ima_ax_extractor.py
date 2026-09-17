@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 # 导入公共模块
 from ima_common import (
     DB_FILE, CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running, init_database,
-    get_ima_main_window, find_cliclick,
+    get_ima_main_window, find_cliclick, is_ima_app_name,
 )
 
 # ==================== 配置 ====================
@@ -42,6 +42,8 @@ MAX_PAGES = 65
 # 有未知候选的页整页走完，本阈值放宽为「候选数 + MAX_CONSECUTIVE_SEEN」，
 # 仅作候选全为误报（标题匹配系统性失准）时的保险丝
 MAX_CONSECUTIVE_SEEN = 2
+# 连续「有候选但零新增」走查页数上限：标题预检与 DB 标题系统性失配时的止损线
+MAX_ZERO_NEW_WALK_PAGES = 3
 # 点击后校验"打开的是本篇"的最大尝试次数（含首次点击；失败即重试点击）
 CLICK_VERIFY_ATTEMPTS = 3
 
@@ -379,7 +381,7 @@ def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
             print(f"  ⚠️  extract_url_ax list_windows 失败: {e}")
             return None
         for w in wins:
-            if "ima" not in w.get("app_name", "").lower():
+            if not is_ima_app_name(w.get("app_name", "")):
                 continue
             if w.get("bounds", {}).get("height", 0) <= 200:
                 continue
@@ -627,10 +629,9 @@ def _kb_visible_in_any_window(kb_name: str) -> Optional[bool]:
     None——调用方对 None 放行，仅对明确的 False 中止，避免误中止。"""
     try:
         wins = json.loads(run_cua(["list_windows"]))["windows"]
-        ima_names = {"ima", "ima.copilot"}
         titles = [
             w.get("title", "") for w in wins
-            if w.get("app_name", "").lower() in ima_names
+            if is_ima_app_name(w.get("app_name", ""))
             and w.get("bounds", {}).get("height", 0) > 200
         ]
         if not any(titles):
@@ -691,6 +692,9 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     db_titles = _load_db_titles_norm()
     # 连续「整页标题均在库」的页数：达到 2 判定列表走完（见页级标题预检注释）
     confirmed_known_pages = 0
+    # 连续「有候选但零新增」的走查页数：达到 MAX_ZERO_NEW_WALK_PAGES 判定标题
+    # 预检与库系统性失配，停止翻页（防失配时走满 MAX_PAGES）
+    zero_new_walk_pages = 0
 
     for page in range(1, MAX_PAGES + 1):
         print(f"\n{'─' * 50}")
@@ -898,6 +902,19 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             if page_new == 0 and page_skipped == 0 and page_failed == 0:
                 print("  ⚠️  本页无进展，停止继续滚动")
                 break
+
+            # 标题预检保险丝的第二道：预检判定有候选，但整页走完却零新增——
+            # DB 标题与列表标题系统性失配时，候选永远消化不完，会一路走满
+            # MAX_PAGES。连续多页「有候选零新增」即判定失配，停止翻页。
+            # 有失败页不计入（AX 抖动属临时态，保守继续走）。
+            if page_new == 0 and page_failed == 0:
+                zero_new_walk_pages += 1
+                if zero_new_walk_pages >= MAX_ZERO_NEW_WALK_PAGES:
+                    print(f"  ⚠️  连续 {zero_new_walk_pages} 页有候选但零新增"
+                          f"（标题预检与库系统性失配），停止翻页")
+                    break
+            else:
+                zero_new_walk_pages = 0
 
         # 滚动加载更多
         print("  滚动加载更多...")

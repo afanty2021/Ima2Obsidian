@@ -356,3 +356,59 @@ def test_click_failure_allows_retry_on_next_page(temp_db, monkeypatch):
         saved_urls = {row[0] for row in conn.execute("SELECT url FROM articles")}
     # 点击失败的文章在第二页重试成功
     assert "https://mp.weixin.qq.com/s/retry-click" in saved_urls
+
+
+def test_zero_new_candidate_pages_trip_systematic_mismatch_fuse(temp_db, monkeypatch):
+    """连续「有候选但零新增」页达到上限 → 判定标题预检与库系统性失配，停止翻页。
+
+    背景：DB 标题与列表标题系统性失配（如旧库全用另一种标题风格）时，
+    每页都有"未知候选"、URL 又全命中——没有这道保险丝会一路走满 MAX_PAGES。
+    """
+    init_database()
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute(
+            "INSERT INTO articles (url, title, knowledge_base, status) VALUES "
+            "('https://mp.weixin.qq.com/s/known-u', '库内标题K', 'AI', 'success')"
+        )
+
+    # 三页各有 2 个未知候选标题，URL 却全命中同一篇已知文章（失配形态）
+    pages = [
+        [{"element_index": 1, "title": "列表标题甲"}, {"element_index": 2, "title": "列表标题乙"}],
+        [{"element_index": 1, "title": "列表标题丙"}, {"element_index": 2, "title": "列表标题丁"}],
+        [{"element_index": 1, "title": "列表标题戊"}, {"element_index": 2, "title": "列表标题己"}],
+    ]
+    urls = iter(["https://mp.weixin.qq.com/s/known-u"] * 6)
+    page_titles = iter(["列表标题甲", "列表标题乙", "列表标题丙", "列表标题丁", "列表标题戊", "列表标题己"])
+    parsed_pages = []
+
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 10)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_ZERO_NEW_WALK_PAGES", 3)
+    # 放宽连续命中阈值（跨页累计），确保本测试先触发零新增保险丝而非它
+    monkeypatch.setattr(ima_ax_extractor, "MAX_CONSECUTIVE_SEEN", 5)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
+    monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
+    monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_AFTER_CLOSE", 0)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_SCROLL", 0)
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_window_state",
+        lambda _pid, _wid: {"element_count": 100},
+    )
+
+    def parse_page(_state, _kb_name):
+        parsed_pages.append(True)
+        return pages.pop(0)
+
+    monkeypatch.setattr(ima_ax_extractor, "parse_articles_from_tree", parse_page)
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
+    monkeypatch.setattr(ima_ax_extractor, "click_element", lambda _p, _w, _e: True)
+    monkeypatch.setattr(ima_ax_extractor, "extract_url_ax", lambda *_a: next(urls))
+    monkeypatch.setattr(ima_ax_extractor, "extract_title_ax", lambda: next(page_titles))
+    monkeypatch.setattr(ima_ax_extractor, "cmd_w_close", lambda **_kw: None)
+    monkeypatch.setattr(ima_ax_extractor, "scroll_down", lambda *_a: None)
+    monkeypatch.setattr(ima_ax_extractor.time, "sleep", lambda _s: None)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    # 第 3 个零新增页走完即触发保险丝，不再解析第 4 页
+    assert len(parsed_pages) == 3

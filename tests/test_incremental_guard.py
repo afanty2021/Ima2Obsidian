@@ -234,17 +234,16 @@ class TestExtractorFailureHandling:
         daemon 挂/AX<100 也会 exit 1。绝不能因此跳过剩余 KB。"""
         init_database()
 
-        fake_result = MagicMock()
-        fake_result.returncode = 1
-        # 这是真实 extractor 的典型 stdout：守卫通过 + 后续失败
-        fake_result.stdout = (
-            "✅ 数据库: ima_articles.db (已有 100 篇)\n"
-            "✅ URL 规范化自检通过\n"
-            "❌ cua-driver daemon 未运行\n"
-        )
-        fake_result.stderr = ""
+        # 流式改造后走 Popen（stdout 逐行读）：模拟 exit 1 的提取器输出
+        fake_proc = MagicMock()
+        fake_proc.stdout = iter([
+            "✅ 数据库: ima_articles.db (已有 100 篇)",
+            "✅ URL 规范化自检通过",
+            "❌ cua-driver daemon 未运行",
+        ])
+        fake_proc.returncode = 1
 
-        with patch("ima_incremental_update.subprocess.run", return_value=fake_result), \
+        with patch("ima_incremental_update.subprocess.Popen", return_value=fake_proc), \
              patch("ima_incremental_update.activate_ima"), \
              patch("ima_incremental_update.ensure_ima_ready", return_value=True), \
              patch("ima_incremental_update.get_ima_main_window",

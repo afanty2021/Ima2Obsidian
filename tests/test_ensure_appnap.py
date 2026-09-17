@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import patch, MagicMock
-from ima_common import ensure_appnap_disabled
+from ima_common import ensure_appnap_disabled, ensure_ima_appnap_disabled
 
 
 class TestEnsureAppNapDisabled(unittest.TestCase):
@@ -65,6 +65,40 @@ class TestEnsureAppNapDisabled(unittest.TestCase):
             result = ensure_appnap_disabled(quiet_restart_hint=True)
         self.assertFalse(result)
         self.assertNotIn("建议重启", buf.getvalue())
+
+
+class TestEnsureImaAppNapDisabled(unittest.TestCase):
+    """ima（com.tencent.imamac）的 App Nap 禁用——2026-09-17 AX 脱落根治方案"""
+
+    @patch("ima_common.subprocess.run")
+    def test_already_set_returns_true_no_write(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="1\n", stderr="")
+        result = ensure_ima_appnap_disabled()
+        self.assertTrue(result)
+        self.assertEqual(mock_run.call_count, 1)
+        # 读的是 ima 的 domain，不是 Obsidian 的
+        self.assertIn("com.tencent.imamac", mock_run.call_args[0][0])
+
+    @patch("ima_common.subprocess.run")
+    def test_not_set_writes_ima_domain(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr="not found"),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+        result = ensure_ima_appnap_disabled()
+        self.assertFalse(result)
+        self.assertEqual(mock_run.call_count, 2)
+        write_args = mock_run.call_args_list[1][0][0]
+        self.assertIn("com.tencent.imamac", write_args)
+        self.assertIn("YES", write_args)
+
+    @patch("ima_common.subprocess.run")
+    def test_obsidian_still_targets_obsidian_domain(self, mock_run):
+        """回归钉：扩展后 ensure_appnap_disabled 仍只操作 md.obsidian"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="1\n", stderr="")
+        self.assertTrue(ensure_appnap_disabled())
+        self.assertIn("md.obsidian", mock_run.call_args[0][0])
+        self.assertNotIn("com.tencent.imamac", mock_run.call_args[0][0])
 
 
 if __name__ == "__main__":

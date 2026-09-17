@@ -38,10 +38,79 @@ WAIT_SCROLL = 2.0
 WAIT_ACTIVATE = 0.5
 
 MAX_PAGES = 65
-MAX_CONSECUTIVE_SEEN = 2 # 连续遇到已存在文章后停止
+# 连续已存在早停阈值。语义（2026-09-17 起）：每页先做标题预检，全部命中直接停；
+# 有未知候选的页整页走完，本阈值放宽为「候选数 + MAX_CONSECUTIVE_SEEN」，
+# 仅作候选全为误报（标题匹配系统性失准）时的保险丝
+MAX_CONSECUTIVE_SEEN = 2
+# 点击后校验"打开的是本篇"的最大尝试次数（含首次点击；失败即重试点击）
+CLICK_VERIFY_ATTEMPTS = 3
 
 
 _CLICLICK_PATH = find_cliclick()
+
+
+# ==================== 幻影跳过防护 ====================
+#
+# 2026-09-17 实证（英语教与学 首屏第 2 篇不在库却报"已存在"）：点击未生效/未切换时，
+# extract_url_ax 读到旧文章标签页的 URL，url_exists 误判"已存在"计入连续命中，
+# 两连即触发 MAX_CONSECUTIVE_SEEN 早停——列表顶部真新文章被静默跳过。
+# 因此点击后必须先确认打开的是本篇，幻影 URL 绝不进入 url_exists。
+
+# 列表标题 vs 文章页标题常有空白/标点/前后缀微差，比较前统一剥离
+_TITLE_COMPARE_NOISE = re.compile(
+    r"[\s「」『』“”‘’\"'《》【】()\[\]（）·：:，,。．、！!？?\-—–~～*…]+"
+)
+
+
+def normalize_title_for_compare(title: Optional[str]) -> str:
+    """剥离空白与中英文标点后转小写，供标题容错比较。"""
+    return _TITLE_COMPARE_NOISE.sub("", title or "").lower()
+
+
+def is_same_article_page(
+    list_title: Optional[str],
+    page_title: Optional[str],
+    url: Optional[str],
+    prev_url: Optional[str],
+) -> bool:
+    """判断点击后打开的文章页是否就是列表里点的那篇。
+
+    - page_title 非空：归一化后相等，或短方(≥6字)为长方子串（容忍截断/前后缀差异）。
+    - page_title 为空（AXDocument 未就绪；launchd 下 osascript 读 AX 被 TCC 拦截，
+      extract_title_ax 恒 None）：退化为 URL 基线——与上一篇已验证 URL 相同即判幻影，
+      不同则放行。首篇无基线可被会话残留标签页漏过，但该卡失败路径的
+      cmd_w_close(None) 会关闭任意残留标签页，且单发幻影不足以触发早停。
+    """
+    norm_page = normalize_title_for_compare(page_title)
+    if not norm_page:
+        return bool(url) and url != prev_url
+    norm_list = normalize_title_for_compare(list_title)
+    if norm_page == norm_list:
+        return True
+    short, long_ = sorted((norm_page, norm_list), key=len)
+    return len(short) >= 6 and short in long_
+
+
+def ax_tree_menu_bar_only(md: str) -> bool:
+    """AX 树是否已脱落成「仅菜单栏」形态（有 AXMenuBar 而 AXStaticText 为 0）。
+
+    2026-09-17 实证：新版 ima 的 web AX 会被 macOS 回收（App Nap 类机制）成
+    仅菜单栏，element_count 仍 >100（菜单 265 项），数量阈值区分不了；此态下
+    点击按在死元素上、状态读取耗满 run_cua 30s 超时，每张卡可磨 8-10 分钟。
+    空 md 视为未知，不算脱落（不误触发中止）。"""
+    return bool(md) and "AXMenuBar" in md and "AXStaticText" not in md
+
+
+def _read_main_window_md() -> str:
+    """廉价读取主窗口 AX markdown（脱落探测用）；失败返回空串（视为未知）。"""
+    try:
+        w = get_ima_main_window()
+        if not w:
+            return ""
+        st = get_window_state(w["pid"], w["window_id"])
+        return (st or {}).get("tree_markdown", "")
+    except Exception:
+        return ""
 
 
 # ==================== URL 规范化 ====================
@@ -235,12 +304,41 @@ def click_element(pid: int, window_id: int, element_index: int) -> bool:
     return result is not None
 
 
+# 定向滚轮的窗口局部坐标缓存（窗口尺寸整个会话恒定，算一次即可）
+_SCROLL_LOCAL_COORDS: Optional[dict] = None
+
+
+def _scroll_local_coords(window_id: int) -> dict:
+    """取定向滚轮的窗口局部坐标：宽度中点、y≈45%（列表区，避开左侧 KB 侧边栏）。"""
+    global _SCROLL_LOCAL_COORDS
+    if _SCROLL_LOCAL_COORDS:
+        return _SCROLL_LOCAL_COORDS
+    width, height = 1400, 900  # 兜底（自动化窗口长期为 1512x949）
+    try:
+        wins = json.loads(run_cua(["list_windows"]))["windows"]
+        for w in wins:
+            if w.get("window_id") == window_id:
+                b = w.get("bounds", {})
+                width, height = b.get("width", width), b.get("height", height)
+                break
+    except Exception:
+        pass
+    _SCROLL_LOCAL_COORDS = {"x": int(width * 0.5), "y": int(height * 0.45)}
+    return _SCROLL_LOCAL_COORDS
+
+
 def scroll_down(pid: int, window_id: int, amount: int = 3):
+    # 新版 ima 列表是嵌套 overflow 滚动区，不吃合成按键（PageDown/箭头/无目标
+    # 滚轮三路由实测全部无效，2026-09-17）；必须用 cua-driver 定向滚轮路径：
+    # window-local x/y 处合成真实滚轮事件（CGEventCreateScrollWheelEvent），
+    # 按光标命中测试落在列表滚动区上。
+    coords = _scroll_local_coords(window_id)
     run_cua_call("scroll", {
         "pid": pid,
         "window_id": window_id,
         "direction": "down",
-        "amount": amount
+        "amount": amount,
+        **coords,
     })
 
 
@@ -313,6 +411,24 @@ def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
                         return m_url.group(1)
         time.sleep(1.5)
     return None
+
+
+def close_all_article_tabs(max_tabs: int = 5) -> int:
+    """关闭所有文章标签页，返回关闭数（探测不到标签页立即返回 0）。
+
+    中断/幻影重试会留下残留标签页，而 extract_url_ax 按 list_windows 顺序读
+    第一个含地址栏的窗口——残留标签页排在前面时，校验循环每次都读到旧 URL、
+    每次都判幻影，表现为「永远卡在同一篇文章」（2026-09-17 学困生 实证：
+    上一轮 Ctrl+C 残留的标签页让下一轮所有卡片幻影化）。
+    幻影重试前与走库开始时调用本函数，保证「点击后唯一打开的标签页」无歧义。
+    """
+    closed = 0
+    for _ in range(max_tabs):
+        if extract_url_ax() is None:
+            break
+        cmd_w_close()
+        closed += 1
+    return closed
 
 
 def extract_title_ax() -> Optional[str]:
@@ -503,6 +619,38 @@ def parse_articles_from_tree(state: Dict, kb_name: str = "") -> List[Dict]:
 
 # ==================== 核心提取逻辑 ====================
 
+def _kb_visible_in_any_window(kb_name: str) -> Optional[bool]:
+    """CG 标题层面判断目标 KB 是否仍显示在任一 ima 大窗口（走库漂移守卫用）。
+
+    用 list_windows 的 CG 标题（launchd 下可读），不依赖 System Events。
+    返回 True/False；无法判定（标题全空/读取失败，如 Electron 冷启动）返回
+    None——调用方对 None 放行，仅对明确的 False 中止，避免误中止。"""
+    try:
+        wins = json.loads(run_cua(["list_windows"]))["windows"]
+        ima_names = {"ima", "ima.copilot"}
+        titles = [
+            w.get("title", "") for w in wins
+            if w.get("app_name", "").lower() in ima_names
+            and w.get("bounds", {}).get("height", 0) > 200
+        ]
+        if not any(titles):
+            return None
+        return any(kb_name in t for t in titles if t)
+    except Exception:
+        return None
+
+
+def _load_db_titles_norm() -> set:
+    """全部文章标题的归一化集合（页级标题预检用）。
+
+    跨库包含：URL 唯一约束下，任一库已提取即视为已知（跨库重复是独立已知限制）。"""
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        return {
+            normalize_title_for_compare(t)
+            for (t,) in conn.execute("SELECT title FROM articles WHERE title IS NOT NULL")
+        }
+
+
 async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     print("\n" + "=" * 60)
     print(f"开始批量提取（{kb_name} 知识库）")
@@ -512,7 +660,18 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     total_skipped = 0
     total_failed = 0
     consecutive_seen = 0
+    # 上一篇通过幻影校验的文章 URL：launchd 下标题校验不可用时的幻影判定基线
+    prev_verified_url: Optional[str] = None
     processed_titles: Set[str] = set()
+
+    # 走库前清掉残留文章标签页（上一轮中断/失败的遗留会让首卡读到旧 URL）
+    leftover = close_all_article_tabs()
+    if leftover:
+        print(f"  ⚠️  已关闭 {leftover} 个残留文章标签页")
+
+    db_titles = _load_db_titles_norm()
+    # 连续「整页标题均在库」的页数：达到 2 判定列表走完（见页级标题预检注释）
+    confirmed_known_pages = 0
 
     for page in range(1, MAX_PAGES + 1):
         print(f"\n{'─' * 50}")
@@ -534,6 +693,16 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             print(f"  ⚠️  元素数过少 ({elem_count})，可能窗口不在当前 Space")
             break
 
+        # AX 脱落检测：仅菜单栏形态下继续走库只会死点击 + 30s/次读取超时
+        if ax_tree_menu_bar_only(state.get("tree_markdown", "")):
+            print("  ⚠️  AX 树呈仅菜单栏形态（AX 已脱落），激活 IMA 后重读...")
+            activate_ima()
+            state = get_window_state(pid, window_id)
+            if not state or ax_tree_menu_bar_only(state.get("tree_markdown", "")):
+                print("  ❌ IMA AX 树已脱落且激活无效，中止本库提取"
+                      "（已提取文章照常进入保存阶段；根治见 ima NSAppSleepDisabled）")
+                break
+
         # 解析文章列表
         articles = parse_articles_from_tree(state, kb_name)
         print(f"  识别到 {len(articles)} 篇文章")
@@ -542,13 +711,43 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             print("  ⚠️  未找到文章，可能已到列表底部")
             break
 
+        # KB 漂移守卫：窗口已离开目标知识库（如误点侧边栏/重启后停在别的库）
+        # 时立即中止——防止把别的库的文章张冠李戴入库（2026-09-17 实证 15 篇）
+        if _kb_visible_in_any_window(kb_name) is False:
+            print(f"  ❌ IMA 窗口已离开 '{kb_name}' 知识库，中止本库提取（防跨库污染）")
+            break
+
+        # 页级标题预检：本页标题与 DB 比对，全部命中则不点击任何卡片。
+        # 背景（2026-09-17 英语教与学 实证）：列表顶部可能是 2 篇已知文章、其下才是
+        # 7+ 篇从未提取的——「连续 2 篇已存在即停」的旧启发式会把它们全部漏掉。
+        # 标题匹配只用于"是否存在未知候选"的页级决策，skip/新增仍以 URL 为准。
+        # 注意：预检只能看到可视区卡片——全已知页不立即停止，而是滚动一页确认
+        # 折叠线以下；连续两页全已知才判定列表走完（scroll 需真实推进）。
+        unknown_titles = [
+            a["title"] for a in articles
+            if normalize_title_for_compare(a["title"]) not in db_titles
+        ]
+        if not unknown_titles:
+            confirmed_known_pages += 1
+            if confirmed_known_pages >= 2:
+                print("  连续两页所有标题均已在库，判定列表已走完，停止翻页")
+                break
+            print("  本页所有标题均已在库，滚动一页确认折叠线以下……")
+        else:
+            confirmed_known_pages = 0
+        # 连续早停阈值放宽：候选未消化完之前不轻易停（详见 MAX_CONSECUTIVE_SEEN 注释）
+        consecutive_stop_at = len(unknown_titles) + MAX_CONSECUTIVE_SEEN
+
         page_new = 0
         page_skipped = 0
         page_failed = 0
 
         should_stop = False
 
-        for i, article in enumerate(articles, 1):
+        # 全已知页不点击（无候选可提取），但仍要走滚动路径确认折叠线以下
+        walk_target = articles if unknown_titles else []
+
+        for i, article in enumerate(walk_target, 1):
             elem_idx = article["element_index"]
             title = article["title"]
 
@@ -584,19 +783,51 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             await asyncio.sleep(WAIT_CLICK_LOAD)
 
             article_url: Optional[str] = None
+            retry_click_failed = False
             try:
-                # 提取 URL
-                url = extract_url_ax(pid, window_id)
+                # 幻影防护：确认打开的是本篇才信任 URL（is_same_article_page docstring）。
+                # 幻影/未读到 URL 都重试点击；幻影 URL 绝不进入 url_exists。
+                url = None
+                verified_page_title: Optional[str] = None
+                for verify_attempt in range(1, CLICK_VERIFY_ATTEMPTS + 1):
+                    if verify_attempt > 1:
+                        # 脱落态下点击必落空、状态读取必耗满超时——先廉价探测，脱落则放弃重试
+                        if ax_tree_menu_bar_only(_read_main_window_md()):
+                            print("    ❌ IMA AX 树已脱落（仅菜单栏），放弃重试")
+                            break
+                        # 残留标签页投毒防护：关掉所有文章标签页再重试点击，
+                        # 保证重读到的必然是本次点击打开的那篇
+                        closed = close_all_article_tabs()
+                        if closed:
+                            print(f"    ⚠️  已清理 {closed} 个残留标签页后重试")
+                        print(f"    ⚠️  打开的不是本篇（幻影）或未读到 URL，重试点击 ({verify_attempt}/{CLICK_VERIFY_ATTEMPTS})...")
+                        if not click_element(pid, window_id, elem_idx):
+                            print("    ❌ 重试点击失败，刷新状态重试...")
+                            retry_click_failed = True
+                            break
+                        await asyncio.sleep(WAIT_CLICK_LOAD)
+                    url = extract_url_ax(pid, window_id)
+                    if not url:
+                        continue  # 没读到 URL：可能点击未生效，重试
+                    page_title = extract_title_ax()
+                    if is_same_article_page(title, page_title, url, prev_verified_url):
+                        verified_page_title = page_title
+                        break
+                    url = None  # 幻影：读到的是其他文章的 URL，丢弃不计
 
                 if not url:
-                    print("    ⚠️  未提取到 URL")
+                    print("    ⚠️  未提取到本篇 URL")
                     total_failed += 1
                     page_failed += 1
                     consecutive_seen = 0  # 失败时重置计数器
+                    if retry_click_failed:
+                        # 与首次点击失败同语义：索引缓存已可疑，跳出本页由下页重新解析
+                        break  # finally 负责关闭标签页
                     continue  # finally 负责关闭标签页
 
                 print(f"    ✅ URL: {url[:80]}...")
                 article_url = url
+                prev_verified_url = url
                 # URL 成功提取后才标记已处理——点击/URL 失败的标题
                 # 不在此标记，允许分页重叠时在后续页面重试。
                 processed_titles.add(title)
@@ -607,15 +838,17 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                     page_skipped += 1
                     consecutive_seen += 1
 
-                    if consecutive_seen >= MAX_CONSECUTIVE_SEEN:
-                        print(f"\n  ⚠️  连续 {consecutive_seen} 篇已存在，可能已全部提取")
+                    if consecutive_seen >= consecutive_stop_at:
+                        print(f"\n  ⚠️  连续 {consecutive_seen} 篇已存在（本页 {len(unknown_titles)} 个"
+                              f"疑似未知标题均为误报），可能已全部提取")
                         should_stop = True
                         break  # finally 负责关闭标签页
                 else:
                     # 只有确认 URL 不在数据库中时，才打断连续命中计数。
                     consecutive_seen = 0
-                    title_extracted = extract_title_ax()
-                    final_title = title_extracted or title
+                    # 页面标题已在幻影校验时读取并通过匹配，直接复用（省一次 osascript；
+                    # launchd 下为 None，落回列表标题，与旧 extract_title_ax 失败路径一致）
+                    final_title = verified_page_title or title
                     print(f"    ✅ 标题: {final_title[:60]}...")
 
                     if save_article(url, final_title, kb_name):
@@ -637,14 +870,15 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
         if should_stop:
             break
 
-        print(f"\n  本页完成: 新增 {page_new}, 跳过 {page_skipped}")
+        if unknown_titles:
+            print(f"\n  本页完成: 新增 {page_new}, 跳过 {page_skipped}")
 
-        # 本页没有新增、跳过或失败，说明列表没有继续推进（通常是滚动卡住，
-        # 或页面内容已完全由本次运行处理过）。有失败时继续尝试，避免 AX 临时
-        # 故障导致整页 URL 提取失败后被误判为列表已卡住。
-        if page_new == 0 and page_skipped == 0 and page_failed == 0:
-            print("  ⚠️  本页无进展，停止继续滚动")
-            break
+            # 本页没有新增、跳过或失败，说明列表没有继续推进（通常是滚动卡住，
+            # 或页面内容已完全由本次运行处理过）。有失败时继续尝试，避免 AX 临时
+            # 故障导致整页 URL 提取失败后被误判为列表已卡住。
+            if page_new == 0 and page_skipped == 0 and page_failed == 0:
+                print("  ⚠️  本页无进展，停止继续滚动")
+                break
 
         # 滚动加载更多
         print("  滚动加载更多...")
@@ -733,10 +967,18 @@ async def main():
 
     if kb_name in title:
         print(f"✅ 确认在 {kb_name} 知识库列表页")
+    elif title:
+        # 标题非空但不匹配 = 窗口停在别的知识库（如 ima 重启后恢复到上次浏览的 KB）。
+        # 绝不能继续：整轮提取会把别的库的文章张冠李戴入库
+        # （2026-09-17 实证：15 篇皮皮鲁文章被挂到英语教与学名下）。
+        print(f"❌ 窗口标题是 '{title}'，不含目标知识库 '{kb_name}'")
+        print(f"   请先在 IMA 中打开 {kb_name} 知识库列表页再运行")
+        sys.exit(2)
     else:
-        print(f"⚠️  窗口标题不包含 '{kb_name}'")
-        print(f"   请确保 IMA 已打开 {kb_name} 知识库列表页")
-        print("   继续尝试提取...")
+        # 标题为空（Electron 冷启动标题读取不可靠/System Events 无权限）：
+        # 无法从标题判定，放行但显式声明——真正的防线是 extract_articles 的
+        # 每页 CG 标题漂移守卫 + 幻影标题校验
+        print(f"⚠️  窗口标题为空，无法确认在 '{kb_name}' 知识库，继续尝试提取...")
 
     # 获取初始状态验证
     state = get_window_state(pid, window_id)

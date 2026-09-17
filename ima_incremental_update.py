@@ -29,9 +29,13 @@ from pathlib import Path
 # 导入公共模块
 from ima_common import (
     CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running,
+    ensure_ima_appnap_disabled,
     save_snapshot_and_report_drift,
     get_ima_main_window, ensure_appnap_disabled,
 )
+
+# 提取器子进程总预算（秒）：到点强杀（threading.Timer），防止病态场景拖穿夜窗
+EXTRACTOR_BUDGET_SECONDS = 3600
 
 # ==================== 配置 ====================
 
@@ -132,6 +136,9 @@ def is_ima_running() -> bool:
 def launch_ima():
     """启动 IMA 应用"""
     log("启动 IMA 应用...")
+    # 先写 NSAppSleepDisabled 再 open：新进程自带标志（后台 AX 不被系统回收，
+    # 防提取中途 AX 脱落成仅菜单栏）。已设置时函数内 no-op 无日志。
+    ensure_ima_appnap_disabled(quiet_restart_hint=True)
     subprocess.run(
         ["open", "-a", "ima.copilot"],
         capture_output=True, timeout=10
@@ -935,44 +942,64 @@ def update_knowledge_base(kb_name: str, dry_run: bool = False) -> dict:
     ]
 
     log(f"执行提取器...")
+    # 流式回灌：提取器每张卡 ~40s，旧 capture_output 会把全部输出憋到进程结束才
+    # 回灌，终端整轮空白，用户无从分辨「慢」与「卡死」（2026-09-17 三次误判的
+    # 体验根源）。TTY 下逐行实时打印；日志文件始终逐行落盘供事后排查。
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # 合并 stderr：traceback 也进流，避免双管道读死锁
             text=True,
-            timeout=3600,
-            cwd=Path(__file__).parent
+            errors="replace",
+            cwd=Path(__file__).parent,
         )
-
-        if result.stdout:
-            for line in result.stdout.split("\n"):
-                if line.strip():
-                    log(f"  {line}", print_too=False)
-
-        if result.returncode != 0:
-            log(f"❌ 提取器执行失败")
-            if result.stderr:
-                log(f"错误: {result.stderr}")
-            return {"new": 0, "skipped": 0, "failed": 1}
-
-        # 解析统计信息（含「本次失败」——逐篇提取失败不计入会让门控误判全成功）
-        stats = _parse_extractor_stats(result.stdout)
-        new_count = stats["new"]
-        skipped_count = stats["skipped"]
-        extract_failed = stats["failed"]
-
-        log(f"✅ {kb_name} 更新完成: 新增 {new_count}, 跳过 {skipped_count}")
-        if extract_failed:
-            log(f"⚠️  {kb_name} 有 {extract_failed} 篇提取失败（未入库），"
-                f"计入知识库处理失败以触发 17:10 补扫")
-        return {"new": new_count, "skipped": skipped_count, "failed": extract_failed}
-
-    except subprocess.TimeoutExpired:
-        log(f"❌ {kb_name} 提取超时")
-        return {"new": 0, "skipped": 0, "failed": 1}
     except Exception as e:
-        log(f"❌ {kb_name} 提取失败: {e}")
+        log(f"❌ 提取器启动失败: {e}")
         return {"new": 0, "skipped": 0, "failed": 1}
+
+    stdout_lines = []
+    tty = sys.stdout.isatty()
+
+    def _kill_on_budget():
+        # 提取器内部调用均有界，但病态场景整轮仍可能拖长——保留原 3600s 总预算：
+        # 到点强杀，读循环随 EOF 结束（returncode=-9 → 超时分支）
+        if proc.poll() is None:
+            proc.kill()
+
+    budget = threading.Timer(EXTRACTOR_BUDGET_SECONDS, _kill_on_budget)
+    budget.start()
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip()
+            if not line.strip():
+                continue
+            stdout_lines.append(line)
+            if tty:
+                print(f"  {line}", flush=True)
+            log(f"  {line}", print_too=False)
+        proc.wait(timeout=60)
+    finally:
+        budget.cancel()
+
+    if proc.returncode == -9:
+        log(f"❌ {kb_name} 提取超时（{EXTRACTOR_BUDGET_SECONDS}s 预算，已强制终止）")
+        return {"new": 0, "skipped": 0, "failed": 1}
+    if proc.returncode != 0:
+        log(f"❌ 提取器执行失败 (exit {proc.returncode})")
+        return {"new": 0, "skipped": 0, "failed": 1}
+
+    # 解析统计信息（含「本次失败」——逐篇提取失败不计入会让门控误判全成功）
+    stats = _parse_extractor_stats("\n".join(stdout_lines))
+    new_count = stats["new"]
+    skipped_count = stats["skipped"]
+    extract_failed = stats["failed"]
+
+    log(f"✅ {kb_name} 更新完成: 新增 {new_count}, 跳过 {skipped_count}")
+    if extract_failed:
+        log(f"⚠️  {kb_name} 有 {extract_failed} 篇提取失败（未入库），"
+            f"计入知识库处理失败以触发 17:10 补扫")
+    return {"new": new_count, "skipped": skipped_count, "failed": extract_failed}
 
 
 # ==================== 运行收尾 ====================

@@ -11,6 +11,8 @@ import json
 import sqlite3
 from unittest.mock import patch
 
+import pytest
+
 import ima_ax_extractor
 from ima_ax_extractor import ax_tree_menu_bar_only
 
@@ -192,6 +194,38 @@ class TestKbVisibleInAnyWindow:
             raise RuntimeError("daemon down")
         monkeypatch.setattr(ima_ax_extractor, "run_cua", boom)
         assert ima_ax_extractor._kb_visible_in_any_window("英语教与学") is None
+
+
+class TestVerifyKbOrExit:
+    """运行前 KB 预检（_verify_kb_or_exit）。
+
+    背景（评审 2026-09-17）：旧实现基于 get_kb_window_title——该函数只会返回
+    「包含 kb_name 的标题」或空串，窗口停在别的知识库时必然拿到空串走进放行分支，
+    sys.exit(2) 硬中止对其注释声称的跨库场景是死代码。现改用与走库漂移守卫
+    同源的 _kb_visible_in_any_window 三态判定。"""
+
+    def test_on_target_kb_passes(self, monkeypatch, capsys):
+        monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window",
+                            lambda _kb: True)
+        ima_ax_extractor._verify_kb_or_exit("英语教与学")
+        assert "确认在 英语教与学" in capsys.readouterr().out
+
+    def test_drifted_aborts_with_exit_2(self, monkeypatch, capsys):
+        # 窗口停在别的知识库（如重启后恢复到上次浏览的 KB）→ 必须硬中止
+        monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window",
+                            lambda _kb: False)
+        with pytest.raises(SystemExit) as exc:
+            ima_ax_extractor._verify_kb_or_exit("英语教与学")
+        assert exc.value.code == 2
+        out = capsys.readouterr().out
+        assert "防跨库污染" in out and "英语教与学" in out
+
+    def test_unreadable_titles_passes_with_warning(self, monkeypatch, capsys):
+        # 标题全空/读失败（Electron 冷启动）→ 放行，走库守卫兜底
+        monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window",
+                            lambda _kb: None)
+        ima_ax_extractor._verify_kb_or_exit("英语教与学")
+        assert "继续尝试提取" in capsys.readouterr().out
 
 
 def test_kb_drift_aborts_walk_without_clicks(temp_db, monkeypatch):

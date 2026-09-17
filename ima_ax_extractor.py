@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 # 导入公共模块
 from ima_common import (
     DB_FILE, CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running, init_database,
-    get_ima_main_window, get_kb_window_title, find_cliclick,
+    get_ima_main_window, find_cliclick,
 )
 
 # ==================== 配置 ====================
@@ -640,6 +640,25 @@ def _kb_visible_in_any_window(kb_name: str) -> Optional[bool]:
         return None
 
 
+def _verify_kb_or_exit(kb_name: str) -> None:
+    """运行前 KB 预检：与走库漂移守卫同数据源（list_windows CG 标题，launchd 可读），
+    两层防线真正叠加，而不是 System Events 标题的平行实现。
+
+    True=在目标库；False=窗口标题可读但均不含目标库（停在别的知识库），立即中止——
+    绝不能继续：整轮提取会把别的库的文章张冠李戴入库
+    （2026-09-17 实证：15 篇皮皮鲁文章被挂到英语教与学名下）；
+    None=标题全空/读取失败（Electron 冷启动），放行但显式声明，走库守卫兜底。"""
+    check = _kb_visible_in_any_window(kb_name)
+    if check is True:
+        print(f"✅ 确认在 {kb_name} 知识库列表页")
+        return
+    if check is False:
+        print(f"❌ IMA 窗口标题均不含目标知识库 '{kb_name}'，中止（防跨库污染）")
+        print(f"   请先在 IMA 中打开 {kb_name} 知识库列表页再运行")
+        sys.exit(2)
+    print(f"⚠️  无法从窗口标题确认在 '{kb_name}' 知识库，继续尝试提取...")
+
+
 def _load_db_titles_norm() -> set:
     """全部文章标题的归一化集合（页级标题预检用）。
 
@@ -961,24 +980,8 @@ async def main():
     bounds = window.get("bounds", {})
     print(f"✅ 窗口: PID={pid}, window_id={window_id}, {bounds.get('width')}x{bounds.get('height')}")
 
-    # 验证在指定知识库
-    title = get_kb_window_title(kb_name)
-    print(f"\n当前窗口标题: {title}")
-
-    if kb_name in title:
-        print(f"✅ 确认在 {kb_name} 知识库列表页")
-    elif title:
-        # 标题非空但不匹配 = 窗口停在别的知识库（如 ima 重启后恢复到上次浏览的 KB）。
-        # 绝不能继续：整轮提取会把别的库的文章张冠李戴入库
-        # （2026-09-17 实证：15 篇皮皮鲁文章被挂到英语教与学名下）。
-        print(f"❌ 窗口标题是 '{title}'，不含目标知识库 '{kb_name}'")
-        print(f"   请先在 IMA 中打开 {kb_name} 知识库列表页再运行")
-        sys.exit(2)
-    else:
-        # 标题为空（Electron 冷启动标题读取不可靠/System Events 无权限）：
-        # 无法从标题判定，放行但显式声明——真正的防线是 extract_articles 的
-        # 每页 CG 标题漂移守卫 + 幻影标题校验
-        print(f"⚠️  窗口标题为空，无法确认在 '{kb_name}' 知识库，继续尝试提取...")
+    # 验证在指定知识库（CG 标题三态判定，与走库漂移守卫同源）
+    _verify_kb_or_exit(kb_name)
 
     # 获取初始状态验证
     state = get_window_state(pid, window_id)

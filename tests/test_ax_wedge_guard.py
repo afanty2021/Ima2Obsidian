@@ -475,3 +475,80 @@ def test_wedge_mid_list_heal_descends_past_processed_pages(temp_db, monkeypatch)
     assert calls == {"restart": 1, "navigate": 1}
     # 自愈页(丙失败那次)不滚动；页1、宽限下降页、补试页各滚动一批
     assert len(scrolls) == 30
+
+
+def test_two_heals_in_one_walk_accumulate_budget_and_resume(temp_db, monkeypatch):
+    """单库连续两次自愈：预算叠加消耗（restarts==2）、宽限二次赋值均生效，
+    两次弃卡都在重解析页补试入库（79d6058 宽限语义的多自愈几何）。"""
+    import ima_incremental_update
+    from ima_common import init_database
+
+    init_database()
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute(
+            "INSERT INTO articles (url, title, knowledge_base, status) VALUES "
+            "('https://mp.weixin.qq.com/s/known-seed', '库内已知文章', 'AI', 'success')"
+        )
+
+    t_jia = "新文章甲的标题足够长以通过幻影校验"
+    t_yi = "新文章乙的标题同样足够长以便校验"
+    t_bing = "新文章丙的标题长度也足以通过幻影校验"
+    t_known = "库内已知文章"
+    pages = [
+        [{"element_index": 1, "title": t_jia}],
+        [{"element_index": 1, "title": t_yi}],
+        [{"element_index": 1, "title": t_yi}],
+        [{"element_index": 1, "title": t_bing}],
+        [{"element_index": 1, "title": t_bing}],
+        [{"element_index": 1, "title": t_known}],
+    ]
+    urls = iter([
+        "https://mp.weixin.qq.com/s/jia",   # 甲 正常入库
+        None,                                # 乙 未读到 URL → 探测脱落 → 自愈 1
+        "https://mp.weixin.qq.com/s/yi",    # 乙 重解析补试成功
+        None,                                # 丙 未读到 URL → 探测脱落 → 自愈 2
+        "https://mp.weixin.qq.com/s/bing",  # 丙 重解析补试成功
+    ])
+    page_titles = iter([t_jia, t_yi, t_bing])
+    states = [dict(HEALTHY_STATE), dict(HEALTHY_STATE), dict(WEDGED_STATE),
+              dict(HEALTHY_STATE), dict(HEALTHY_STATE), dict(WEDGED_STATE),
+              dict(HEALTHY_STATE), dict(HEALTHY_STATE), dict(HEALTHY_STATE)]
+    restarts = {"n": 0}
+    parsed = []
+
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 6)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 5)
+    monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
+    monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_window_state",
+        lambda _p, _w: states.pop(0),
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "parse_articles_from_tree",
+        lambda _state, _kb: (parsed.append(1), pages.pop(0))[1],
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_ima_main_window",
+        lambda: {"pid": 9, "window_id": 9, "bounds": {"width": 1512, "height": 949}},
+    )
+    monkeypatch.setattr(ima_incremental_update, "restart_ima", lambda: restarts.update(n=restarts["n"] + 1) or True)
+    monkeypatch.setattr(ima_incremental_update, "navigate_to_kb", lambda kb, allow_restart=True: True)
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
+    monkeypatch.setattr(ima_ax_extractor, "click_element", lambda _p, _w, _e: True)
+    monkeypatch.setattr(ima_ax_extractor, "extract_url_ax", lambda *_a: next(urls))
+    monkeypatch.setattr(ima_ax_extractor, "extract_title_ax", lambda: next(page_titles))
+    monkeypatch.setattr(ima_ax_extractor, "cmd_w_close", lambda **_kw: None)
+    monkeypatch.setattr(ima_ax_extractor, "scroll_down", lambda *_a: None)
+    monkeypatch.setattr(ima_ax_extractor.time, "sleep", lambda _s: None)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    with sqlite3.connect(temp_db) as conn:
+        saved = {row[0] for row in conn.execute("SELECT url FROM articles")}
+
+    assert restarts["n"] == 2  # 两次自愈，预算 5 未耗尽
+    assert {"https://mp.weixin.qq.com/s/jia",
+            "https://mp.weixin.qq.com/s/yi",
+            "https://mp.weixin.qq.com/s/bing"} <= saved
+    assert len(parsed) == 6  # 走满页预算而非中途截停

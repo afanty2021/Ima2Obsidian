@@ -265,8 +265,11 @@ def test_wedge_heal_at_page_start_recovers_and_continues(temp_db, monkeypatch):
     init_database()
     monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 5)
     monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 5)
-    # 页1 顶/重读均脱落；自愈后页2/页3 健康（标题全在库 → 预检停止）
-    states = [dict(WEDGED_STATE), dict(WEDGED_STATE), dict(HEALTHY_STATE), dict(HEALTHY_STATE)]
+    # 页1 顶/重读均脱落；自愈后页2-5 健康（标题全在库）：前两页消耗自愈宽限，
+    # 后两页连续全已知触发预检停止
+    states = [dict(WEDGED_STATE), dict(WEDGED_STATE)] + [
+        dict(HEALTHY_STATE) for _ in range(4)
+    ]
     monkeypatch.setattr(
         ima_ax_extractor, "get_window_state",
         lambda _p, _w: states.pop(0),
@@ -388,3 +391,87 @@ def test_wedge_heal_mid_card_resumes_and_retries_card(temp_db, monkeypatch):
     assert clicked == [1, 2, 2]
     # 自愈页不得滚动（滚动会跳过未处理的弃卡）——仅页 2 走完后的正常翻页滚动一批
     assert len(scrolls) == 10
+
+
+def test_wedge_mid_list_heal_descends_past_processed_pages(temp_db, monkeypatch):
+    """中段脱落几何回归（复审 61b4eb5 Important#1）：页1 全部处理完 → 页2 首卡脱落
+    → 自愈后重解析从列表顶开始，重走已处理页三计数全零，若无宽限「本页无进展」
+    会立刻截停续走、弃卡丢失。宽限机制下必须穿过已处理页下降回弃卡并补试入库。"""
+    import ima_incremental_update
+    from ima_common import init_database
+
+    init_database()
+    page1 = [
+        {"element_index": 1, "title": "新文章甲的标题足够长以通过幻影校验"},
+        {"element_index": 2, "title": "新文章乙的标题同样足够长以便校验"},
+    ]
+    page2 = [
+        {"element_index": 3, "title": "新文章丙的标题一样足够长以便校验通过"},
+        {"element_index": 4, "title": "新文章丁的标题仍旧足够长以便校验"},
+    ]
+    # 迭代序：页1(甲乙入库) → 页2(丙脱落自愈) → 重解析回顶部(甲乙去重跳过，宽限)
+    # → 滚动回页2(丙补试+丁入库，解除宽限) → 页2 再解析(全已处理，无进展停止)
+    parse_sequence = [page1, page2, page1, page2, page2]
+    # 甲、乙、丙(失败一次)、丙补试、丁
+    urls = iter([
+        "https://mp.weixin.qq.com/s/jia", "https://mp.weixin.qq.com/s/yi",
+        None, "https://mp.weixin.qq.com/s/bing", "https://mp.weixin.qq.com/s/ding",
+    ])
+    titles = iter([
+        "新文章甲的标题足够长以通过幻影校验", "新文章乙的标题同样足够长以便校验",
+        "新文章丙的标题一样足够长以便校验通过", "新文章丁的标题仍旧足够长以便校验",
+    ])
+    clicked, scrolls = [], []
+    states = [dict(HEALTHY_STATE), dict(HEALTHY_STATE), dict(WEDGED_STATE),
+              dict(HEALTHY_STATE), dict(HEALTHY_STATE), dict(HEALTHY_STATE)]
+
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 10)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 5)
+    monkeypatch.setattr(ima_ax_extractor, "get_window_state",
+                        lambda _p, _w: states.pop(0))
+    monkeypatch.setattr(ima_ax_extractor, "parse_articles_from_tree",
+                        lambda _state, _kb: parse_sequence.pop(0))
+    monkeypatch.setattr(ima_ax_extractor, "get_ima_main_window",
+                        lambda: {"pid": 9, "window_id": 9,
+                                 "bounds": {"width": 1512, "height": 949}})
+    calls = {"restart": 0, "navigate": 0}
+
+    def fake_restart():
+        calls["restart"] += 1
+        return True
+
+    def fake_navigate(kb, allow_restart=True):
+        calls["navigate"] += 1
+        return True
+
+    monkeypatch.setattr(ima_incremental_update, "restart_ima", fake_restart)
+    monkeypatch.setattr(ima_incremental_update, "navigate_to_kb", fake_navigate)
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
+
+    def click(_pid, _wid, element_index):
+        clicked.append(element_index)
+        return True
+
+    monkeypatch.setattr(ima_ax_extractor, "click_element", click)
+    monkeypatch.setattr(ima_ax_extractor, "extract_url_ax", lambda *_a: next(urls))
+    monkeypatch.setattr(ima_ax_extractor, "extract_title_ax", lambda: next(titles))
+    monkeypatch.setattr(ima_ax_extractor, "scroll_down",
+                        lambda *_a, **_kw: scrolls.append(True))
+    monkeypatch.setattr(ima_ax_extractor.time, "sleep", lambda _s: None)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    with sqlite3.connect(temp_db) as conn:
+        saved_urls = {row[0] for row in conn.execute("SELECT url FROM articles")}
+
+    # 四篇文章全部入库——弃卡丙经「重解析顶部 → 宽限下降 → 补试」链路回收
+    assert saved_urls == {
+        "https://mp.weixin.qq.com/s/jia", "https://mp.weixin.qq.com/s/yi",
+        "https://mp.weixin.qq.com/s/bing", "https://mp.weixin.qq.com/s/ding",
+    }
+    # 甲乙 → 丙(失败) → 重解析页去重跳过不点击 → 丙补试 → 丁
+    assert clicked == [1, 2, 3, 3, 4]
+    assert calls == {"restart": 1, "navigate": 1}
+    # 自愈页(丙失败那次)不滚动；页1、宽限下降页、补试页各滚动一批
+    assert len(scrolls) == 30

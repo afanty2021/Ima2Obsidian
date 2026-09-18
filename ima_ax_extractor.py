@@ -700,11 +700,18 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     zero_new_walk_pages = 0
 
     # AX 脱落自愈：重启 ima + 重新导航到目标库（navigate_to_kb 在增量更新模块，
-    # 惰性导入避免循环依赖；CLI 独立运行时同样可用）。返回是否恢复健康。
+    # 惰性导入保持提取器可独立 CLI 运行、不背增量更新的模块级依赖）。
+    # 返回是否恢复健康。
     wedge_restarts = 0
+    # 自愈续走宽限（页）：重启导航后列表回到顶部，重走「本轮已处理」页时三计数
+    # 全零会触发「本页无进展」停止，重走「DB 已知」页会推进两连全已知停止与
+    # 零新增保险丝——任一生效都会在弃卡补试到达前截停续走。宽限期内抑制这三
+    # 个停止条件，直到走回新增内容（首个 page_new>0 页立即解除）；页数取脱落时
+    # 已走页数+1（够下降回弃卡位置），滚动真卡死时的空转也有界。
+    heal_resume_grace = 0
 
     def _heal_wedge() -> bool:
-        nonlocal wedge_restarts
+        nonlocal wedge_restarts, heal_resume_grace
         if wedge_restarts >= MAX_WEDGE_RESTARTS_PER_KB:
             return False
         wedge_restarts += 1
@@ -718,6 +725,13 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             if not navigate_to_kb(kb_name, allow_restart=False):
                 print("  ⚠️  自愈：重新导航失败")
                 return False
+            # 重建走库前不变量：新进程若恢复会话标签页，launchd 基线模式下
+            # 首卡校验可能读到恢复页旧 URL 而误配对入库
+            leftover = close_all_article_tabs()
+            if leftover:
+                print(f"  🩹 自愈：已清理 {leftover} 个重启后残留标签页")
+            # 续走宽限从本页起算：足够穿过已处理区下降回弃卡位置
+            heal_resume_grace = page + 1
             return True
         except Exception as e:
             print(f"  ⚠️  自愈异常: {e}")
@@ -786,11 +800,15 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             if normalize_title_for_compare(a["title"]) not in db_titles
         ]
         if not unknown_titles:
-            confirmed_known_pages += 1
-            if confirmed_known_pages >= 2:
-                print("  连续两页所有标题均已在库，判定列表已走完，停止翻页")
-                break
-            print("  本页所有标题均已在库，滚动一页确认折叠线以下……")
+            if heal_resume_grace > 0:
+                # 自愈宽限：重走 DB 已知页不算「列表走完」，穿过已处理区再恢复计数
+                confirmed_known_pages = 0
+            else:
+                confirmed_known_pages += 1
+                if confirmed_known_pages >= 2:
+                    print("  连续两页所有标题均已在库，判定列表已走完，停止翻页")
+                    break
+                print("  本页所有标题均已在库，滚动一页确认折叠线以下……")
         else:
             confirmed_known_pages = 0
         # 连续早停阈值放宽：候选未消化完之前不轻易停（详见 MAX_CONSECUTIVE_SEEN 注释）
@@ -950,20 +968,28 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             # 本页没有新增、跳过或失败，说明列表没有继续推进（通常是滚动卡住，
             # 或页面内容已完全由本次运行处理过）。有失败时继续尝试，避免 AX 临时
             # 故障导致整页 URL 提取失败后被误判为列表已卡住。
+            # 自愈宽限期内不判无进展——重走已处理页本来就是三计数全零。
             if page_new == 0 and page_skipped == 0 and page_failed == 0:
-                print("  ⚠️  本页无进展，停止继续滚动")
-                break
+                if heal_resume_grace > 0:
+                    print("  🩹 自愈宽限中：重走已处理页寻找弃卡，不判无进展")
+                else:
+                    print("  ⚠️  本页无进展，停止继续滚动")
+                    break
 
             # 标题预检保险丝的第二道：预检判定有候选，但整页走完却零新增——
             # DB 标题与列表标题系统性失配时，候选永远消化不完，会一路走满
             # MAX_PAGES。连续多页「有候选零新增」即判定失配，停止翻页。
             # 有失败页不计入（AX 抖动属临时态，保守继续走）。
+            # 自愈宽限期内不计（重走已处理页天然零新增），并复位计数。
             if page_new == 0 and page_failed == 0:
-                zero_new_walk_pages += 1
-                if zero_new_walk_pages >= MAX_ZERO_NEW_WALK_PAGES:
-                    print(f"  ⚠️  连续 {zero_new_walk_pages} 页有候选但零新增"
-                          f"（标题预检与库系统性失配），停止翻页")
-                    break
+                if heal_resume_grace > 0:
+                    zero_new_walk_pages = 0
+                else:
+                    zero_new_walk_pages += 1
+                    if zero_new_walk_pages >= MAX_ZERO_NEW_WALK_PAGES:
+                        print(f"  ⚠️  连续 {zero_new_walk_pages} 页有候选但零新增"
+                              f"（标题预检与库系统性失配），停止翻页")
+                        break
             else:
                 zero_new_walk_pages = 0
 
@@ -973,6 +999,16 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             scroll_down(pid, window_id, 3)
             time.sleep(0.1)
         await asyncio.sleep(WAIT_SCROLL)
+
+        # 自愈宽限消耗与解除：走完一页减一；走回新增内容立即解除
+        if heal_resume_grace > 0:
+            if page_new > 0:
+                heal_resume_grace = 0
+                print("  ✅ 自愈续走已到达新增内容，解除宽限")
+            else:
+                heal_resume_grace -= 1
+                if heal_resume_grace == 0:
+                    print("  ⚠️  自愈宽限耗尽仍未遇新增内容，恢复停止条件")
 
     # 总结
     stats = get_stats()

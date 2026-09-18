@@ -68,6 +68,7 @@ def test_wedged_at_page_start_aborts_without_clicks(temp_db, monkeypatch):
     init_database()
     activations = []
     monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 5)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 0)  # 自愈预算清零 → 走中止分支
     monkeypatch.setattr(
         ima_ax_extractor, "get_window_state",
         lambda _p, _w: dict(WEDGED_STATE),
@@ -92,7 +93,7 @@ def test_wedge_detected_in_verify_loop_skips_reclick(temp_db, monkeypatch):
 
     init_database()
     pages = [
-        [{"element_index": 1, "title": "新文章甲"}],
+        [{"element_index": 1, "title": "新文章甲的标题足够长以通过幻影校验"}],
         [{"element_index": 2, "title": "后续新文章"}],
     ]
     # 卡1 幻影：读到别的文章；重试探测到脱落 → 放弃；页2 再遇脱落 → 中止
@@ -102,6 +103,7 @@ def test_wedge_detected_in_verify_loop_skips_reclick(temp_db, monkeypatch):
     states = [dict(HEALTHY_STATE), dict(WEDGED_STATE), dict(WEDGED_STATE), dict(WEDGED_STATE)]
 
     monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 3)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 0)  # 自愈预算清零 → 走中止分支
     monkeypatch.setattr(
         ima_ax_extractor, "get_window_state",
         lambda _p, _w: states.pop(0),
@@ -253,3 +255,136 @@ def test_kb_drift_aborts_walk_without_clicks(temp_db, monkeypatch):
     assert clicked == []
     with sqlite3.connect(temp_db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0] == 0
+
+
+def test_wedge_heal_at_page_start_recovers_and_continues(temp_db, monkeypatch):
+    """页首脱落 → 激活重读仍脱落 → 自愈（重启+重新导航）→ 刷新句柄重解析并继续走库"""
+    import ima_incremental_update
+    from ima_common import init_database
+
+    init_database()
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 5)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 5)
+    # 页1 顶/重读均脱落；自愈后页2/页3 健康（标题全在库 → 预检停止）
+    states = [dict(WEDGED_STATE), dict(WEDGED_STATE), dict(HEALTHY_STATE), dict(HEALTHY_STATE)]
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_window_state",
+        lambda _p, _w: states.pop(0),
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "parse_articles_from_tree",
+        lambda _state, _kb: [{"element_index": 1, "title": "库内文章甲"}],
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_ima_main_window",
+        lambda: {"pid": 9, "window_id": 9, "bounds": {"width": 1512, "height": 949}},
+    )
+    calls = {"restart": 0, "navigate": 0}
+
+    def fake_restart():
+        calls["restart"] += 1
+        return True
+
+    def fake_navigate(kb, allow_restart=True):
+        calls["navigate"] += 1
+        return True
+
+    monkeypatch.setattr(ima_incremental_update, "restart_ima", fake_restart)
+    monkeypatch.setattr(ima_incremental_update, "navigate_to_kb", fake_navigate)
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
+    monkeypatch.setattr(
+        ima_ax_extractor, "click_element", lambda *_a: (_ for _ in ()).throw(AssertionError("不应点击")))
+
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute(
+            "INSERT INTO articles (url, title, knowledge_base, status) VALUES "
+            "('https://mp.weixin.qq.com/s/known', '库内文章甲', '英语教与学', 'success')"
+        )
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "英语教与学"))
+
+    assert calls == {"restart": 1, "navigate": 1}
+    assert calls["restart"] <= ima_ax_extractor.MAX_WEDGE_RESTARTS_PER_KB
+
+
+def test_wedge_heal_mid_card_resumes_and_retries_card(temp_db, monkeypatch):
+    """卡间脱落 → 自愈 → 弃卡重解析当前页（不滚动），已完成卡去重跳过、弃卡补试成功"""
+    import ima_incremental_update
+    from ima_common import init_database
+
+    init_database()
+    pages = [
+        [
+            {"element_index": 1, "title": "新文章甲的标题足够长以通过幻影校验"},
+            {"element_index": 2, "title": "新文章乙的标题同样足够长以便校验"},
+        ],
+        [
+            {"element_index": 1, "title": "新文章甲的标题足够长以通过幻影校验"},
+            {"element_index": 2, "title": "新文章乙的标题同样足够长以便校验"},
+        ],
+    ]
+    # 甲 正常入库；乙 第一次读 URL 失败 → 探测脱落 → 自愈 → 重解析后乙补试成功
+    urls = iter([
+        "https://mp.weixin.qq.com/s/jia",  # 甲
+        None,                               # 乙 未读到 URL → 探测脱落 → 自愈
+        "https://mp.weixin.qq.com/s/yi",    # 乙 重解析后补试成功
+    ])
+    page_titles = iter(["新文章甲的标题足够长以通过幻影校验", "新文章乙的标题同样足够长以便校验"])
+    clicked = []
+    scrolls = []
+    states = [dict(HEALTHY_STATE), dict(WEDGED_STATE), dict(HEALTHY_STATE)]
+
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 2)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 5)
+    monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
+    monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_window_state",
+        lambda _p, _w: states.pop(0),
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "parse_articles_from_tree",
+        lambda _state, _kb: pages.pop(0),
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_ima_main_window",
+        lambda: {"pid": 9, "window_id": 9, "bounds": {"width": 1512, "height": 949}},
+    )
+
+    def fake_restart():
+        return True
+
+    def fake_navigate(kb, allow_restart=True):
+        return True
+
+    monkeypatch.setattr(ima_incremental_update, "restart_ima", fake_restart)
+    monkeypatch.setattr(ima_incremental_update, "navigate_to_kb", fake_navigate)
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
+
+    def click(_pid, _wid, element_index):
+        clicked.append(element_index)
+        return True
+
+    monkeypatch.setattr(ima_ax_extractor, "click_element", click)
+    monkeypatch.setattr(ima_ax_extractor, "extract_url_ax", lambda *_a: next(urls))
+    monkeypatch.setattr(ima_ax_extractor, "extract_title_ax", lambda: next(page_titles))
+    monkeypatch.setattr(ima_ax_extractor, "cmd_w_close", lambda **_kw: None)
+
+    def fake_scroll(*_a):
+        scrolls.append(True)
+
+    monkeypatch.setattr(ima_ax_extractor, "scroll_down", fake_scroll)
+    monkeypatch.setattr(ima_ax_extractor.time, "sleep", lambda _s: None)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    with sqlite3.connect(temp_db) as conn:
+        saved_urls = {row[0] for row in conn.execute("SELECT url FROM articles")}
+
+    # 甲 入库；乙 在自愈后的重解析页上补试成功
+    assert "https://mp.weixin.qq.com/s/yi" in saved_urls
+    # 甲 点击一次、乙 失败前点击一次、重解析后补试一次
+    assert clicked == [1, 2, 2]
+    # 自愈页不得滚动（滚动会跳过未处理的弃卡）——仅页 2 走完后的正常翻页滚动一批
+    assert len(scrolls) == 10

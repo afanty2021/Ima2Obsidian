@@ -44,6 +44,8 @@ MAX_PAGES = 65
 MAX_CONSECUTIVE_SEEN = 2
 # 连续「有候选但零新增」走查页数上限：标题预检与 DB 标题系统性失配时的止损线
 MAX_ZERO_NEW_WALK_PAGES = 3
+# 单库提取中 AX 脱落自愈（重启 ima + 重新导航）的次数上限，耗尽才中止本库
+MAX_WEDGE_RESTARTS_PER_KB = 5
 # 点击后校验"打开的是本篇"的最大尝试次数（含首次点击；失败即重试点击）
 CLICK_VERIFY_ATTEMPTS = 3
 
@@ -697,6 +699,30 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     # 预检与库系统性失配，停止翻页（防失配时走满 MAX_PAGES）
     zero_new_walk_pages = 0
 
+    # AX 脱落自愈：重启 ima + 重新导航到目标库（navigate_to_kb 在增量更新模块，
+    # 惰性导入避免循环依赖；CLI 独立运行时同样可用）。返回是否恢复健康。
+    wedge_restarts = 0
+
+    def _heal_wedge() -> bool:
+        nonlocal wedge_restarts
+        if wedge_restarts >= MAX_WEDGE_RESTARTS_PER_KB:
+            return False
+        wedge_restarts += 1
+        print(f"  🩹 AX 脱落自愈 {wedge_restarts}/{MAX_WEDGE_RESTARTS_PER_KB}："
+              f"重启 IMA 并重新导航到 {kb_name}...")
+        try:
+            from ima_incremental_update import restart_ima, navigate_to_kb
+            if not restart_ima():
+                print("  ⚠️  自愈：IMA 重启失败")
+                return False
+            if not navigate_to_kb(kb_name, allow_restart=False):
+                print("  ⚠️  自愈：重新导航失败")
+                return False
+            return True
+        except Exception as e:
+            print(f"  ⚠️  自愈异常: {e}")
+            return False
+
     for page in range(1, MAX_PAGES + 1):
         print(f"\n{'─' * 50}")
         print(f"第 {page} 页")
@@ -723,7 +749,15 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             activate_ima()
             state = get_window_state(pid, window_id)
             if not state or ax_tree_menu_bar_only(state.get("tree_markdown", "")):
-                print("  ❌ IMA AX 树已脱落且激活无效，中止本库提取"
+                if _heal_wedge():
+                    # 重启后 pid/window_id 全变，刷新句柄并重解析当前页
+                    nw = get_ima_main_window()
+                    if not nw:
+                        print("  ❌ 自愈后未找到 IMA 窗口，中止本库提取")
+                        break
+                    pid, window_id = nw["pid"], nw["window_id"]
+                    continue
+                print("  ❌ IMA AX 树已脱落且自愈无效，中止本库提取"
                       "（已提取文章照常进入保存阶段；根治见 ima NSAppSleepDisabled）")
                 break
 
@@ -770,6 +804,8 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
 
         # 全已知页不点击（无候选可提取），但仍要走滚动路径确认折叠线以下
         walk_target = articles if unknown_titles else []
+        abandon_page = False       # 重试点击失败 → 弃本页重新解析
+        healed_mid_page = False    # 卡间自愈 → 弃本页重新解析（不滚动）
 
         for i, article in enumerate(walk_target, 1):
             elem_idx = article["element_index"]
@@ -807,7 +843,6 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             await asyncio.sleep(WAIT_CLICK_LOAD)
 
             article_url: Optional[str] = None
-            retry_click_failed = False
             try:
                 # 幻影防护：确认打开的是本篇才信任 URL（is_same_article_page docstring）。
                 # 幻影/未读到 URL 都重试点击；幻影 URL 绝不进入 url_exists。
@@ -815,9 +850,12 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                 verified_page_title: Optional[str] = None
                 for verify_attempt in range(1, CLICK_VERIFY_ATTEMPTS + 1):
                     if verify_attempt > 1:
-                        # 脱落态下点击必落空、状态读取必耗满超时——先廉价探测，脱落则放弃重试
+                        # 脱落态下点击必落空、状态读取必耗满超时——先廉价探测，脱落则自愈
                         if ax_tree_menu_bar_only(_read_main_window_md()):
-                            print("    ❌ IMA AX 树已脱落（仅菜单栏），放弃重试")
+                            if _heal_wedge():
+                                healed_mid_page = True
+                            else:
+                                print("    ❌ IMA AX 树已脱落（仅菜单栏）且自愈无效，放弃重试")
                             break
                         # 残留标签页投毒防护：关掉所有文章标签页再重试点击，
                         # 保证重读到的必然是本次点击打开的那篇
@@ -827,7 +865,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                         print(f"    ⚠️  打开的不是本篇（幻影）或未读到 URL，重试点击 ({verify_attempt}/{CLICK_VERIFY_ATTEMPTS})...")
                         if not click_element(pid, window_id, elem_idx):
                             print("    ❌ 重试点击失败，刷新状态重试...")
-                            retry_click_failed = True
+                            abandon_page = True
                             break
                         await asyncio.sleep(WAIT_CLICK_LOAD)
                     url = extract_url_ax(pid, window_id)
@@ -844,8 +882,9 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                     total_failed += 1
                     page_failed += 1
                     consecutive_seen = 0  # 失败时重置计数器
-                    if retry_click_failed:
-                        # 与首次点击失败同语义：索引缓存已可疑，跳出本页由下页重新解析
+                    if abandon_page or healed_mid_page:
+                        # 自愈/点击失败后索引缓存已失效：弃本卡，重新解析当前页续走
+                        # （已完成卡片由 processed_titles 去重跳过，本卡与未处理卡会补试）
                         break  # finally 负责关闭标签页
                     continue  # finally 负责关闭标签页
 
@@ -893,6 +932,17 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
 
         if should_stop:
             break
+
+        if healed_mid_page:
+            # 自愈后窗口句柄全变：刷新 pid/window_id，重新解析当前页（不滚动），
+            # 已完成卡片由 processed_titles 去重跳过，弃卡与未处理卡自动补试
+            nw = get_ima_main_window()
+            if not nw:
+                print("  ❌ 自愈后未找到 IMA 窗口，中止本库提取")
+                break
+            pid, window_id = nw["pid"], nw["window_id"]
+            print("  ↩️  自愈完成，重新解析当前页续走...")
+            continue
 
         if unknown_titles:
             print(f"\n  本页完成: 新增 {page_new}, 跳过 {page_skipped}")

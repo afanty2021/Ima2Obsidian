@@ -52,6 +52,7 @@ def _patch_common(monkeypatch):
     """提取流程公共 mock：无真实 cua-driver / 系统调用"""
     monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
     monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
     monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
     monkeypatch.setattr(ima_ax_extractor, "WAIT_AFTER_CLOSE", 0)
     monkeypatch.setattr(ima_ax_extractor, "WAIT_SCROLL", 0)
@@ -240,6 +241,7 @@ def test_kb_drift_aborts_walk_without_clicks(temp_db, monkeypatch):
         lambda _p, _w: dict(HEALTHY_STATE),
     )
     monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
     monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: False)
     monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
 
@@ -341,6 +343,7 @@ def test_wedge_heal_mid_card_resumes_and_retries_card(temp_db, monkeypatch):
     monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 2)
     monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 5)
     monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
     monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
     monkeypatch.setattr(
         ima_ax_extractor, "get_window_state",
@@ -519,6 +522,7 @@ def test_two_heals_in_one_walk_accumulate_budget_and_resume(temp_db, monkeypatch
     monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 6)
     monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 5)
     monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
     monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
     monkeypatch.setattr(
         ima_ax_extractor, "get_window_state",
@@ -552,3 +556,84 @@ def test_two_heals_in_one_walk_accumulate_budget_and_resume(temp_db, monkeypatch
             "https://mp.weixin.qq.com/s/yi",
             "https://mp.weixin.qq.com/s/bing"} <= saved
     assert len(parsed) == 6  # 走满页预算而非中途截停
+
+
+def test_heal_budget_exact_exhaustion_boundary(temp_db, monkeypatch):
+    """预算边界：MAX_WEDGE_RESTARTS_PER_KB=2 时，第 2 次自愈（额度内最后一次）
+    必须被允许并成功续走，第 3 次脱落被拒（restarts 不再增长）——钉住 off-by-one。
+
+    序列即「预算未耗尽的成功自愈后再脱落」：乙 靠自愈1 入库（成功自愈），
+    丙 靠自愈2（恰好用尽预算）入库，丁 脱落时被拒计失败留待下轮。"""
+    import ima_incremental_update
+    from ima_common import init_database
+
+    init_database()
+    t_jia = "新文章甲的标题足够长以通过幻影校验"
+    t_yi = "新文章乙的标题同样足够长以便校验"
+    t_bing = "新文章丙的标题长度也足以通过幻影校验"
+    t_ding = "新文章丁的标题长度亦足以通过幻影校验"
+    pages = [
+        [{"element_index": 1, "title": t_jia}],
+        [{"element_index": 1, "title": t_yi}],
+        [{"element_index": 1, "title": t_yi}],
+        [{"element_index": 1, "title": t_bing}],
+        [{"element_index": 1, "title": t_bing}],
+        [{"element_index": 1, "title": t_ding}],
+    ]
+    urls = iter([
+        "https://mp.weixin.qq.com/s/jia",   # 甲 正常入库
+        None,                                # 乙 → 探测脱落 → 自愈 1（成功自愈）
+        "https://mp.weixin.qq.com/s/yi",    # 乙 补试成功
+        None,                                # 丙 → 探测脱落 → 自愈 2（恰好用尽预算）
+        "https://mp.weixin.qq.com/s/bing",  # 丙 补试成功
+        None,                                # 丁 → 自愈被拒 → 计失败留待下轮
+    ])
+    page_titles = iter([t_jia, t_yi, t_bing])
+    # 状态消费序：P1/P2/探测/重读/P3/P4/探测/重读/P5/P6/探测
+    # = H H W H H W H H W
+    states = [dict(HEALTHY_STATE), dict(HEALTHY_STATE), dict(WEDGED_STATE),
+              dict(HEALTHY_STATE), dict(HEALTHY_STATE), dict(WEDGED_STATE),
+              dict(HEALTHY_STATE), dict(HEALTHY_STATE), dict(WEDGED_STATE)]
+    restarts = {"n": 0}
+    parsed = []
+
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 6)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 2)
+    monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
+    monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
+    monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_window_state",
+        lambda _p, _w: states.pop(0),
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "parse_articles_from_tree",
+        lambda _state, _kb: (parsed.append(1), pages.pop(0))[1],
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_ima_main_window",
+        lambda: {"pid": 9, "window_id": 9, "bounds": {"width": 1512, "height": 949}},
+    )
+    monkeypatch.setattr(ima_incremental_update, "restart_ima", lambda: restarts.update(n=restarts["n"] + 1) or True)
+    monkeypatch.setattr(ima_incremental_update, "navigate_to_kb", lambda kb, allow_restart=True: True)
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
+    monkeypatch.setattr(ima_ax_extractor, "click_element", lambda _p, _w, _e: True)
+    monkeypatch.setattr(ima_ax_extractor, "extract_url_ax", lambda *_a: next(urls))
+    monkeypatch.setattr(ima_ax_extractor, "extract_title_ax", lambda: next(page_titles))
+    monkeypatch.setattr(ima_ax_extractor, "cmd_w_close", lambda **_kw: None)
+    monkeypatch.setattr(ima_ax_extractor, "scroll_down", lambda *_a: None)
+    monkeypatch.setattr(ima_ax_extractor.time, "sleep", lambda _s: None)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    with sqlite3.connect(temp_db) as conn:
+        saved = {row[0] for row in conn.execute("SELECT url FROM articles")}
+
+    # 恰好用尽预算的两次自愈都成功续走并入库
+    assert restarts["n"] == 2
+    assert {"https://mp.weixin.qq.com/s/jia",
+            "https://mp.weixin.qq.com/s/yi",
+            "https://mp.weixin.qq.com/s/bing"} <= saved
+    # 丁 在预算耗尽后被拒：不入库（留待下轮），但本轮正常走完不崩溃
+    assert "https://mp.weixin.qq.com/s/ding" not in saved
+    assert len(parsed) == 6  # MAX_PAGES=6：丁 被拒后仍正常走完页循环

@@ -75,6 +75,19 @@ def _quiet_app_cleanup(monkeypatch):
     yield mock
 
 
+@pytest.fixture(autouse=True)
+def _stub_ima_restart(monkeypatch):
+    """默认隔离对真实 IMA 的重启/拉起（自愈循环、导航兜底会调用）。
+
+    自愈走 _heal_wedge 的惰性导入取模块属性，本兜底使未显式 mock 的用例
+    一律走「重启失败 → 中止」的安全路径，绝不真的退出/拉起 IMA。需要真实
+    断言的用例在 ima_incremental_update 上自行 monkeypatch 覆盖即可。
+    """
+    mod = importlib.import_module("ima_incremental_update")
+    monkeypatch.setattr(mod, "restart_ima", lambda: False)
+    monkeypatch.setattr(mod, "launch_ima", lambda *a, **k: False)
+
+
 @pytest.fixture
 def seeded_db(temp_db):
     """初始化 schema 并插入若干测试文章"""

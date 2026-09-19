@@ -106,7 +106,10 @@ def ax_tree_menu_bar_only(md: str) -> bool:
 
 
 def _read_main_window_md() -> str:
-    """廉价读取主窗口 AX markdown（脱落探测用）；失败返回空串（视为未知）。"""
+    """读主窗口 AX markdown（脱落探测用）；失败返回空串（视为未知）。
+
+    注意非真正廉价：脱落态下 get_window_state 可耗满 30s 超时，探测成本
+    与一次真实读取同量级——探测价值在于省掉「点击+等载+读 URL」整链。"""
     try:
         w = get_ima_main_window()
         if not w:
@@ -824,6 +827,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
         walk_target = articles if unknown_titles else []
         abandon_page = False       # 重试点击失败 → 弃本页重新解析
         healed_mid_page = False    # 卡间自愈 → 弃本页重新解析（不滚动）
+        wedge_unhealed = False     # 卡间自愈被拒（预算耗尽/重启失败）→ 中止本库
 
         for i, article in enumerate(walk_target, 1):
             elem_idx = article["element_index"]
@@ -873,7 +877,12 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                             if _heal_wedge():
                                 healed_mid_page = True
                             else:
-                                print("    ❌ IMA AX 树已脱落（仅菜单栏）且自愈无效，放弃重试")
+                                # 自愈被拒（预算耗尽/重启失败）＝ ima 已死且不可恢复，
+                                # 本页剩余卡只在死树上空转（每卡磨 50-90s，2026-09-18 实证）。
+                                # 与页首被拒同语义：立即中止本库，不磨完剩余卡
+                                print("    ❌ IMA AX 树已脱落（仅菜单栏）且自愈无效，"
+                                      "中止本库提取（已提取文章照常进入保存阶段）")
+                                wedge_unhealed = True
                             break
                         # 残留标签页投毒防护：关掉所有文章标签页再重试点击，
                         # 保证重读到的必然是本次点击打开的那篇
@@ -900,7 +909,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                     total_failed += 1
                     page_failed += 1
                     consecutive_seen = 0  # 失败时重置计数器
-                    if abandon_page or healed_mid_page:
+                    if abandon_page or healed_mid_page or wedge_unhealed:
                         # 自愈/点击失败后索引缓存已失效：弃本卡，重新解析当前页续走
                         # （已完成卡片由 processed_titles 去重跳过，本卡与未处理卡会补试）
                         break  # finally 负责关闭标签页
@@ -948,7 +957,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                 cmd_w_close(article_url=article_url)
                 await asyncio.sleep(WAIT_AFTER_CLOSE)
 
-        if should_stop:
+        if should_stop or wedge_unhealed:
             break
 
         if healed_mid_page:

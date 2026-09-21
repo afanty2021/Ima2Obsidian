@@ -25,6 +25,29 @@ CREATE TABLE articles (
 );
 ```
 
+### dead_articles 表（2026-09-21 提取侧拦截页黑名单）
+
+```sql
+CREATE TABLE dead_articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title_norm TEXT UNIQUE NOT NULL,        -- 归一化标题（normalize_title_for_compare）
+    title TEXT,                             -- 原始列表标题
+    reason TEXT,                            -- 发布者删除 / 违规不可查看 / 账号被屏蔽
+    url TEXT,                               -- 尽力而为（launchd 下拦截页 URL 读不到）
+    marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+提取器在幻影重试耗尽后探测文章页 AX 文本（<100 字且命中 `ima_common.DELETED_REASON_MAP`
+——与 saver `_deleted_reason` 同表同阈值），判定为微信拦截页（违规/发布者删除/账号
+屏蔽）时写入，页级预检与逐卡走查永久跳过。以标题为键是因为 launchd 下拦截页读不到
+URL（`articles.status='deleted'` 的 URL 键机制管 saver 侧，两者互补）。误标解除：
+
+```sql
+SELECT * FROM dead_articles;
+DELETE FROM dead_articles WHERE title_norm = (SELECT title_norm FROM dead_articles WHERE title LIKE '%…%');
+```
+
 ---
 
 ## 索引

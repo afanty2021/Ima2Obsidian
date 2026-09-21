@@ -25,6 +25,7 @@ VIOLATION_MD = (
 CAPTCHA_MD = (
     "- [0] AXWindow \"微信公众平台\"\n"
     "- [1] AXTextField 地址和搜索栏\n"
+    "- [2] AXStaticText = \"环境异常，完成验证后即可继续访问\"\n"
 )
 T_JIA = "新文章甲的标题足够长以通过幻影校验"
 T_BING = "新文章丙的标题长度也足以通过幻影校验"
@@ -58,8 +59,11 @@ def _patch_flow(monkeypatch, *, pages, urls, titles=None, probe_md="", max_pages
                         lambda _state, _kb: pages.pop(0))
     monkeypatch.setattr(ima_ax_extractor, "click_element", lambda _p, _w, _e: True)
     monkeypatch.setattr(ima_ax_extractor, "extract_url_ax", lambda *_a: next(urls))
-    if titles is not None:
-        monkeypatch.setattr(ima_ax_extractor, "extract_title_ax", lambda: next(titles))
+    # titles=None 时按 launchd 语义返回 None（URL≠上一篇基线），绝不打真实 osascript
+    monkeypatch.setattr(
+        ima_ax_extractor, "extract_title_ax",
+        (lambda: next(titles)) if titles is not None else (lambda: None),
+    )
 
 
 def _saved_and_dead(temp_db):
@@ -149,3 +153,81 @@ def test_shared_word_table_single_source():
     assert ima_common.detect_deleted_reason("正文" * 200 + "此内容因违规无法查看") is None
     assert ima_common.detect_deleted_reason("此内容因违规无法查看") == "违规不可查看"
     assert ima_common.detect_deleted_reason("") is None
+
+
+def test_dead_marking_page_counts_as_progress_no_early_stop(temp_db, monkeypatch):
+    """整页唯一产出是删除标记时不得判「本页无进展」——page_deleted 算真实进展，
+    走查必须继续滚动（其下新内容当轮可采，279a808 复审实验 D 钉住）。"""
+    init_database()
+    T_DING = "新文章丁的标题同样足够长以便校验"
+    pages = [
+        [{"element_index": 2, "title": T_BING}],           # P1：丙 违规标记，整页仅此产出
+        [{"element_index": 4, "title": T_DING}],           # P2：丁 新文章，必须被走到
+    ]
+    urls = iter([None, None, None, "https://mp.weixin.qq.com/s/ding"])
+    clicked = []
+    _patch_flow(monkeypatch, pages=pages, urls=urls, probe_md=VIOLATION_MD, max_pages=2)
+    monkeypatch.setattr(ima_ax_extractor, "click_element",
+                        lambda _p, _w, e: clicked.append(e) or True)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    saved, dead = _saved_and_dead(temp_db)
+    assert normalize_title_for_compare(T_BING) in dead
+    # P1 未因无进展截停：P2 的 丁 被点击并入库
+    assert saved == {"https://mp.weixin.qq.com/s/ding"}
+    assert clicked == [2, 2, 2, 4]
+
+
+def test_db_dead_page_with_known_titles_stops_via_two_known(temp_db, monkeypatch):
+    """库内 dead 标题在页级预检被排除：dead+已知混合页视作「全已知」，两连全已知
+    正常停止、不误判有候选（279a808 复审实验 C 钉住——删除预检排除行此测试即红）。"""
+    init_database()
+    T_YI = "新文章乙的标题同样足够长以便校验"
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute(
+            "INSERT INTO articles (url, title, knowledge_base, status) VALUES "
+            "('https://mp.weixin.qq.com/s/yi-known', ?, 'AI', 'success')", (T_YI,))
+        conn.execute(
+            "INSERT INTO dead_articles (title_norm, title, reason) VALUES (?, ?, ?)",
+            (normalize_title_for_compare(T_BING), T_BING, "违规不可查看"),
+        )
+    mixed = [{"element_index": 1, "title": T_YI},
+             {"element_index": 2, "title": T_BING}]
+    # 第 3 页若被访问会 IndexError——以此钉住「两连全已知即停」
+    pages = [list(mixed), list(mixed), list(mixed)]
+    urls = iter([])  # 全已知页零点击
+    clicked = []
+    _patch_flow(monkeypatch, pages=pages, urls=urls)
+    monkeypatch.setattr(ima_ax_extractor, "click_element",
+                        lambda _p, _w, e: clicked.append(e) or True)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    saved, dead = _saved_and_dead(temp_db)
+    assert saved == {"https://mp.weixin.qq.com/s/yi-known"}
+    assert clicked == []  # 零点击：既不重采已知，也不点 dead 卡
+    assert len(pages) == 1  # 走完两页即停，第 3 页未被解析
+
+
+def test_dead_mark_write_failure_falls_back_to_failed(temp_db, monkeypatch):
+    """落库失败（如 database is locked）不得计删除进展——否则 page_deleted 会同时
+    压制无进展停止与零新增保险丝，卡每页重试磨到 MAX_PAGES（279a808 复审 Important）。
+    降级为普通失败，由单轮失败记忆 cap 兜底。"""
+    init_database()
+    page = [{"element_index": 2, "title": T_BING}]
+    pages = [list(page)] * 3
+    urls = (None for _ in iter(int, 1))
+    clicked = []
+    _patch_flow(monkeypatch, pages=pages, urls=urls, probe_md=VIOLATION_MD)
+    monkeypatch.setattr(ima_ax_extractor, "mark_dead_title", lambda *a, **k: False)
+    monkeypatch.setattr(ima_ax_extractor, "click_element",
+                        lambda _p, _w, e: clicked.append(e) or True)
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "AI"))
+
+    saved, dead = _saved_and_dead(temp_db)
+    assert dead == {}  # 落库失败不标记
+    # 两轮走查（各 3 次幻影点击）后 cap=2 截停，第 3 页迭代零点击——
+    # 若落库失败仍计删除进展，这里会磨满 MAX_PAGES
+    assert clicked == [2, 2, 2, 2, 2, 2]

@@ -979,11 +979,19 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                     dead_reason = None if wedge_unhealed else _detect_dead_page_reason()
                     if dead_reason:
                         norm = normalize_title_for_compare(title)
+                        # 落库成功才算删除进展——落库失败时若仍计 page_deleted，会同时
+                        # 压制无进展停止与零新增保险丝（279a808 复审 Important），卡会
+                        # 每页重试磨到 MAX_PAGES；降级为普通失败，由单轮失败记忆兜底
                         if mark_dead_title(norm, title, dead_reason):
                             dead_titles.add(norm)
-                        total_deleted += 1
-                        page_deleted += 1
-                        print(f"    🗑️  {dead_reason}（微信拦截页），已标记永久跳过: {title[:50]}...")
+                            total_deleted += 1
+                            page_deleted += 1
+                            print(f"    🗑️  {dead_reason}（微信拦截页），已标记永久跳过: {title[:50]}...")
+                        else:
+                            print(f"    ⚠️  疑似拦截页（{dead_reason}）但落库失败，按失败处理: {title[:50]}...")
+                            total_failed += 1
+                            page_failed += 1
+                            failed_attempt_counts[title] = failed_attempt_counts.get(title, 0) + 1
                     else:
                         print("    ⚠️  未提取到本篇 URL")
                         total_failed += 1

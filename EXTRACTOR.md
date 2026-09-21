@@ -40,6 +40,7 @@ get_window_state → 解析文章 → 点击文章 → 等待加载 → 提取 U
 | `MAX_CONSECUTIVE_SEEN` | 2 | 每页早停保险丝：主停止条件是页级标题预检「连续两页全已知」；有未知候选的页阈值放宽为「候选数 + 该值」，仅作标题匹配系统性失准时的保险丝 |
 | `MAX_ZERO_NEW_WALK_PAGES` | 3 | 连续「有候选但零新增」走查页数上限——标题预检与 DB 标题系统性失配时的第二道止损线（有失败页不计入） |
 | `MAX_WEDGE_RESTARTS_PER_KB` | 5 | 单库 AX 脱落自愈（重启 ima）次数上限，耗尽保留中止行为 |
+| `MAX_CARD_ATTEMPTS_PER_RUN` | 2 | 单轮运行内同一标题 URL 提取失败次数上限（分页重叠下不再每页重试同一失败卡；拦截页标记不受此限） |
 | `CLICK_VERIFY_ATTEMPTS` | 3 | 点击后「确认打开的是本篇」的最大尝试次数（含首次） |
 
 > 页级标题预检（2026-09-17）：每页标题先与 DB 归一化比对，整页全已知则不点击任何
@@ -69,6 +70,16 @@ get_window_state → 解析文章 → 点击文章 → 等待加载 → 提取 U
 > （深列表位置脱落后若剩余页数不足，续走可能走不完）。运行背景：macOS 27 的 AX 状态
 > 随开机时长退化（约 2 天起明显），重启机器即清零；ima 已设置 NSAppSleepDisabled=1
 > 但不能完全防脱落。
+
+> 微信拦截页标记（2026-09-21）：违规/发布者删除/账号屏蔽页在 ima 内同样被拦（微信按
+> URL 服务端拦截，ima 只是同 URL webview——「能打开」的只是提示页），表现为点击后
+> 标题对不上、AXDocument 读不到 URL、幻影重试耗尽。此时读取文章窗口 AX 静态文本：
+> 正文极短（<100 字，同保存器阈值）且命中共享词表（ima_common.DELETED_REASON_MAP，
+> 与保存器 _deleted_reason 同源）即写入 `dead_articles` 表（以归一化标题为键）永久
+> 跳过，计数「标记删除」不计失败。验证码/风控页无拦截文案，不误标，走普通失败路径。
+> 单轮失败记忆：非拦截页失败达 `MAX_CARD_ATTEMPTS_PER_RUN` 次后本轮不再重试（跨页
+> 翻案一次），下轮重新尝试。误标解除（人工核实后）：
+> `sqlite3 ima_articles.db "DELETE FROM dead_articles WHERE title_norm = (…)"`。
 
 ---
 

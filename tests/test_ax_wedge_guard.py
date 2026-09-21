@@ -53,6 +53,8 @@ def _patch_common(monkeypatch):
     monkeypatch.setattr(ima_ax_extractor, "WAIT_CLICK_LOAD", 0)
     monkeypatch.setattr(ima_ax_extractor, "close_all_article_tabs", lambda: 0)
     monkeypatch.setattr(ima_ax_extractor, "_kb_visible_in_any_window", lambda _kb: True)
+    # 拦截页探测默认读不到正文（不标记，走普通失败路径）；探测用例自行覆盖
+    monkeypatch.setattr(ima_ax_extractor, "_probe_article_window_md", lambda: "")
     monkeypatch.setattr(ima_ax_extractor, "WAIT_AFTER_CLOSE", 0)
     monkeypatch.setattr(ima_ax_extractor, "WAIT_SCROLL", 0)
     monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)

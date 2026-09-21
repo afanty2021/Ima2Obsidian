@@ -114,6 +114,19 @@ def init_database():
         c.execute("CREATE INDEX IF NOT EXISTS idx_url ON articles(url)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_kb ON articles(knowledge_base)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_obsidian_saved ON articles(obsidian_saved)")
+        # 永久不可恢复页（微信拦截页）的标题黑名单：launchd 下拦截页 URL 读不到，
+        # 以归一化标题为键（extractor 标记、预检排除；与 articles.status='deleted'
+        # 的 URL 键机制互补——saver 侧有 URL 时仍走 mark_deleted）
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS dead_articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title_norm TEXT UNIQUE NOT NULL,
+                title TEXT,
+                reason TEXT,
+                url TEXT,
+                marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # 向后兼容：对已有数据库添加缺失的列
         for col, type_def in [
             ("obsidian_saved", "INTEGER DEFAULT 0"),
@@ -131,6 +144,72 @@ def init_database():
                     continue
                 raise
         conn.commit()
+
+
+# ==================== 永久不可恢复页（微信拦截页）共享判定 ====================
+
+# 三类永久不可恢复页（发布者删除 / 平台下架违规内容 / 账号被平台屏蔽）的拦截文案，
+# 单源供保存器（Chrome DOM body）与提取器（ima AX tree 静态文本）共用；行为一致：
+# 命中即永久跳过、不计 failed。顺序敏感：首条命中决定 reason（近义文案放一起）。
+# 匹配语义：全部子串匹配（k in text，非正则）。
+# 修改本表须同步审视调用方：saver._deleted_reason、saver.is_verify_page、
+# extractor 幽影失败路径的探测标记。
+DELETED_REASON_MAP = (
+    # 前 3 条 sentence（整句本身就是强信号，极不可能出现在合法短文本）
+    ("该内容已被发布者删除",   "发布者删除"),
+    ("此内容因违规已删除",     "违规不可查看"),      # 旧文案
+    ("此内容因违规无法查看",   "违规不可查看"),      # 新文案
+    # 第 4 条 prefix（「内容无法查看」是通用后缀，前缀对文案微调鲁棒）
+    ("此账号已被屏蔽",         "账号被屏蔽"),
+)
+
+# 判定阈值：拦截页正文实测最大 65 字（saver PR #5 首日数据），100 留 +35 余量；
+# 实测合法文章最小 496 字，留 ~5 倍边际。阈值是防误杀关键——不得简化成纯
+# 关键词匹配（丢阈值 = 误杀合法文章且不可回滚；saver PR#6 review #3 决策 C）。
+DELETED_REASON_LEN_THRESHOLD = 100
+
+
+def detect_deleted_reason(text: str):
+    """永久不可恢复页判定：文本短于阈值且含拦截文案 → reason 字符串；否则 None。
+
+    保存器传 Chrome DOM body 文本；提取器传 ima 文章窗口 AX tree 的
+    AXStaticText 聚合文本（拦截页 AXDocument 读不到 URL，靠正文形态识别）。
+    """
+    if not text or len(text) >= DELETED_REASON_LEN_THRESHOLD:
+        return None
+    for keyword, reason in DELETED_REASON_MAP:    # 顺序敏感：首条命中决定 reason
+        if keyword in text:                        # 子串匹配（非正则）
+            return reason
+    return None
+
+
+def mark_dead_title(title_norm: str, title: str, reason: str, url: str = "") -> bool:
+    """把列表标题记入 dead_articles（提取侧永久跳过，幂等：重复标记保留首次）。
+
+    title_norm 由调用方归一化（normalize_title_for_compare 在提取器，common 不反向
+    依赖）。launchd 下拦截页 URL 读不到，故以归一化标题为键、url 尽力而为。
+    """
+    try:
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO dead_articles (title_norm, title, reason, url) "
+                "VALUES (?, ?, ?, ?)",
+                (title_norm, title, reason, url),
+            )
+            conn.commit()
+        return True
+    except sqlite3.Error as e:
+        print(f"  ⚠️  dead_articles 写入失败: {e}")
+        return False
+
+
+def load_dead_titles():
+    """全部已标记永久不可恢复的归一化标题集合（extractor 页级预检/逐卡跳过用）。"""
+    try:
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            return {r for (r,) in conn.execute("SELECT title_norm FROM dead_articles")}
+    except sqlite3.Error:
+        return set()
 
 
 def verify_urls_canonical(db_file=None):

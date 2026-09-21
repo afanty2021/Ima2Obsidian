@@ -1183,27 +1183,11 @@ def _log_possible_miss(body: str, url: Optional[str] = None, title: Optional[str
 
 # ==================== 永久不可恢复页判定（单源） ====================
 
-# _deleted_reason 的 body 长度阈值：body < 此值才进入关键词匹配。
-# 实测违规页最大 65 字（PR #5 首日数据），100 留 +35 余量。
-# 提阈值时须同步 _log_possible_miss 调用点（save_one_article 内 if len(body) >= 此值）。
-# PR #6 review #3 决策 C：接受误判风险——图片为主的文章（正文 70 字）+ 含 DELETED 关键词
-# 整句会被 mark_deleted 不可回滚。实测合法文章最小 496 字，留 ~5 倍边际；[自取证] 日志
-# 暴露误判（title+text 片段），运维可发现。v8 可考虑加 undelete 接口（marked_at 时间戳）。
-_DELETED_REASON_LEN_THRESHOLD = 100
-
-# 三类永久不可恢复页（行为一致：mark_deleted 永久跳过，不计 failed）：
-#   发布者删除 / 平台下架违规内容 / 账号被平台屏蔽
-# 顺序敏感：首条命中决定 reason（近义关键词放一起，如两条违规文案映射同一 reason）。
-# 修改本表会影响：_deleted_reason（判定源）、is_verify_page（前置排除）——改词表时
-# 同步审视这些调用方。
-# 匹配语义：全部子串匹配（k in text，非正则）；每条标注 prefix/sentence 见行末注释。
-_DELETED_REASON_MAP = (
-    # 前 3 条 sentence（整句本身就是强信号，极不可能出现在合法短文本；前缀化收益小）
-    ("该内容已被发布者删除",   "发布者删除"),        # sentence
-    ("此内容因违规已删除",     "违规不可查看"),      # sentence（旧文案）
-    ("此内容因违规无法查看",   "违规不可查看"),      # sentence（新文案）
-    # 第 4 条 prefix（「内容无法查看」是通用后缀，前缀对文案微调鲁棒）
-    ("此账号已被屏蔽",         "账号被屏蔽"),        # prefix
+# 词表与阈值单源于 ima_common（2026-09-21 提取侧违规探测共用同一表）；
+# 语义与防误杀依据（阈值 = 防误杀关键）见 ima_common.DELETED_REASON_MAP 注释。
+from ima_common import (
+    DELETED_REASON_LEN_THRESHOLD as _DELETED_REASON_LEN_THRESHOLD,
+    DELETED_REASON_MAP as _DELETED_REASON_MAP,
 )
 
 

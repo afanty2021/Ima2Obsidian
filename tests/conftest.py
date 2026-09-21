@@ -129,3 +129,14 @@ def _stub_saver_execute_chrome_js(monkeypatch):
     except ImportError:
         return
     monkeypatch.setattr(sv, "execute_chrome_js", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _stub_extractor_dead_page_probe(monkeypatch):
+    """默认隔离提取器的微信拦截页探测（失败路径会调 list_windows/get_window_state）。
+
+    返回空 markdown = 探测不到正文 = 不标记，走普通失败路径。探测用例
+    （test_dead_page_marking）自行 monkeypatch 覆盖。
+    """
+    import ima_ax_extractor as ex
+    monkeypatch.setattr(ex, "_probe_article_window_md", lambda: "")

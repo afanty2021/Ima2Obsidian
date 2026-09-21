@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 from ima_common import (
     DB_FILE, CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running, init_database,
     get_ima_main_window, find_cliclick, is_ima_app_name,
+    detect_deleted_reason, mark_dead_title, load_dead_titles,
 )
 
 # ==================== 配置 ====================
@@ -46,6 +47,10 @@ MAX_CONSECUTIVE_SEEN = 2
 MAX_ZERO_NEW_WALK_PAGES = 3
 # 单库提取中 AX 脱落自愈（重启 ima + 重新导航）的次数上限，耗尽才中止本库
 MAX_WEDGE_RESTARTS_PER_KB = 5
+# 单轮运行内同一标题允许的 URL 提取失败次数上限：分页重叠会让同一张失败卡在
+# 每个页迭代都被重试（2026-09-21 实证单篇违规文磨 17 次 × ~1.5 分钟）。cap=2
+# 仍给 AX 瞬时故障一次跨页翻案机会；永久性失败（微信拦截页）另走 dead 标记。
+MAX_CARD_ATTEMPTS_PER_RUN = 2
 # 点击后校验"打开的是本篇"的最大尝试次数（含首次点击；失败即重试点击）
 CLICK_VERIFY_ATTEMPTS = 3
 
@@ -476,6 +481,47 @@ return ""
         return None
 
 
+def _probe_article_window_md() -> str:
+    """只读聚合 ima 标签页窗口（含「地址和搜索栏」）的 AX 静态文本——
+    幽影失败后的微信拦截页（违规/发布者删除/账号屏蔽）探测用。
+
+    与 extract_url_ax 同一窗口选择口径，但不点击、不聚焦（拦截页无需聚焦地址栏）。
+    launchd 下后台 AX 可能被回收成仅菜单栏（读不到正文）→ 返回空文本 → 不标记，
+    退回普通失败路径（fail-safe：宁可漏标记每天重试，不可误标正常文章）。"""
+    try:
+        activate_ima()
+        time.sleep(WAIT_ACTIVATE)
+        wins = json.loads(run_cua(["list_windows"]))["windows"]
+    except Exception:
+        return ""
+    parts = []
+    for w in wins:
+        if not is_ima_app_name(w.get("app_name", "")):
+            continue
+        if w.get("bounds", {}).get("height", 0) <= 200:
+            continue
+        try:
+            st = json.loads(run_cua(["call", "get_window_state", json.dumps(
+                {"pid": w["pid"], "window_id": w["window_id"]})]))
+        except Exception:
+            continue
+        md = st.get("tree_markdown", "")
+        if "地址和搜索栏" in md:
+            parts.append(md)
+    return "\n".join(parts)
+
+
+def _detect_dead_page_reason() -> Optional[str]:
+    """对当前打开的文章页做永久不可恢复判定：AXStaticText 聚合后过共享词表。
+
+    阈值与词表与保存器 _deleted_reason 同源（ima_common），防误杀语义一致。"""
+    md = _probe_article_window_md()
+    if not md:
+        return None
+    texts = re.findall(r'AXStaticText\s*=\s*"([^"]*)"', md)
+    return detect_deleted_reason("".join(texts))
+
+
 
 def cmd_w_close(article_url: Optional[str] = None, max_retries: int = 2) -> bool:
     """Cmd+W 关闭当前文章标签页，校验+重试，返回是否确认关闭。
@@ -701,6 +747,11 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     # 连续「有候选但零新增」的走查页数：达到 MAX_ZERO_NEW_WALK_PAGES 判定标题
     # 预检与库系统性失配，停止翻页（防失配时走满 MAX_PAGES）
     zero_new_walk_pages = 0
+    # 单轮失败记忆：幻影重试耗尽的标题在后续页迭代不再重试（见 MAX_CARD_ATTEMPTS_PER_RUN）
+    failed_attempt_counts: Dict[str, int] = {}
+    # 永久不可恢复页（微信拦截页）的归一化标题：库内历史 + 本轮新标记均跳过
+    dead_titles = load_dead_titles()
+    total_deleted = 0
 
     # AX 脱落自愈：重启 ima + 重新导航到目标库（navigate_to_kb 在增量更新模块，
     # 惰性导入保持提取器可独立 CLI 运行、不背增量更新的模块级依赖）。
@@ -801,6 +852,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
         unknown_titles = [
             a["title"] for a in articles
             if normalize_title_for_compare(a["title"]) not in db_titles
+            and normalize_title_for_compare(a["title"]) not in dead_titles
         ]
         if not unknown_titles:
             if heal_resume_grace > 0:
@@ -820,6 +872,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
         page_new = 0
         page_skipped = 0
         page_failed = 0
+        page_deleted = 0
 
         should_stop = False
 
@@ -838,6 +891,19 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             # 注意：仅在 URL 成功提取后才标记已处理（见下方 add），
             # 点击/URL 失败的标题允许在后续页面重试。
             if title in processed_titles:
+                continue
+
+            # 永久不可恢复页（微信拦截页）：标记过即不再点击——拦截页永不自愈，
+            # 点击只会再次打开提示页（2026-09-21 单篇违规文每页迭代被磨 17 次）
+            if normalize_title_for_compare(title) in dead_titles:
+                print(f"    ⏭️  永久不可恢复（微信拦截页），跳过: {title[:50]}...")
+                continue
+
+            # 单轮失败记忆：达到次数上限的标题本轮不再重试，等下轮（AX 瞬时故障
+            # 跨页翻案一次；持续失败者下轮走拦截页探测/恢复流程再判）
+            attempts = failed_attempt_counts.get(title, 0)
+            if attempts >= MAX_CARD_ATTEMPTS_PER_RUN:
+                print(f"    ⏭️  本轮已失败 {attempts} 次，跳过等下轮: {title[:50]}...")
                 continue
 
             print(f"\n  [{i}] {title[:60]}... (element {elem_idx})")
@@ -905,9 +971,24 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                     url = None  # 幻影：读到的是其他文章的 URL，丢弃不计
 
                 if not url:
-                    print("    ⚠️  未提取到本篇 URL")
-                    total_failed += 1
-                    page_failed += 1
+                    # 微信拦截页探测：违规/发布者删除/账号屏蔽页 AXDocument 读不到
+                    # URL（launchd/TTY 同），但 AX 正文极短且含平台拦截文案——命中即
+                    # 永久标记（与保存器同表同阈值），不计失败、后续页不再重试
+                    # （拦截页永不自愈；2026-09-21 实证单篇违规文被磨 17 次）。
+                    # 自愈被拒（wedge_unhealed）时 ima 已死，探测无意义
+                    dead_reason = None if wedge_unhealed else _detect_dead_page_reason()
+                    if dead_reason:
+                        norm = normalize_title_for_compare(title)
+                        if mark_dead_title(norm, title, dead_reason):
+                            dead_titles.add(norm)
+                        total_deleted += 1
+                        page_deleted += 1
+                        print(f"    🗑️  {dead_reason}（微信拦截页），已标记永久跳过: {title[:50]}...")
+                    else:
+                        print("    ⚠️  未提取到本篇 URL")
+                        total_failed += 1
+                        page_failed += 1
+                        failed_attempt_counts[title] = failed_attempt_counts.get(title, 0) + 1
                     consecutive_seen = 0  # 失败时重置计数器
                     if abandon_page or healed_mid_page or wedge_unhealed:
                         # 自愈/点击失败后索引缓存已失效：弃本卡，重新解析当前页续走
@@ -972,13 +1053,14 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             continue
 
         if unknown_titles:
-            print(f"\n  本页完成: 新增 {page_new}, 跳过 {page_skipped}")
+            print(f"\n  本页完成: 新增 {page_new}, 跳过 {page_skipped}, 标记删除 {page_deleted}")
 
-            # 本页没有新增、跳过或失败，说明列表没有继续推进（通常是滚动卡住，
-            # 或页面内容已完全由本次运行处理过）。有失败时继续尝试，避免 AX 临时
-            # 故障导致整页 URL 提取失败后被误判为列表已卡住。
-            # 自愈宽限期内不判无进展——重走已处理页本来就是三计数全零。
-            if page_new == 0 and page_skipped == 0 and page_failed == 0:
+            # 本页没有新增、跳过、失败或删除标记，说明列表没有继续推进（通常是滚动
+            # 卡住，或页面内容已完全由本次运行处理过）。有失败时继续尝试，避免 AX
+            # 临时故障导致整页 URL 提取失败后被误判为列表已卡住；删除标记算真实
+            # 进展（候选已定性消化），不算无进展。
+            if (page_new == 0 and page_skipped == 0 and page_failed == 0
+                    and page_deleted == 0):
                 if heal_resume_grace > 0:
                     print("  🩹 自愈宽限中：重走已处理页寻找弃卡，不判无进展")
                 else:
@@ -990,7 +1072,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
             # MAX_PAGES。连续多页「有候选零新增」即判定失配，停止翻页。
             # 有失败页不计入（AX 抖动属临时态，保守继续走）。
             # 自愈宽限期内不计（重走已处理页天然零新增），并复位计数。
-            if page_new == 0 and page_failed == 0:
+            if page_new == 0 and page_failed == 0 and page_deleted == 0:
                 if heal_resume_grace > 0:
                     zero_new_walk_pages = 0
                 else:
@@ -1027,6 +1109,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     print(f"  本次新增: {total_new} 篇")
     print(f"  本次跳过: {total_skipped} 篇")
     print(f"  本次失败: {total_failed} 篇")
+    print(f"  本次标记删除: {total_deleted} 篇")
     print(f"  数据库总计: {stats['total']} 篇 ({stats['kb_count']} 个知识库)")
 
 

@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # ==================== 配置 ====================
@@ -127,6 +127,15 @@ def init_database():
                 marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # saver 跨进程/跨知识库的节流状态（当前仅存风控冷却截止时刻）：
+        # 增量更新一轮内逐库调 saver 子进程，验证墙熔断须让后续库立即停开页，
+        # 且冷却期要跨 update 运行持续（16:10 撞墙后 17:10 探测、手动补跑也感知）
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS saver_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         # 向后兼容：对已有数据库添加缺失的列
         for col, type_def in [
             ("obsidian_saved", "INTEGER DEFAULT 0"),
@@ -210,6 +219,59 @@ def load_dead_titles():
             return {r for (r,) in conn.execute("SELECT title_norm FROM dead_articles")}
     except sqlite3.Error:
         return set()
+
+
+# ==================== saver 风控冷却（验证墙熔断后的跨运行节流）====================
+
+SAVE_WALL_COOLDOWN_KEY = "save_wall_cooldown_until"
+# 冷却时长：45 分钟让 16:10 撞墙熔断后，17:10 兜底槽（约 55 分钟后）仍能探测一次；
+# 探测再撞墙会再次熔断并重置冷却（每天 ≤2 次探测，每次代价 ~2 篇尝试即止损）。
+# 9/27 实测墙持续数小时，探测失败是常态但有界——宁探测勿长封，避免冷却过长拖慢积压消化。
+SAVE_WALL_COOLDOWN_MINUTES = 45
+
+
+def set_save_wall_cooldown(minutes: int = SAVE_WALL_COOLDOWN_MINUTES,
+                           now: datetime = None) -> bool:
+    """把风控冷却截止时刻写入 saver_state（验证墙熔断时调用）。
+
+    now 可注入供测试。写失败返回 False（冷却写不进去时调用方仍会本轮熔断，
+    只是下一轮失去跨运行记忆——降级不失效，与 mark_dead_title 同口径）。
+    """
+    expiry = (now or datetime.now()) + timedelta(minutes=minutes)
+    try:
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO saver_state (key, value) VALUES (?, ?)",
+                (SAVE_WALL_COOLDOWN_KEY, expiry.strftime("%Y-%m-%dT%H:%M:%S")),
+            )
+            conn.commit()
+        return True
+    except sqlite3.Error as e:
+        print(f"  ⚠️  saver_state 冷却写入失败: {e}")
+        return False
+
+
+def get_save_wall_cooldown_remaining(now: datetime = None) -> int:
+    """风控冷却剩余秒数（0 = 无冷却/已过期/状态不可读）。
+
+    值损坏按无冷却处理（fail-open）：冷却只是节流优化，读不出来不该阻断保存。
+    """
+    try:
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            row = conn.execute(
+                "SELECT value FROM saver_state WHERE key = ?",
+                (SAVE_WALL_COOLDOWN_KEY,),
+            ).fetchone()
+    except sqlite3.Error:
+        return 0
+    if not row:
+        return 0
+    try:
+        expiry = datetime.strptime(row[0], "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError):
+        return 0
+    remaining = (expiry - (now or datetime.now())).total_seconds()
+    return max(0, int(remaining))
 
 
 def verify_urls_canonical(db_file=None):

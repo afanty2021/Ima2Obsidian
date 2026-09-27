@@ -41,6 +41,9 @@
 | `WAIT_POPUP_APPEAR` | 10.0s | 剪藏器弹窗窗口出现等待超时（超时即 popup_missing 快速失败） |
 | `WAIT_AX_BUTTONS` | 12.0s | 弹窗 AX 按钮就绪轮询预算（每轮首个弹窗预热实测 ~6s，12s 与 IMA 侧对齐） |
 | `WAIT_CLIP_SAVE` | 1.0s | 落盘首轮轮询前起步间隔；半成品由 `_file_write_settled` 双采样防护 |
+| `MAX_SAVE_PER_RUN` | 12 | 每轮保存硬顶（--limit 只能收窄不能放大），防积压日一口气全开触发风控 |
+| `VERIFY_WALL_ABORT_THRESHOLD` | 2 | verify_page_stuck 连续达此次数判定风控墙活跃，熔断本轮并写冷却 |
+| `SAVE_WALL_COOLDOWN_MINUTES` | 45 | 墙熔断后的冷却时长（16:10 撞墙 → 17:10 仍能探测一次） |
 | `DEFAULT_LIMIT` | 1300 | 每次最多处理文章数 |
 
 ### 性能调优（2026-08-27）
@@ -110,7 +113,22 @@
 
 ### 3. 同签名熔断（`ConsecutiveFailureBreaker`，阈值 3）
 
-同一失败签名连续 3 次说明是系统性环境故障而非单篇问题（扩展被禁用/输入法拦截/击键被 TCC 丢弃），熔断剩余批次并按签名打印排查指引——2026-08 曾一天 94 篇 × ~90s 全失败空转 1.5 小时。签名：`popup_missing`（命令层未响应）/ `file_not_found`（触发成功但未落盘）/ `exception`。成功或 deleted 重置计数。
+同一失败签名连续 3 次说明是系统性环境故障而非单篇问题（扩展被禁用/输入法拦截/击键被 TCC 丢弃），熔断剩余批次并按签名打印排查指引——2026-08 曾一天 94 篇 × ~90s 全失败空转 1.5 小时。签名：`popup_missing`（命令层未响应）/ `file_not_found`（触发成功但未落盘）/ `verify_page_stuck`（验证墙，走专项熔断）/ `exception`。成功或 deleted 重置计数。
+
+### 3.5 保存节流三件套（2026-09-27 滑块墙事故后）
+
+一次补 3 天积压连开 ~29 个文章页触发微信滑块风控墙（32 次验证页、16 存 3）。三层节流：
+
+1. **每轮上限 `MAX_SAVE_PER_RUN=12`**：saver 单次运行至多开 12 页；`--limit` 只能收窄不能放大。正常日每库新增 1-3 篇碰不到上限，积压靠多时槽摊平（双槽 24 页/天消化力）
+2. **验证墙熔断**：`verify_page_stuck` 连续 2 次（成功重置，人工拖滑块救回一篇即继续）判定墙活跃，熔断本轮并把冷却截止时刻写入 `saver_state` 表（45 分钟）——滑块拼图解不了，继续开页只会喂风控
+3. **update 侧传播**：`ima_incremental_update` 每库保存前查冷却（墙按账号计，换库开页同样喂风控，一库撞墙全轮停保存、提取不受影响）+ 跨库共享保存预算 `SAVE_BUDGET_PER_UPDATE=12`（按实际尝试页数递减，失败页也计风控暴露）
+
+冷却 45 分钟的设计：16:10 撞墙熔断后 17:10 兜底槽（约 55 分钟后）仍能探测一次，再撞再冷却，每天探测代价有界（每次 ~2 篇尝试即止损）。冷却中的跳过不计失败（熔断当轮已非零退出告警过）。手动解除/查看冷却：
+
+```sql
+SELECT * FROM saver_state WHERE key='save_wall_cooldown_until';
+DELETE FROM saver_state WHERE key='save_wall_cooldown_until';  -- 立即恢复保存
+```
 
 ### 4. 环境漂移快照（incremental 主流程，`ima_common.environment_snapshot`）
 

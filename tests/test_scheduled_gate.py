@@ -331,7 +331,7 @@ class TestMainScheduledGate:
                             lambda kb, dry_run: {"new": 3, "skipped": 0, "failed": 2})
         # new=3 会触发保存阶段，mock 掉真实 saver
         monkeypatch.setattr(inc, "save_to_obsidian",
-                            lambda kb, dry_run=False, run_reclaim=True:
+                            lambda kb, dry_run=False, run_reclaim=True, save_budget=None:
                             {"saved": 3, "failed": 0, "started": True})
 
         with pytest.raises(SystemExit) as exc_info:

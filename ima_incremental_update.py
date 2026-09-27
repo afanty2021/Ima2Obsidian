@@ -32,10 +32,17 @@ from ima_common import (
     ensure_ima_appnap_disabled,
     save_snapshot_and_report_drift,
     get_ima_main_window, ensure_appnap_disabled,
+    get_save_wall_cooldown_remaining,
 )
 
 # 提取器子进程总预算（秒）：到点强杀（threading.Timer），防止病态场景拖穿夜窗
 EXTRACTOR_BUDGET_SECONDS = 3600
+
+# 整轮增量更新的保存预算（跨知识库共享）：风控按账号计，一轮 5 库各开 N 页与
+# 单库开 5N 页等价。2026-09-27 积压日单库连开 ~13 页即触墙，正常日全轮 ~5-15 页
+# 无碍——预算取 12 兼顾正常日一次跑完与积压日有界爆发；用尽后剩余库本轮跳过保存
+# （提取照常），下一时槽/次日自动续消化。
+SAVE_BUDGET_PER_UPDATE = 12
 
 # ==================== 配置 ====================
 
@@ -653,9 +660,14 @@ def save_to_obsidian(
     kb_name: str = None,
     dry_run: bool = False,
     run_reclaim: bool = True,
+    save_budget: int = None,
 ) -> dict:
     """
     调用 Obsidian 保存器（行级实时透传 saver 输出，避免长时间无输出被误判"卡死"）
+
+    save_budget：本轮剩余保存预算（跨知识库递减的页数上限），None 用历史行为
+    （不传 --limit 上限，由 saver 自身 MAX_SAVE_PER_RUN 硬顶）；0 由调用方直接
+    跳过、不会走到这里。
 
     返回统计信息: {saved, failed, started}
     """
@@ -673,7 +685,10 @@ def save_to_obsidian(
         "python3",
         "-u",  # 禁用输出缓冲，配合下面的行级透传实时显示保存进度
         Path(__file__).parent / "ima_obsidian_saver.py",
-        "--limit", "1000",  # 每次最多保存 1000 篇
+        # 保存预算：跨库共享的每轮页数上限（--limit 传剩余预算；saver 侧另有
+        # MAX_SAVE_PER_RUN 硬顶，--limit 只能收窄）。原 1000 上限等于无限制，
+        # 9/27 积压日一口气连开 ~29 页触发微信滑块风控墙
+        "--limit", str(save_budget if save_budget is not None else 1000),
         # quick 模式的 ⌥⇧O 会被中文输入法(SCIM)拦截，⌥组合键永远到不了扩展；
         # clipper 模式(⌘⇧O+回车)不受输入法影响，2026-08-27 实测验证可落盘
         "--mode", "clipper",
@@ -1203,6 +1218,9 @@ def main():
         total_saved = 0
         total_failed = 0       # 保存失败（saver）
         total_kb_failed = 0    # 知识库处理失败（导航/窗口/提取）
+        save_cooldown_skips = 0  # 风控冷却跳过保存的库数（不计失败：熔断轮已告警）
+        save_budget_skips = 0    # 保存预算用尽跳过保存的库数（节流设计内行为）
+        save_budget = SAVE_BUDGET_PER_UPDATE  # 跨库共享的每轮开页预算
         reclaim_done = False   # 同一轮增量更新只执行一次全量 reclaim
 
         # 逐个处理知识库
@@ -1225,11 +1243,30 @@ def main():
             if (stats["new"] > 0 or unsaved > 0) and not args.no_save and not args.dry_run:
                 if stats["new"] == 0 and unsaved > 0:
                     log(f"检测到 {kb_name} 有 {unsaved} 篇历史漏存未保存，触发保存重试")
-                save_stats = save_to_obsidian(kb_name, run_reclaim=not reclaim_done)
-                if save_stats.get("started", False):
-                    reclaim_done = True
-                total_saved += save_stats["saved"]
-                total_failed += save_stats["failed"]
+                # 风控墙冷却（saver 熔断时写 DB）：冷却内跳过所有库的保存阶段——
+                # 墙按账号计，换库开页一样喂风控。提取不受影响，积压由冷却后的
+                # 时槽继续消化；跳过不算 KB 失败（熔断当轮已非零退出告警过）
+                cooldown = get_save_wall_cooldown_remaining()
+                if cooldown > 0:
+                    log(f"⛔ 微信风控冷却中（剩 {cooldown // 60} 分钟），"
+                        f"跳过 {kb_name} 保存阶段（提取不受影响），留待冷却后重试")
+                    save_cooldown_skips += 1
+                elif save_budget <= 0:
+                    log(f"ℹ️  本轮保存预算已用尽（{SAVE_BUDGET_PER_UPDATE} 页），"
+                        f"跳过 {kb_name} 保存阶段，剩余留待下一时槽")
+                    save_budget_skips += 1
+                else:
+                    save_stats = save_to_obsidian(
+                        kb_name, run_reclaim=not reclaim_done,
+                        save_budget=save_budget,
+                    )
+                    if save_stats.get("started", False):
+                        reclaim_done = True
+                    total_saved += save_stats["saved"]
+                    total_failed += save_stats["failed"]
+                    # 按实际尝试页数（成功+失败）扣减预算——失败页也开了文章页、
+                    # 同样计入风控暴露；deleted 不扣（没走 Chrome 开页）
+                    save_budget -= (save_stats["saved"] + save_stats["failed"])
 
             # 知识库之间等待
             if i < len(kbs):
@@ -1245,6 +1282,10 @@ def main():
         log(f"总计跳过: {total_skipped} 篇")
         log(f"保存到 Obsidian: {total_saved} 篇")
         log(f"保存失败: {total_failed} 篇")
+        if save_cooldown_skips:
+            log(f"风控冷却跳过保存: {save_cooldown_skips} 个库（冷却结束后自动恢复）")
+        if save_budget_skips:
+            log(f"保存预算用尽跳过: {save_budget_skips} 个库（下一时槽继续消化）")
         log(f"知识库处理失败: {total_kb_failed} 个")
 
         # 落盘运行结果供 17:10 兜底槽前置判断读取；dry-run 不代表真实扫描，不写

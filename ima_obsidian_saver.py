@@ -56,6 +56,8 @@ from ima_common import (
     run_cua, get_ime_source, ime_blocks_option_shortcuts,
     read_chrome_profile_info, read_web_clipper_status,
     CUA_DRIVER, is_daemon_running,
+    get_save_wall_cooldown_remaining, set_save_wall_cooldown,
+    SAVE_WALL_COOLDOWN_MINUTES,
 )
 
 
@@ -99,6 +101,13 @@ WAIT_AX_BUTTONS = 12.0      # 弹窗 AX 按钮就绪等待：Chromium 每轮首�
                             # 12s 与 IMA 侧 wait_for_ax_ready 预算对齐，给冷缓存/繁忙机器留余量
 WAIT_AX_BUTTONS_POLL = 0.5  # AX 按钮轮询间隔
 CONSECUTIVE_FAIL_ABORT = 3  # 同签名连续失败熔断阈值（跳过剩余批次，避免整批空转）
+VERIFY_WALL_ABORT_THRESHOLD = 2  # verify_page_stuck 达此次数判定风控墙活跃，熔断并写冷却
+
+# 每轮保存上限（防积压爆发触发微信风控）：2026-09-27 一次补 3 天积压连开 ~29 个
+# 文章页触发滑块墙（32 次验证页、16 存 3）。正常日每库新增 1-3 篇远碰不到上限；
+# 积压日靠多轮（16:10/17:10 双槽 + 次日）摊平消化，每轮至多开这么多页。
+# --limit 可调低不可调高（上限是硬顶）；如需手动强制批量处理改此常量。
+MAX_SAVE_PER_RUN = 12
 
 # 弹窗确认按钮的匹配标签（小写子串匹配）。扩展弹窗 UI 目前为英文；若未来本地化，
 # 在此追加对应语言标签即可（匹配不到时已有回车键兜底，不会中断流程）
@@ -1901,7 +1910,23 @@ def main():
         print("\n✅ 没有待保存的文章")
         return
 
-    articles = get_unsaved_articles(args.limit, args.kb)
+    # 风控冷却检查（验证墙熔断后写 saver_state；update 侧每库前置检查为主，
+    # 此处是手动直跑 saver 的兜底）。冷却中跳过保存按成功退出——熔断当轮已
+    # 非零退出告过警，冷却跳过是设计内行为不应重复告警。
+    if not args.dry_run:
+        cooldown = get_save_wall_cooldown_remaining()
+        if cooldown > 0:
+            print(f"\n⛔ 微信风控冷却中（剩 {cooldown // 60} 分钟），本轮跳过保存。")
+            print("   验证墙熔断时已写冷却截止时刻；冷却结束后的下一轮自动恢复重试。")
+            sys.exit(0)
+
+    # 每轮上限：--limit 只能收窄不能放大（风控节流是硬顶，防积压日一口气全开）
+    effective_limit = min(args.limit, MAX_SAVE_PER_RUN)
+    articles = get_unsaved_articles(effective_limit, args.kb)
+    stats_before = get_stats(args.kb)
+    if len(articles) < stats_before["unsaved"]:
+        print(f"ℹ️  待保存 {stats_before['unsaved']} 篇 > 本轮节流上限 {MAX_SAVE_PER_RUN} 篇"
+              f"（防微信风控），剩余 {stats_before['unsaved'] - len(articles)} 篇留待下轮")
     print(f"\n本次处理: {len(articles)} 篇\n")
 
     if not args.dry_run:
@@ -1928,6 +1953,8 @@ def main():
     failed_count = 0
     deleted_count = 0
     aborted_by_breaker = False
+    aborted_by_wall = False
+    wall_hits = 0  # verify_page_stuck 计数：达阈值判定风控墙活跃（滑块拼图无人拖）
     breaker = ConsecutiveFailureBreaker()
 
     def _abort_batch(sig):
@@ -1949,6 +1976,7 @@ def main():
                 saved_count += 1
                 print(f"    ✅ 完成")
                 breaker.record_success()
+                wall_hits = 0  # 成功证明页能开（墙间歇/人工拖滑块），墙计数同通用熔断按连续计
             elif status == "deleted":
                 # 永久不可恢复页（发布者删除/违规/屏蔽）：永久跳过，不计 failed（避免触发上游告警）
                 if not args.dry_run:
@@ -1956,9 +1984,22 @@ def main():
                 deleted_count += 1
                 print(f"    🗑️  已删除（标记 status='deleted' 永久跳过）")
                 breaker.record_success()  # 确定性结局，重置熔断计数
+                wall_hits = 0
             else:  # failed
                 failed_count += 1
                 print(f"    ❌ 失败")
+                # 验证墙熔断（先于通用熔断：2 < 3 次即止损，且须写跨运行冷却）——
+                # 滑块拼图自动化解不了，继续开页只会喂风控、可能延长标记期
+                if _LAST_FAILURE_SIGNATURE == "verify_page_stuck":
+                    wall_hits += 1
+                    if wall_hits >= VERIFY_WALL_ABORT_THRESHOLD:
+                        aborted_by_wall = True
+                        set_save_wall_cooldown(SAVE_WALL_COOLDOWN_MINUTES)
+                        print(f"\n⛔ 熔断：本轮 {wall_hits} 篇卡在验证页/滑块页，微信风控墙活跃，"
+                              f"跳过剩余文章并写 {SAVE_WALL_COOLDOWN_MINUTES} 分钟冷却")
+                        print("   冷却期内增量更新将跳过各库保存阶段（提取不受影响）；"
+                              "人工在场可拖滑块解除后立即重跑")
+                        break
                 if breaker.record_failure(_LAST_FAILURE_SIGNATURE):
                     aborted_by_breaker = True
                     _abort_batch(_LAST_FAILURE_SIGNATURE)
@@ -1991,6 +2032,9 @@ def main():
     if aborted_by_breaker:
         print(f"  ⚠️  本批已熔断（连续 {CONSECUTIVE_FAIL_ABORT} 篇同签名失败），"
               f"剩余文章留待修复环境后重试")
+    if aborted_by_wall:
+        print(f"  ⛔ 验证墙熔断：风控冷却已写入（{SAVE_WALL_COOLDOWN_MINUTES} 分钟），"
+              f"冷却内各轮跳过保存，剩余文章留待冷却结束后重试")
     print(f"  本次已删除: {deleted_count} 篇")
     print(f"  剩余待保存: {stats['unsaved']}")
     if stats.get("deleted"):

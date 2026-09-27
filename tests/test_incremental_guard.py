@@ -130,7 +130,7 @@ class TestMainEntryGuardCallsRealMain:
 
         calls = []
 
-        def fake_save(kb_name, dry_run=False, run_reclaim=True):
+        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None):
             calls.append((kb_name, run_reclaim))
             return {"saved": 0, "failed": 0, "started": True}
 
@@ -197,7 +197,7 @@ class TestMainEntryGuardCallsRealMain:
 
         calls = []
 
-        def fake_save(kb_name, dry_run=False, run_reclaim=True):
+        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None):
             calls.append((kb_name, run_reclaim))
             return {"saved": 0, "failed": 1, "started": False} if kb_name == "AI" \
                 else {"saved": 0, "failed": 0, "started": True}

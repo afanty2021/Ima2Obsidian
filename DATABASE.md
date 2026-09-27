@@ -48,6 +48,19 @@ SELECT * FROM dead_articles;
 DELETE FROM dead_articles WHERE title_norm = (SELECT title_norm FROM dead_articles WHERE title LIKE '%…%');
 ```
 
+### saver_state 表（2026-09-27 保存节流冷却状态）
+
+```sql
+CREATE TABLE saver_state (
+    key TEXT PRIMARY KEY,       -- 目前仅 save_wall_cooldown_until
+    value TEXT NOT NULL         -- 冷却截止时刻（YYYY-MM-DDTHH:MM:SS 本地时间）
+);
+```
+
+saver 验证墙熔断（`verify_page_stuck` 连续 2 次）时写入冷却截止时刻；冷却期内
+incremental_update 跳过各库保存阶段（提取不受影响），saver 手动直跑也会自查。
+值损坏按无冷却处理（fail-open——节流优化不该因状态读不出来阻断保存）。
+
 ---
 
 ## 索引

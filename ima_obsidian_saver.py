@@ -1375,6 +1375,29 @@ DELETED_CLIPPING_MARKERS = (
 )
 
 
+def _wechat_platform_title_hit(txt: str) -> bool:
+    """frontmatter title 精确等于「微信公众平台」⇔ Web Clipper 把验证/滑块页剪藏成了 .md。
+
+    文章落盘 title 恒为文章名，微信系统提示页（验证页/滑块页）落盘 title 恒为此值，
+    是无歧义强标志——认领跳过与本轮落盘垃圾清理共用此判据（单一事实源）。
+    只在首个 frontmatter 块（--- ... ---）内搜，避免正文 YAML 代码块（讲 Web Clipper 等
+    技术文章引用 frontmatter 示例）误判。兼容 YAML 引号变体（双引号/单引号/无引号；
+    纯中文 title 常态无引号）。
+    """
+    fm = re.match(r'^---\s*\n(.*?)\n---', txt, re.DOTALL)
+    fm_text = fm.group(1) if fm else ""
+    return bool(re.search(r'^title:\s*["\']?微信公众平台["\']?\s*$', fm_text, re.MULTILINE))
+
+
+def _is_wechat_platform_clipping(md_path: Path) -> bool:
+    """路径版：读文件后判 frontmatter title 是否「微信公众平台」（OSError → False）。"""
+    try:
+        txt = md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return _wechat_platform_title_hit(txt)
+
+
 def _is_verify_clipping(md_path: Path) -> bool:
     """检测 Web Clipper 落盘的 .md 是否为验证页/删除页等干扰内容（非文章）。
 
@@ -1388,21 +1411,44 @@ def _is_verify_clipping(md_path: Path) -> bool:
     except OSError:
         return False
     # 验证页落盘 frontmatter title 恒为"微信公众平台"（文章 title 是文章名）→ 直接判定。
-    # 只在首个 frontmatter 块（--- ... ---）内搜，避免正文 YAML 代码块（讲 Web Clipper 等
-    # 技术文章引用 frontmatter 示例）误判 → 跳过认领 → 静默保存失败。
-    fm = re.match(r'^---\s*\n(.*?)\n---', txt, re.DOTALL)
-    fm_text = fm.group(1) if fm else ""
-    # 兼容 YAML 引号变体（双引号/单引号/无引号；纯中文 title 常态无引号）
-    if re.search(r'^title:\s*["\']?微信公众平台["\']?\s*$', fm_text, re.MULTILINE):
+    if _wechat_platform_title_hit(txt):
         return True
     # 删除页 .md 仅一句提示（正文很短）；合法文章即便正文引用整句，.md 正文也很长 →
     # 要求正文短才判删除页落盘，避免误伤引用整句的合法文章（静默跳过认领 = 永久卡队列）。
     # 剥 frontmatter 后算长度：真实 Web Clipper frontmatter（source URL 150+字 + author +
     # published + tags）已 ~200 字，含 frontmatter 算长度会让 path ② 永不触发（fix #4）。
+    fm = re.match(r'^---\s*\n(.*?)\n---', txt, re.DOTALL)
     body_text = txt[fm.end():] if fm else txt
     if len(body_text) < 200 and any(k in txt for k in DELETED_CLIPPING_MARKERS):
         return True
     return sum(1 for k in VERIFY_CLIPPING_MARKERS if k in txt) >= 2
+
+
+def _purge_new_verify_clippings(existing_files: set) -> int:
+    """认领失败后清理本轮新落盘的验证页剪藏垃圾（frontmatter title=微信公众平台）。
+
+    quick_clip 打在验证/滑块页上会落盘此类 .md：认领按文章标题匹配必然失配 → 计失败，
+    但垃圾滞留 Clippings 永不清理（2026-09-27 实测单轮 12 个；认领路径只跳过不删除，
+    最早的同类垃圾已潜伏 7 周）。仅删 title 精确命中的文件——不可逆操作收窄到无歧义
+    强标志，删除页/宽口径命中仍走认领跳过兜底，不做物理删除。
+    existing_files：打开文章前的 (Path, mtime) 快照，只清本轮新增，不碰存量文件。
+
+    返回删除的文件数。
+    """
+    purged = 0
+    if not CLIPPINGS_DIR.exists():
+        return 0
+    seen_paths = {p for (p, _m) in existing_files}
+    for f in CLIPPINGS_DIR.rglob("*.md"):
+        if f in seen_paths or not _is_wechat_platform_clipping(f):
+            continue
+        try:
+            f.unlink()
+            purged += 1
+            print(f"    🧹 已清理验证页剪藏垃圾: {f.name}")
+        except OSError:
+            pass
+    return purged
 
 
 def find_and_rename_in_vault(
@@ -1612,6 +1658,18 @@ def save_one_article(
     #   is_verify_page 前置 _deleted_reason 排除，屏蔽/违规页不会被误判为验证页 → 不浪费重试
     if handle_verify_page(browser_app, initial_snap=snap):
         snap = read_page_snapshot(browser_app)  # 点确认跳转后复读真页面
+        if is_verify_page(snap):
+            # 两轮自动确认后仍停留在验证页/滑块页（如滑块拼图无人拖动）。此时 quick_clip
+            # 只会剪藏出 title=微信公众平台 的垃圾 .md：认领按文章标题匹配必然失配 →
+            # 计失败，但垃圾滞留 Clippings（9/27 实测单轮 12 个）→ 放弃剪藏保持未保存，
+            # 下次重试；认领失败分支另有本轮落盘垃圾清理兜底（防时序竞争漏网）。
+            print("    ⚠️ 自动确认后仍停留在验证页/滑块页，放弃剪藏（保持未保存，下次重试）")
+            print(f"       [自取证] title={(snap or {}).get('title')!r} "
+                  f"text={((snap or {}).get('text') or '')[:120]!r}")
+            _LAST_FAILURE_SIGNATURE = "verify_page_stuck"
+            close_tab(browser_app)
+            time.sleep(WAIT_CLOSE_TAB)
+            return "failed", None
 
     # 2.55 永久不可恢复页检测（发布者删除 / 违规不可查看 / 账号屏蔽）：命中即短路返回，不触发 quick_clip
     #   （此类页 quick_clip 只会 0 落盘；保持未保存会被每次运行反复打开 → failed_count 假告警）
@@ -1702,6 +1760,9 @@ def save_one_article(
         folder_info = f"{target_folder}/" if target_folder else ""
         print(f"    ⚠️  未找到保存的文件，可能需要手动移动到: {folder_info}{date_str} {sanitize_filename(title)}.md")
         _LAST_FAILURE_SIGNATURE = "file_not_found"
+        # 兜底：剪藏可能打在验证/滑块页上落盘了 title=微信公众平台 的垃圾 .md
+        # （认领失配的典型伴随物）。只清本轮新增，存量垃圾与宽口径命中不物理删除。
+        _purge_new_verify_clippings(existing_files)
 
     # 5. 关闭标签页（尝试后台关闭，不激活浏览器）
     close_tab(browser_app)

@@ -166,6 +166,24 @@ class TestSaverWallAbort:
         assert get_save_wall_cooldown_remaining() > 0  # 冷却已落库
         assert "风控墙活跃" in capsys.readouterr().out
 
+    def test_wall_abort_cooldown_write_failure_wording(self, saver_env, capsys):
+        """熔断但冷却写库失败：汇总不得谎称已写入（写失败告警已单独打印）"""
+        articles = [_fake_article(i) for i in range(5)]
+
+        def fake_save_one(*_a, **_k):
+            sv._LAST_FAILURE_SIGNATURE = "verify_page_stuck"
+            return ("failed", None)
+
+        with patch.object(sv, "get_unsaved_articles", return_value=articles), \
+             patch.object(sv, "get_stats", return_value={"total": 5, "saved": 0, "unsaved": 5, "deleted": 0}), \
+             patch.object(sv, "save_one_article", side_effect=fake_save_one), \
+             patch.object(sv, "set_save_wall_cooldown", return_value=False):
+            with pytest.raises(SystemExit):
+                sv.main()
+        out = capsys.readouterr().out
+        assert "已写入" not in out
+        assert "写入失败" in out
+
     def test_other_signature_uses_generic_breaker_no_cooldown(self, saver_env):
         """非墙失败走通用熔断（3 次），不写冷却——冷却专属验证墙"""
         articles = [_fake_article(i) for i in range(5)]
@@ -240,6 +258,20 @@ class TestUpdateSaveBudget:
         assert budgets == [upd.SAVE_BUDGET_PER_UPDATE,
                            upd.SAVE_BUDGET_PER_UPDATE - 1,
                            upd.SAVE_BUDGET_PER_UPDATE - 2]
+
+    def test_budget_counts_deleted_pages(self, upd_env):
+        """删除页也扣预算——删除判定在 open_url 开页之后，风控暴露与成败页相同"""
+        upd_env.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest"])
+        budgets = []
+
+        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None):
+            budgets.append(save_budget)
+            return {"saved": 1, "failed": 0, "deleted": 2, "started": True}
+
+        upd_env.setattr(upd, "save_to_obsidian", fake_save)
+        upd.main()
+        assert budgets == [upd.SAVE_BUDGET_PER_UPDATE,
+                           upd.SAVE_BUDGET_PER_UPDATE - 3]
 
     def test_budget_exhaustion_skips_remaining_kbs(self, upd_env):
         """预算用尽后剩余库跳过保存（提取照常），输出说明"""

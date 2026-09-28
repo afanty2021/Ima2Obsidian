@@ -669,7 +669,7 @@ def save_to_obsidian(
     （不传 --limit 上限，由 saver 自身 MAX_SAVE_PER_RUN 硬顶）；0 由调用方直接
     跳过、不会走到这里。
 
-    返回统计信息: {saved, failed, started}
+    返回统计信息: {saved, failed, deleted, started}
     """
     log(f"\n{'─'*40}")
     log(f"保存到 Obsidian...")
@@ -679,7 +679,7 @@ def save_to_obsidian(
     if not dry_run:
         if not ensure_obsidian_ready():
             log("❌ Obsidian 无法启动，跳过本次保存")
-            return {"saved": 0, "failed": 1, "started": False}
+            return {"saved": 0, "failed": 1, "deleted": 0, "started": False}
 
     cmd = [
         "python3",
@@ -714,7 +714,7 @@ def save_to_obsidian(
         )
     except Exception as e:
         log(f"❌ 启动 Obsidian 保存器失败: {e}")
-        return {"saved": 0, "failed": 1, "started": False}
+        return {"saved": 0, "failed": 1, "deleted": 0, "started": False}
 
     # 行级实时透传 saver stdout → 日志：替代 capture_output=True 的全量缓冲，
     # 让每篇文章的提取日期/触发 clipper/落盘轮询进度立即可见，
@@ -750,7 +750,7 @@ def save_to_obsidian(
         stdout_t.join(timeout=3)
         stderr_t.join(timeout=3)
         log(f"❌ Obsidian 保存超时（1800s），已终止 saver")
-        return {"saved": 0, "failed": 1, "started": True}
+        return {"saved": 0, "failed": 1, "deleted": 0, "started": True}
 
     stdout_t.join(timeout=5)
     stderr_t.join(timeout=5)
@@ -768,6 +768,7 @@ def save_to_obsidian(
 
     saved_count = _parse_count("本次成功")
     failed_count = _parse_count("本次失败")
+    deleted_count = _parse_count("本次已删除")  # 不与「累计已删除」行冲突（marker 含「本次」）
 
     if returncode != 0:
         log(f"❌ Obsidian 保存失败（退出码 {returncode}：成功 {saved_count}，失败 {failed_count}）")
@@ -775,7 +776,8 @@ def save_to_obsidian(
             log(f"错误: {chr(10).join(stderr_lines)}")
     else:
         log(f"✅ 保存完成: {saved_count} 篇")
-    return {"saved": saved_count, "failed": failed_count, "started": True}
+    return {"saved": saved_count, "failed": failed_count,
+            "deleted": deleted_count, "started": True}
 
 
 def count_unsaved_articles(kb_name: str = None):
@@ -1264,9 +1266,10 @@ def main():
                         reclaim_done = True
                     total_saved += save_stats["saved"]
                     total_failed += save_stats["failed"]
-                    # 按实际尝试页数（成功+失败）扣减预算——失败页也开了文章页、
-                    # 同样计入风控暴露；deleted 不扣（没走 Chrome 开页）
-                    save_budget -= (save_stats["saved"] + save_stats["failed"])
+                    # 按实际开页数（成功+失败+删除）扣减预算——删除页的判定在
+                    # open_url 开页之后，风控暴露与成败页相同，一并计入
+                    save_budget -= (save_stats["saved"] + save_stats["failed"]
+                                    + save_stats.get("deleted", 0))
 
             # 知识库之间等待
             if i < len(kbs):

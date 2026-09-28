@@ -170,7 +170,7 @@ class TestMainEntryGuardCallsRealMain:
 
         result = save_to_obsidian("AI", run_reclaim=False)
 
-        assert result == {"saved": 0, "failed": 0, "started": True}
+        assert result == {"saved": 0, "failed": 0, "deleted": 0, "started": True}
         assert "--skip-reclaim" in commands[0]
 
     def test_failed_saver_does_not_consume_reclaim_for_next_kb(self, temp_db, tmp_path, monkeypatch):

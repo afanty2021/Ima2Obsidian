@@ -248,3 +248,14 @@ brew install cliclick
 - 永久跳过，不再重试，不计失败（避免反复打开已删文章 + 触发上游告警）
 - 统计行「累计已删除(永久跳过)」可见数量；日志经 `incremental_update.log` 落盘
 - 如需重试：`UPDATE articles SET status='success' WHERE id=?`
+
+
+## 人在回路（--human-in-loop）
+
+滑块墙活跃时的手动兜底模式：saver 复检确认仍卡在验证/滑块页时，每篇开
+150s（HUMAN_VERIFY_WINDOW）窗口等真人拖动，期间**弹 macOS 通知+提示音**
+（`_notify_human`，无需盯终端）；解除即继续保存，超时计 verify_page_stuck
+留待重试。配套放宽：墙熔断阈值 2→3（VERIFY_WALL_ABORT_THRESHOLD_HUMAN）；
+saver 启动冷却门与 update KB 循环冷却检查均被该旗标旁路（人工在场重跑
+不受 45 分钟冷却限制）。自动解滑块为明确否决项：解题尝试本身喂风控信号，
+易升级账号标记期。

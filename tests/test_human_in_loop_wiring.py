@@ -42,3 +42,40 @@ def test_updater_threads_flag_and_bypasses_kb_cooldown():
     assert '"--human-in-loop"' in src
     assert "human_in_loop=args.human_in_loop" in src
     assert "and not args.human_in_loop:" in src
+
+
+def test_notify_uses_osascript_and_escapes_quotes():
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+
+    orig = sv.subprocess.run
+    sv.subprocess.run = fake_run
+    try:
+        sv._notify_human('副标题"引号', '正文"引号\\反斜杠')
+    finally:
+        sv.subprocess.run = orig
+    assert len(calls) == 1
+    assert calls[0][0] == "osascript"
+    script = calls[0][2]
+    assert '\\"' in script  # 引号已转义
+    assert "\\\\" in script  # 反斜杠已转义
+
+
+def test_notify_swallows_all_exceptions():
+    def boom(*_a, **_k):
+        raise RuntimeError("osascript missing")
+
+    orig = sv.subprocess.run
+    sv.subprocess.run = boom
+    try:
+        sv._notify_human("t", "m")  # 不抛即过
+    finally:
+        sv.subprocess.run = orig
+
+
+def test_saver_pings_notification_on_slider_and_timeout():
+    src = inspect.getsource(sv)
+    assert src.count("_notify_human(") >= 3  # def + 出现时 + 超时
+    assert "display notification" in src

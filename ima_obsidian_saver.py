@@ -111,7 +111,7 @@ MAX_SAVE_PER_RUN = 12
 
 # 人在回路（--human-in-loop）：自动化点完两轮「去验证」后仍停留滑块页时，轮询等
 # 真人拖滑块。无人在场时这套等待纯属空转，故只在显式人工模式下启用。
-HUMAN_VERIFY_WINDOW = 90.0  # 每篇等人工拖滑块的窗口（秒）
+HUMAN_VERIFY_WINDOW = 150.0  # 每篇等人工拖滑块的窗口（秒）
 HUMAN_VERIFY_POLL = 5.0     # 窗口内页面快照轮询间隔
 VERIFY_WALL_ABORT_THRESHOLD_HUMAN = 3  # 人工模式墙熔断阈值放宽：拖滑块需要时间，2 篇就熔断会把人晾在半路
 
@@ -1341,6 +1341,23 @@ def handle_verify_page(browser_app: str = "Google Chrome",
     return True
 
 
+def _notify_human(subtitle: str, message: str = "") -> None:
+    """macOS 通知铃：滑块出现/超时时提醒在场真人（含提示音）。
+
+    通知是锦上添花——任何异常静默吞掉，绝不能影响保存链路。
+    """
+    try:
+        def _esc(s: str) -> str:
+            return s.replace("\\", "\\\\").replace('"', '\\"')
+
+        script = (f'display notification "{_esc(message[:120])}" '
+                  f'with title "IMA 保存器" subtitle "{_esc(subtitle[:60])}" '
+                  f'sound name "Glass"')
+        subprocess.run(["osascript", "-e", script], timeout=5, capture_output=True)
+    except Exception:
+        pass
+
+
 def wait_human_solve_captcha(browser_app: str, title: str, window: float):
     """人在回路：轮询等真人拖滑块，返回解除后的新鲜快照；超时返回 None。
 
@@ -1350,6 +1367,7 @@ def wait_human_solve_captcha(browser_app: str, title: str, window: float):
     """
     deadline = time.time() + window
     print(f"    🙋 请在 Chrome 中拖动滑块完成验证（最长 {window:.0f}s）: {title[:40]}...")
+    _notify_human("滑块验证，请拖动", f"请在 {window:.0f}s 内拖动滑块：{title[:40]}")
     while time.time() < deadline:
         time.sleep(HUMAN_VERIFY_POLL)
         snap = read_page_snapshot(browser_app)
@@ -1357,6 +1375,7 @@ def wait_human_solve_captcha(browser_app: str, title: str, window: float):
             print("    ✅ 验证已解除，继续保存")
             return snap
     print("    ⚠️ 人工验证窗口超时")
+    _notify_human("验证窗口超时", f"本篇计失败留待重试：{title[:40]}")
     return None
 
 

@@ -661,7 +661,8 @@ def save_to_obsidian(
     dry_run: bool = False,
     run_reclaim: bool = True,
     save_budget: int = None,
-) -> dict:
+
+    human_in_loop: bool = False,) -> dict:
     """
     调用 Obsidian 保存器（行级实时透传 saver 输出，避免长时间无输出被误判"卡死"）
 
@@ -689,6 +690,8 @@ def save_to_obsidian(
         # MAX_SAVE_PER_RUN 硬顶，--limit 只能收窄）。原 1000 上限等于无限制，
         # 9/27 积压日一口气连开 ~29 页触发微信滑块风控墙
         "--limit", str(save_budget if save_budget is not None else 1000),
+        # 人在回路：滑块墙出现时等真人拖动（每篇 90s 窗口）；无人在场勿用
+        *(["--human-in-loop"] if human_in_loop else []),
         # quick 模式的 ⌥⇧O 会被中文输入法(SCIM)拦截，⌥组合键永远到不了扩展；
         # clipper 模式(⌘⇧O+回车)不受输入法影响，2026-08-27 实测验证可落盘
         "--mode", "clipper",
@@ -1133,6 +1136,11 @@ def main():
         action="store_true",
         help="跳过运行收尾（不退出 IMA/Obsidian/Chrome，也不杀 cua-driver 守护进程）"
     )
+    parser.add_argument(
+        "--human-in-loop", action="store_true",
+        help="人在回路：保存阶段撞到微信滑块墙时等真人拖动"
+             "（透传 saver --human-in-loop，并旁路风控冷却）",
+    )
     args = parser.parse_args()
 
     # 确定要处理的知识库
@@ -1249,7 +1257,7 @@ def main():
                 # 墙按账号计，换库开页一样喂风控。提取不受影响，积压由冷却后的
                 # 时槽继续消化；跳过不算 KB 失败（熔断当轮已非零退出告警过）
                 cooldown = get_save_wall_cooldown_remaining()
-                if cooldown > 0:
+                if cooldown > 0 and not args.human_in_loop:
                     log(f"⛔ 微信风控冷却中（剩 {cooldown // 60} 分钟），"
                         f"跳过 {kb_name} 保存阶段（提取不受影响），留待冷却后重试")
                     save_cooldown_skips += 1
@@ -1261,7 +1269,8 @@ def main():
                     save_stats = save_to_obsidian(
                         kb_name, run_reclaim=not reclaim_done,
                         save_budget=save_budget,
-                    )
+                    
+                    human_in_loop=args.human_in_loop,)
                     if save_stats.get("started", False):
                         reclaim_done = True
                     total_saved += save_stats["saved"]

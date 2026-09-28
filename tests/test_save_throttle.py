@@ -249,7 +249,7 @@ class TestUpdateSaveBudget:
         upd_env.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest", "英语教与学"])
         budgets = []
 
-        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None):
+        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None, human_in_loop=False):
             budgets.append(save_budget)
             return {"saved": 1, "failed": 0, "started": True}
 
@@ -264,7 +264,7 @@ class TestUpdateSaveBudget:
         upd_env.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest"])
         budgets = []
 
-        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None):
+        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None, human_in_loop=False):
             budgets.append(save_budget)
             return {"saved": 1, "failed": 0, "deleted": 2, "started": True}
 
@@ -277,7 +277,7 @@ class TestUpdateSaveBudget:
         """预算用尽后剩余库跳过保存（提取照常），输出说明"""
         upd_env.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest"])
 
-        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None):
+        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None, human_in_loop=False):
             return {"saved": upd.SAVE_BUDGET_PER_UPDATE, "failed": 0, "started": True}
 
         upd_env.setattr(upd, "save_to_obsidian", fake_save)
@@ -298,7 +298,7 @@ class TestUpdateSaveBudget:
         upd_env.setattr("sys.argv", ["ima_incremental_update.py", "--kb", "AI", "Invest"])
         calls = []
 
-        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None):
+        def fake_save(kb_name, dry_run=False, run_reclaim=True, save_budget=None, human_in_loop=False):
             calls.append(kb_name)
             if kb_name == "AI":
                 set_save_wall_cooldown(45)  # 模拟 saver 子进程熔断写冷却

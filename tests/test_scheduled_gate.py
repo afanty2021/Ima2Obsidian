@@ -328,10 +328,10 @@ class TestMainScheduledGate:
                                           "ime_source": "com.apple.keylayout.ABC"}))
         monkeypatch.setattr(inc.subprocess, "Popen", MagicMock())
         monkeypatch.setattr(inc, "update_knowledge_base",
-                            lambda kb, dry_run: {"new": 3, "skipped": 0, "failed": 2})
+                            lambda kb, dry_run, **_kw: {"new": 3, "skipped": 0, "failed": 2})
         # new=3 会触发保存阶段，mock 掉真实 saver
         monkeypatch.setattr(inc, "save_to_obsidian",
-                            lambda kb, dry_run=False, run_reclaim=True, save_budget=None:
+                            lambda kb, dry_run=False, run_reclaim=True, save_budget=None, **_kw:
                             {"saved": 3, "failed": 0, "started": True})
 
         with pytest.raises(SystemExit) as exc_info:

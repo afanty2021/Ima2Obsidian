@@ -109,6 +109,12 @@ VERIFY_WALL_ABORT_THRESHOLD = 2  # verify_page_stuck 达此次数判定风控墙
 # --limit 可调低不可调高（上限是硬顶）；如需手动强制批量处理改此常量。
 MAX_SAVE_PER_RUN = 12
 
+# 人在回路（--human-in-loop）：自动化点完两轮「去验证」后仍停留滑块页时，轮询等
+# 真人拖滑块。无人在场时这套等待纯属空转，故只在显式人工模式下启用。
+HUMAN_VERIFY_WINDOW = 90.0  # 每篇等人工拖滑块的窗口（秒）
+HUMAN_VERIFY_POLL = 5.0     # 窗口内页面快照轮询间隔
+VERIFY_WALL_ABORT_THRESHOLD_HUMAN = 3  # 人工模式墙熔断阈值放宽：拖滑块需要时间，2 篇就熔断会把人晾在半路
+
 # 弹窗确认按钮的匹配标签（小写子串匹配）。扩展弹窗 UI 目前为英文；若未来本地化，
 # 在此追加对应语言标签即可（匹配不到时已有回车键兜底，不会中断流程）
 ADD_BUTTON_LABELS = ("add to obsidian",)
@@ -1335,6 +1341,25 @@ def handle_verify_page(browser_app: str = "Google Chrome",
     return True
 
 
+def wait_human_solve_captcha(browser_app: str, title: str, window: float):
+    """人在回路：轮询等真人拖滑块，返回解除后的新鲜快照；超时返回 None。
+
+    窗口内自动化零击键（纯读快照），不影响用户操作；解除后调用方拿返回的
+    快照走正常流程（删除判定/发布日期/剪藏）。返回的快照可能是 None（用户
+    拖完但复读失败）——调用方以 is_verify_page 判定，None 不触发放弃路径。
+    """
+    deadline = time.time() + window
+    print(f"    🙋 请在 Chrome 中拖动滑块完成验证（最长 {window:.0f}s）: {title[:40]}...")
+    while time.time() < deadline:
+        time.sleep(HUMAN_VERIFY_POLL)
+        snap = read_page_snapshot(browser_app)
+        if snap and not is_verify_page(snap):
+            print("    ✅ 验证已解除，继续保存")
+            return snap
+    print("    ⚠️ 人工验证窗口超时")
+    return None
+
+
 # ==================== Vault 文件重命名 ====================
 
 def _non_conflicting_path(target: Path, source: Path) -> Path:
@@ -1603,7 +1628,8 @@ def save_one_article(
     mode: str = "quick",
     dry_run: bool = False,
     target_folder: str = None,
-):
+
+    human_verify_window: float = 0.0,):
     """
     返回 (status: str, date_str: Optional[str])，status ∈ {'saved','failed','deleted'}。
 
@@ -1667,6 +1693,10 @@ def save_one_article(
     #   is_verify_page 前置 _deleted_reason 排除，屏蔽/违规页不会被误判为验证页 → 不浪费重试
     if handle_verify_page(browser_app, initial_snap=snap):
         snap = read_page_snapshot(browser_app)  # 点确认跳转后复读真页面
+        if is_verify_page(snap) and human_verify_window > 0:
+            # 人在回路：两轮自动确认后仍停留滑块页 → 轮询等真人拖滑块（拖完跳转
+            # 真文章，拿新鲜快照走正常流程）；无人拖则超时走下方放弃路径
+            snap = wait_human_solve_captcha(browser_app, title, human_verify_window) or snap
         if is_verify_page(snap):
             # 两轮自动确认后仍停留在验证页/滑块页（如滑块拼图无人拖动）。此时 quick_clip
             # 只会剪藏出 title=微信公众平台 的垃圾 .md：认领按文章标题匹配必然失配 →
@@ -1806,6 +1836,11 @@ def main():
                         help="跳过启动时 reclaim（由增量更新流程用于避免重复扫描）")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="跳过环境预检（扩展安装/启用/快捷键/输入法）")
+    parser.add_argument(
+        "--human-in-loop", action="store_true",
+        help="人在回路：撞到微信滑块验证页时等待真人拖动滑块"
+             "（每篇最长 90s；无人在场勿用，自动化空转无意义）",
+    )
     args = parser.parse_args()
 
     browser_config = BROWSERS[args.browser]
@@ -1913,7 +1948,7 @@ def main():
     # 风控冷却检查（验证墙熔断后写 saver_state；update 侧每库前置检查为主，
     # 此处是手动直跑 saver 的兜底）。冷却中跳过保存按成功退出——熔断当轮已
     # 非零退出告过警，冷却跳过是设计内行为不应重复告警。
-    if not args.dry_run:
+    if not args.dry_run and not args.human_in_loop:
         cooldown = get_save_wall_cooldown_remaining()
         if cooldown > 0:
             print(f"\n⛔ 微信风控冷却中（剩 {cooldown // 60} 分钟），本轮跳过保存。")
@@ -1954,6 +1989,7 @@ def main():
     deleted_count = 0
     aborted_by_breaker = False
     aborted_by_wall = False
+    wall_cooldown_written = True  # 熔断时 set_save_wall_cooldown 的落库结果
     wall_hits = 0  # verify_page_stuck 计数：达阈值判定风控墙活跃（滑块拼图无人拖）
     breaker = ConsecutiveFailureBreaker()
 
@@ -1969,7 +2005,8 @@ def main():
             status, date_str = save_one_article(
                 article, browser_config, mode=args.mode, dry_run=args.dry_run,
                 target_folder=args.des
-            )
+            ,
+            human_verify_window=HUMAN_VERIFY_WINDOW if args.human_in_loop else 0.0,)
             if status == "saved":
                 if not args.dry_run:
                     mark_saved(article["id"], published_date=date_str)
@@ -1992,9 +2029,9 @@ def main():
                 # 滑块拼图自动化解不了，继续开页只会喂风控、可能延长标记期
                 if _LAST_FAILURE_SIGNATURE == "verify_page_stuck":
                     wall_hits += 1
-                    if wall_hits >= VERIFY_WALL_ABORT_THRESHOLD:
+                    if wall_hits >= (VERIFY_WALL_ABORT_THRESHOLD_HUMAN if args.human_in_loop else VERIFY_WALL_ABORT_THRESHOLD):
                         aborted_by_wall = True
-                        set_save_wall_cooldown(SAVE_WALL_COOLDOWN_MINUTES)
+                        wall_cooldown_written = set_save_wall_cooldown(SAVE_WALL_COOLDOWN_MINUTES)
                         print(f"\n⛔ 熔断：本轮 {wall_hits} 篇卡在验证页/滑块页，微信风控墙活跃，"
                               f"跳过剩余文章并写 {SAVE_WALL_COOLDOWN_MINUTES} 分钟冷却")
                         print("   冷却期内增量更新将跳过各库保存阶段（提取不受影响）；"
@@ -2033,8 +2070,12 @@ def main():
         print(f"  ⚠️  本批已熔断（连续 {CONSECUTIVE_FAIL_ABORT} 篇同签名失败），"
               f"剩余文章留待修复环境后重试")
     if aborted_by_wall:
-        print(f"  ⛔ 验证墙熔断：风控冷却已写入（{SAVE_WALL_COOLDOWN_MINUTES} 分钟），"
-              f"冷却内各轮跳过保存，剩余文章留待冷却结束后重试")
+        if wall_cooldown_written:
+            print(f"  ⛔ 验证墙熔断：风控冷却已写入（{SAVE_WALL_COOLDOWN_MINUTES} 分钟），"
+                  f"冷却内各轮跳过保存，剩余文章留待冷却结束后重试")
+        else:
+            print(f"  ⛔ 验证墙熔断：风控写入失败（见上方告警），本轮剩余文章留待重试；"
+                  f"冷却未生效，下轮保存仍会尝试")
     print(f"  本次已删除: {deleted_count} 篇")
     print(f"  剩余待保存: {stats['unsaved']}")
     if stats.get("deleted"):

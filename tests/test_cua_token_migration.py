@@ -250,6 +250,47 @@ class TestSaverDualModeClick:
         assert json.loads(mock.call_args[0][0][2])["session"] == CUA_SESSION
 
 
+# ==================== bring_to_front：0.31 partial 语义 ====================
+
+class TestBringToFront:
+    """0.31 带 window_id 时要求精确窗口验证，未达按 partial exit 1——但
+    process_activated 已真（App 前台化），对本项目即为成功。"""
+
+    @staticmethod
+    def _run_cua_raising(payload_json):
+        def fake_run_cua(args, timeout=30):
+            e = RuntimeError("cua-driver failed: exit 1")
+            e.stdout = payload_json
+            raise e
+        return fake_run_cua
+
+    def test_full_success(self):
+        with patch("ima_common.run_cua", return_value="{}"):
+            assert ima_common.cua_bring_to_front(10, 20) is True
+
+    def test_partial_with_process_activated_passes(self):
+        payload = json.dumps({"status": "partial", "code": "bring_to_front_exact_window_unverified",
+                              "process_activated": True})
+        with patch("ima_common.run_cua", side_effect=self._run_cua_raising(payload)):
+            assert ima_common.cua_bring_to_front(10, 20) is True
+
+    def test_refused_returns_false(self):
+        payload = json.dumps({"code": "ambiguous_window_target", "effect": "refused"})
+        with patch("ima_common.run_cua", side_effect=self._run_cua_raising(payload)):
+            assert ima_common.cua_bring_to_front(10, 20) is False
+
+    def test_garbage_failure_returns_false(self):
+        with patch("ima_common.run_cua", side_effect=self._run_cua_raising("not-json")):
+            assert ima_common.cua_bring_to_front(10, 20) is False
+
+    def test_sends_window_id_for_disambiguation(self):
+        """多窗口进程 pid-only 会被拒（ambiguous_window_target）——必须带 window_id。"""
+        with patch("ima_common.run_cua", return_value="{}") as mock:
+            ima_common.cua_bring_to_front(10, 20)
+        p = _last_params(mock)
+        assert p["pid"] == 10 and p["window_id"] == 20
+
+
 # ==================== 纯树模式：去屏幕录制 TCC 依赖 ====================
 
 class TestTreeOnlyReads:

@@ -30,7 +30,7 @@ from pathlib import Path
 import ima_common
 from ima_common import (
     CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running,
-    cua_call, cua_click, cua_element_action,
+    cua_call, cua_click, cua_element_action, cua_bring_to_front,
     element_token_for, remember_window_elements,
     ensure_ima_appnap_disabled,
     save_snapshot_and_report_drift,
@@ -225,11 +225,9 @@ def wait_for_ax_ready(min_elements: int = 5, timeout: int = 12) -> bool:
         # osascript activate 无法跨 Space 拉窗口，须用 bring_to_front 切回当前 Space。
         if not window.get("is_on_screen", True):
             log("  ⚠️  窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到当前 Space...")
-            try:
-                cua_call("bring_to_front", {"pid": window["pid"]})
-                time.sleep(2)
-            except Exception as e:
-                log(f"  bring_to_front 失败: {e}")
+            if not cua_bring_to_front(window["pid"], window["window_id"]):
+                log("  bring_to_front 失败")
+            time.sleep(2)
         try:
             state_result = cua_call(
                 "get_window_state",
@@ -377,15 +375,14 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
     # 切回 Space、再复查 y 走 restart_ima——否则若用 elif，y<-50 在 is_on_screen=False 时永远得不到复位。
     if not window.get("is_on_screen", True):
         log(f"⚠️  IMA 窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到前台...")
-        try:
-            cua_call("bring_to_front", {"pid": window["pid"]})
+        if cua_bring_to_front(window["pid"], window["window_id"]):
             time.sleep(2)
             window = get_ima_main_window()
             if not window:
                 log("❌ bring_to_front 后仍未找到 IMA 窗口")
                 return False
-        except Exception as e:
-            log(f"⚠️  bring_to_front 失败: {e}，继续尝试原窗口")
+        else:
+            log("⚠️  bring_to_front 失败，继续尝试原窗口")
 
     # 复查最新窗口的 y（bring_to_front 切回 Space 可能暴露离屏 y），独立 if 非 elif，
     # 覆盖 is_on_screen=False 且 y<-50 的组合情况。restart_ima 包 try 对齐 bring_to_front 的 fail-soft。
@@ -438,11 +435,9 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
             fresh_window = get_ima_main_window()
             if fresh_window and not fresh_window.get("is_on_screen", True):
                 log(f"  ⚠️  窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到当前 Space...")
-                try:
-                    cua_call("bring_to_front", {"pid": fresh_window["pid"]})
-                    time.sleep(2)
-                except Exception as e:
-                    log(f"  ⚠️  bring_to_front 失败: {e}")
+                if not cua_bring_to_front(fresh_window["pid"], fresh_window["window_id"]):
+                    log("  ⚠️  bring_to_front 失败")
+                time.sleep(2)
             time.sleep(3)
             # 再次获取
             state = json.loads(cua_call("get_window_state",

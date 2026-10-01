@@ -73,7 +73,9 @@ def run_cua(args, timeout: int = 30) -> str:
     cmd = [CUA_DRIVER] + args
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
-        raise RuntimeError(f"cua-driver failed: {result.stderr.strip() or f'exit {result.returncode}'}")
+        err = RuntimeError(f"cua-driver failed: {result.stderr.strip() or f'exit {result.returncode}'}")
+        err.stdout = result.stdout  # 供上层区分 partial/真失败（bring_to_front 等）
+        raise err
     return result.stdout
 
 
@@ -157,6 +159,29 @@ def cua_click(pid, window_id, element_index, timeout: int = 15) -> str:
         element_token=element_token_for(pid, window_id, element_index),
         timeout=timeout,
     )
+
+
+def cua_bring_to_front(pid, window_id, timeout: int = 15) -> bool:
+    """前台化窗口所在 App，返回是否成功。
+
+    0.31 语义变化：pid-only 在多窗口进程上直接拒绝（ambiguous_window_target，
+    ima 主窗+文章标签页常态命中），必须带 window_id；带了以后又要求「精确
+    窗口验证」（该窗是其进程焦点窗+所在屏最前）——验证未达按 partial exit 1，
+    但此时 process_activated 已为真，而前台化 App 正是本项目全部调用点的
+    用途（0.8 的行为）。故 partial 放行成功；真失败（拒绝/异常）返回 False。
+    """
+    try:
+        cua_call("bring_to_front", {"pid": pid, "window_id": window_id},
+                 timeout=timeout)
+        return True
+    except RuntimeError as e:
+        try:
+            payload = json.loads(getattr(e, "stdout", None) or "")
+        except (TypeError, ValueError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get("process_activated") is True:
+            return True
+        return False
 
 
 def is_daemon_running() -> bool:

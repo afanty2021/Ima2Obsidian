@@ -30,7 +30,7 @@ from ima_common import (
     DB_FILE, CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running, init_database,
     get_ima_main_window, find_cliclick, is_ima_app_name,
     detect_deleted_reason, mark_dead_title, load_dead_titles,
-    cua_call, cua_click, remember_window_elements,
+    cua_call, cua_click, cua_bring_to_front, remember_window_elements,
 )
 
 # ==================== 配置 ====================
@@ -388,13 +388,10 @@ def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
     """
     import re
     # 前台化 IMA（标签页窗口需前台，cua-driver 才能读到地址栏 AX）
-    try:
-        mw = get_ima_main_window()
-        if mw and mw.get("pid"):
-            cua_call("bring_to_front", {"pid": mw["pid"]})
-            time.sleep(1.0)
-    except Exception as e:
-        print(f"  ⚠️  extract_url_ax bring_to_front 失败: {e}")
+    mw = get_ima_main_window()
+    if mw and mw.get("pid") and not cua_bring_to_front(mw["pid"], mw["window_id"]):
+        print("  ⚠️  extract_url_ax bring_to_front 失败（AX 读窗降级继续）")
+    time.sleep(1.0)
     # 地址栏 AXTextField 失焦只显示域名，聚焦(click)后才显示完整 URL。
     # 遍历找标签页窗口(含"地址和搜索栏") → click 地址栏聚焦 → 重读完整 URL。
     for attempt in range(3):

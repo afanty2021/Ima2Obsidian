@@ -89,7 +89,7 @@ def test_all_attempts_fail_triggers_restart_ima_fallback():
     with patch("ima_incremental_update.get_ima_main_window",
                return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
+         patch("ima_common.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         result = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
@@ -112,7 +112,7 @@ def test_fallback_recursion_does_not_re_trigger_restart():
     with patch("ima_incremental_update.get_ima_main_window",
                return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
+         patch("ima_common.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
@@ -133,7 +133,7 @@ def test_fallback_recursion_succeeds_returns_true():
     with patch("ima_incremental_update.get_ima_main_window",
                return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
-         patch("ima_incremental_update.run_cua", side_effect=cua_responses), \
+         patch("ima_common.run_cua", side_effect=cua_responses), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"), \
          patch("ima_incremental_update.get_ax_window_title",
@@ -153,7 +153,7 @@ def test_fallback_restart_ima_exception_returns_false():
                return_value=_win()), \
          patch("ima_incremental_update.restart_ima",
                side_effect=RuntimeError("quit timeout")), \
-         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
+         patch("ima_common.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         result = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
@@ -169,7 +169,7 @@ def test_allow_restart_false_does_not_trigger_fallback():
     with patch("ima_incremental_update.get_ima_main_window",
                return_value=_win()), \
          patch("ima_incremental_update.restart_ima") as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
+         patch("ima_common.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         result = ima_incremental_update.navigate_to_kb(
@@ -200,7 +200,7 @@ def test_fallback_recursion_exception_not_attributed_to_restart():
         with patch("ima_incremental_update.get_ima_main_window",
                    return_value=_win()), \
              patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
-             patch("ima_incremental_update.run_cua", side_effect=cua_responses), \
+             patch("ima_common.run_cua", side_effect=cua_responses), \
              patch("ima_incremental_update.subprocess.run"), \
              patch("ima_incremental_update.time.sleep"):
             ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
@@ -223,7 +223,7 @@ def test_fallback_returns_false_when_restart_returns_false():
     with patch("ima_incremental_update.get_ima_main_window",
                return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=False) as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()) as mock_cua, \
+         patch("ima_common.run_cua", return_value=_empty_md_json()) as mock_cua, \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep") as mock_sleep:
         result = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
@@ -244,7 +244,7 @@ def test_fallback_only_once_per_run():
     # 模拟 main 循环：连续两次 navigate_to_kb（每次 5 attempts × 2 次 = 10 次 run_cua）
     with patch("ima_incremental_update.get_ima_main_window", return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
+         patch("ima_common.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         # 第一次调用：5 attempts 失败 → 触发 restart → 递归 allow_restart=False 也失败 → False
@@ -277,7 +277,7 @@ def test_fallback_skipped_when_window_rendered_normally():
 
     with patch("ima_incremental_update.get_ima_main_window", return_value=_win()), \
          patch("ima_incremental_update.restart_ima") as mock_restart, \
-         patch("ima_incremental_update.run_cua",
+         patch("ima_common.run_cua",
                return_value=_rendered_md_without_target_kb_json()) as mock_cua, \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"), \
@@ -312,7 +312,7 @@ def test_fallback_triggered_when_window_not_rendered():
     with patch("ima_incremental_update.get_ima_main_window",
                return_value=_win()), \
          patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value=_empty_md_json()), \
+         patch("ima_common.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"), \
          patch("ima_incremental_update.log", side_effect=fake_log):

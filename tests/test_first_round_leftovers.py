@@ -28,7 +28,7 @@ class TestRunCuaCallTimeoutException:
         """cua-driver 超时时，run_cua_call 应返回 None（让调用方优雅重试/降级），
         而非让 TimeoutExpired 穿透到 extractor main 把整个提取流程崩掉。
         """
-        with patch("ima_ax_extractor.run_cua",
+        with patch("ima_common.run_cua",
                    side_effect=subprocess.TimeoutExpired(cmd="cua-driver", timeout=30)):
             result = run_cua_call("get_window_state", {"pid": 1, "window_id": 1})
         assert result is None, \
@@ -36,7 +36,7 @@ class TestRunCuaCallTimeoutException:
 
     def test_timeout_does_not_print_full_traceback(self, capsys):
         """超时应像 RuntimeError 一样打印简短警告，而非让 Python 解释器打顶层 traceback"""
-        with patch("ima_ax_extractor.run_cua",
+        with patch("ima_common.run_cua",
                    side_effect=subprocess.TimeoutExpired(cmd="cua-driver", timeout=30)):
             run_cua_call("scroll", {"pid": 1, "window_id": 1, "direction": "down"})
         captured = capsys.readouterr()
@@ -45,7 +45,7 @@ class TestRunCuaCallTimeoutException:
 
     def test_runtime_error_still_caught(self):
         """回归：RuntimeError 仍应被捕获（不能因为加了 TimeoutExpired 而漏掉）"""
-        with patch("ima_ax_extractor.run_cua", side_effect=RuntimeError("exit 1")):
+        with patch("ima_common.run_cua", side_effect=RuntimeError("exit 1")):
             assert run_cua_call("click", {"x": 1}) is None
 
 

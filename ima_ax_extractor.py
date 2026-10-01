@@ -25,10 +25,12 @@ from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 # 导入公共模块
+import ima_common
 from ima_common import (
     DB_FILE, CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running, init_database,
     get_ima_main_window, find_cliclick, is_ima_app_name,
     detect_deleted_reason, mark_dead_title, load_dead_titles,
+    cua_call, cua_click, remember_window_elements,
 )
 
 # ==================== 配置 ====================
@@ -278,8 +280,8 @@ def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
       - JSON 输出 → 解析为 dict
       - 非 JSON 文本（如 click 的纯文本回复）→ 包装为 {"raw": ...}
       - 空/仅空白输出（click/scroll 成功时常如此）→ 返回 {}（视为成功，无 payload）
-      - run_cua 抛 RuntimeError（非零退出码）→ 返回 None（调用方据此判失败）
-      - run_cua 抛 subprocess.TimeoutExpired（cua-driver 超时）→ 返回 None
+      - cua_call 抛 RuntimeError（非零退出码）→ 返回 None（调用方据此判失败）
+      - cua_call 抛 subprocess.TimeoutExpired（cua-driver 超时）→ 返回 None
         历史问题：旧实现只捕 RuntimeError，TimeoutExpired 穿透到 extractor main
         把整个提取流程崩掉（cua-driver 卡死场景）。
 
@@ -287,7 +289,7 @@ def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
     cua-driver 静默成功时误判失败，触发不必要的 AX Tree re-fetch。
     """
     try:
-        output = run_cua(["call", tool, json.dumps(params)])
+        output = cua_call(tool, params)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         print(f"  ⚠️  cua-driver call {tool} 失败: {e}")
         return None
@@ -304,16 +306,21 @@ def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
 
 
 def get_window_state(pid: int, window_id: int) -> Optional[Dict]:
-    return run_cua_call("get_window_state", {"pid": pid, "window_id": window_id})
+    state = run_cua_call("get_window_state", {"pid": pid, "window_id": window_id})
+    if state is not None:
+        # 新快照取代旧快照：立刻刷新该窗口的 index→token 映射，后续
+        # click_element 凭此换 token（0.31+），0.8 无 token 走 index 回退
+        remember_window_elements(pid, window_id, state)
+    return state
 
 
 def click_element(pid: int, window_id: int, element_index: int) -> bool:
-    result = run_cua_call("click", {
-        "pid": pid,
-        "window_id": window_id,
-        "element_index": element_index
-    })
-    return result is not None
+    try:
+        cua_click(pid, window_id, element_index)
+        return True
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        print(f"  ⚠️  cua-driver click 失败: {e}")
+        return False
 
 
 # 定向滚轮的窗口局部坐标缓存（单窗口尺寸整个会话恒定，算一次即可）；
@@ -328,7 +335,7 @@ def _scroll_local_coords(window_id: int) -> dict:
         return cached
     width, height = 1400, 900  # 兜底（自动化窗口长期为 1512x949）
     try:
-        wins = json.loads(run_cua(["list_windows"]))["windows"]
+        wins = json.loads(ima_common.run_cua(["list_windows"]))["windows"]
         for w in wins:
             if w.get("window_id") == window_id:
                 b = w.get("bounds", {})
@@ -379,7 +386,7 @@ def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
     try:
         mw = get_ima_main_window()
         if mw and mw.get("pid"):
-            run_cua(["call", "bring_to_front", json.dumps({"pid": mw["pid"]})])
+            cua_call("bring_to_front", {"pid": mw["pid"]})
             time.sleep(1.0)
     except Exception as e:
         print(f"  ⚠️  extract_url_ax bring_to_front 失败: {e}")
@@ -387,7 +394,7 @@ def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
     # 遍历找标签页窗口(含"地址和搜索栏") → click 地址栏聚焦 → 重读完整 URL。
     for attempt in range(3):
         try:
-            wins = json.loads(run_cua(["list_windows"]))["windows"]
+            wins = json.loads(ima_common.run_cua(["list_windows"]))["windows"]
         except Exception as e:
             print(f"  ⚠️  extract_url_ax list_windows 失败: {e}")
             return None
@@ -396,9 +403,8 @@ def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
                 continue
             if w.get("bounds", {}).get("height", 0) <= 200:
                 continue
-            try:
-                st = json.loads(run_cua(["call", "get_window_state", json.dumps({"pid": w["pid"], "window_id": w["window_id"]})]))
-            except Exception:
+            st = get_window_state(w["pid"], w["window_id"])
+            if st is None:
                 continue
             md = st.get("tree_markdown", "")
             if "地址和搜索栏" not in md:
@@ -407,15 +413,12 @@ def extract_url_ax(pid: int = 0, window_id: int = 0) -> Optional[str]:
             if not m_addr:
                 continue
             # click 地址栏聚焦
-            try:
-                run_cua(["call", "click", json.dumps({"pid": w["pid"], "window_id": w["window_id"], "element_index": int(m_addr.group(1))})])
-                time.sleep(1.0)
-            except Exception:
+            if not click_element(w["pid"], w["window_id"], int(m_addr.group(1))):
                 continue
+            time.sleep(1.0)
             # 重读：聚焦后 AXTextField = 完整 URL
-            try:
-                st2 = json.loads(run_cua(["call", "get_window_state", json.dumps({"pid": w["pid"], "window_id": w["window_id"]})]))
-            except Exception:
+            st2 = get_window_state(w["pid"], w["window_id"])
+            if st2 is None:
                 continue
             for line in st2.get("tree_markdown", "").split("\n"):
                 if "AXTextField" in line:
@@ -491,7 +494,7 @@ def _probe_article_window_md() -> str:
     try:
         activate_ima()
         time.sleep(WAIT_ACTIVATE)
-        wins = json.loads(run_cua(["list_windows"]))["windows"]
+        wins = json.loads(ima_common.run_cua(["list_windows"]))["windows"]
     except Exception:
         return ""
     parts = []
@@ -501,8 +504,8 @@ def _probe_article_window_md() -> str:
         if w.get("bounds", {}).get("height", 0) <= 200:
             continue
         try:
-            st = json.loads(run_cua(["call", "get_window_state", json.dumps(
-                {"pid": w["pid"], "window_id": w["window_id"]})]))
+            st = json.loads(cua_call("get_window_state",
+                                     {"pid": w["pid"], "window_id": w["window_id"]}))
         except Exception:
             continue
         md = st.get("tree_markdown", "")
@@ -680,7 +683,7 @@ def _kb_visible_in_any_window(kb_name: str) -> Optional[bool]:
     返回 True/False；无法判定（标题全空/读取失败，如 Electron 冷启动）返回
     None——调用方对 None 放行，仅对明确的 False 中止，避免误中止。"""
     try:
-        wins = json.loads(run_cua(["list_windows"]))["windows"]
+        wins = json.loads(ima_common.run_cua(["list_windows"]))["windows"]
         titles = [
             w.get("title", "") for w in wins
             if is_ima_app_name(w.get("app_name", ""))

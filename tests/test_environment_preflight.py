@@ -407,7 +407,7 @@ class TestChromeWindowHelpers:
 
     def _patch_windows(self, monkeypatch, windows):
         monkeypatch.setattr(
-            "ima_obsidian_saver.run_cua",
+            "ima_common.run_cua",
             lambda *a, **kw: json.dumps({"windows": windows}),
         )
 

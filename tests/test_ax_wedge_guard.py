@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+import ima_common
 import ima_ax_extractor
 from ima_ax_extractor import ax_tree_menu_bar_only
 
@@ -146,7 +147,7 @@ def test_scroll_down_uses_targeted_wheel_path(monkeypatch):
                         lambda tool, params: captured.update(tool=tool, params=params) or {})
     monkeypatch.setattr(ima_ax_extractor, "_SCROLL_LOCAL_COORDS", {})
     monkeypatch.setattr(
-        ima_ax_extractor, "run_cua",
+        ima_common, "run_cua",
         lambda *_a: json.dumps({"windows": [
             {"window_id": 77, "bounds": {"width": 1512, "height": 949}},
             {"window_id": 88, "bounds": {"width": 500, "height": 500}},
@@ -173,20 +174,20 @@ class TestKbVisibleInAnyWindow:
         return fake
 
     def test_target_kb_visible(self, monkeypatch):
-        monkeypatch.setattr(ima_ax_extractor, "run_cua", self._run_cua_with([
+        monkeypatch.setattr(ima_common, "run_cua", self._run_cua_with([
             {"app_name": "ima", "bounds": {"height": 949}, "title": "英语教与学 - 已固定 - ima.copilot"},
         ]))
         assert ima_ax_extractor._kb_visible_in_any_window("英语教与学") is True
 
     def test_drifted_to_other_kb(self, monkeypatch):
-        monkeypatch.setattr(ima_ax_extractor, "run_cua", self._run_cua_with([
+        monkeypatch.setattr(ima_common, "run_cua", self._run_cua_with([
             {"app_name": "ima", "bounds": {"height": 949}, "title": "皮皮鲁的知识库"},
         ]))
         assert ima_ax_extractor._kb_visible_in_any_window("英语教与学") is False
 
     def test_all_titles_empty_unknown(self, monkeypatch):
         # 标题全空（Electron 冷启动）→ 无法判定 → None（放行，不误中止）
-        monkeypatch.setattr(ima_ax_extractor, "run_cua", self._run_cua_with([
+        monkeypatch.setattr(ima_common, "run_cua", self._run_cua_with([
             {"app_name": "ima", "bounds": {"height": 949}, "title": ""},
         ]))
         assert ima_ax_extractor._kb_visible_in_any_window("英语教与学") is None
@@ -194,7 +195,7 @@ class TestKbVisibleInAnyWindow:
     def test_read_failure_unknown(self, monkeypatch):
         def boom(*_a):
             raise RuntimeError("daemon down")
-        monkeypatch.setattr(ima_ax_extractor, "run_cua", boom)
+        monkeypatch.setattr(ima_common, "run_cua", boom)
         assert ima_ax_extractor._kb_visible_in_any_window("英语教与学") is None
 
 

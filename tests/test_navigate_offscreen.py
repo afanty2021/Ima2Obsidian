@@ -47,7 +47,7 @@ def test_y_offscreen_calls_restart_ima():
     with patch("ima_incremental_update.get_ima_main_window",
                side_effect=_window_sequence(_win(True, -100))), \
          patch("ima_incremental_update.restart_ima") as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value='{"tree_markdown":""}'), \
+         patch("ima_common.run_cua", return_value='{"tree_markdown":""}'), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         ima_incremental_update.navigate_to_kb("AI", max_attempts=5, allow_restart=False)
@@ -59,7 +59,7 @@ def test_is_on_screen_false_uses_bring_to_front_not_restart():
     with patch("ima_incremental_update.get_ima_main_window",
                side_effect=_window_sequence(_win(False, 33))), \
          patch("ima_incremental_update.restart_ima") as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value='{"tree_markdown":""}') as mock_cua, \
+         patch("ima_common.run_cua", return_value='{"tree_markdown":""}') as mock_cua, \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         ima_incremental_update.navigate_to_kb("AI", max_attempts=5, allow_restart=False)
@@ -77,7 +77,7 @@ def test_combo_is_on_screen_false_and_y_offscreen_also_restarts():
     with patch("ima_incremental_update.get_ima_main_window",
                side_effect=_window_sequence(_win(False, -100), _win(True, -100))), \
          patch("ima_incremental_update.restart_ima") as mock_restart, \
-         patch("ima_incremental_update.run_cua", return_value='{"tree_markdown":""}'), \
+         patch("ima_common.run_cua", return_value='{"tree_markdown":""}'), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
         ima_incremental_update.navigate_to_kb("AI", max_attempts=5, allow_restart=False)

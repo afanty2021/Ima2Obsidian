@@ -27,8 +27,11 @@ from datetime import datetime
 from pathlib import Path
 
 # 导入公共模块
+import ima_common
 from ima_common import (
     CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running,
+    cua_call, cua_click, cua_element_action,
+    element_token_for, remember_window_elements,
     ensure_ima_appnap_disabled,
     save_snapshot_and_report_drift,
     get_ima_main_window, ensure_appnap_disabled,
@@ -108,7 +111,7 @@ def start_daemon() -> bool:
             time.sleep(1)
             if is_daemon_running():
                 try:
-                    run_cua(["list_windows"], timeout=10)
+                    ima_common.run_cua(["list_windows"], timeout=10)
                     log("✅ cua-driver daemon 已就绪")
                     return True
                 except RuntimeError:
@@ -212,16 +215,14 @@ def wait_for_ax_ready(min_elements: int = 5, timeout: int = 12) -> bool:
         if not window.get("is_on_screen", True):
             log("  ⚠️  窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到当前 Space...")
             try:
-                run_cua(["call", "bring_to_front", json.dumps({"pid": window["pid"]})])
+                cua_call("bring_to_front", {"pid": window["pid"]})
                 time.sleep(2)
             except Exception as e:
                 log(f"  bring_to_front 失败: {e}")
         try:
-            state_result = run_cua(
-                ["call", "get_window_state", json.dumps({
-                    "pid": window["pid"],
-                    "window_id": window["window_id"],
-                })],
+            state_result = cua_call(
+                "get_window_state",
+                {"pid": window["pid"], "window_id": window["window_id"]},
                 timeout=10,  # 单次探测限时，避免一次阻塞吃满整个等待预算
             )
             state = json.loads(state_result)
@@ -252,11 +253,9 @@ def get_ax_window_title() -> str:
         window = get_ima_main_window()
         if not window:
             return ""
-        state_result = run_cua(
-            ["call", "get_window_state", json.dumps({
-                "pid": window["pid"],
-                "window_id": window["window_id"],
-            })],
+        state_result = cua_call(
+            "get_window_state",
+            {"pid": window["pid"], "window_id": window["window_id"]},
             timeout=10,
         )
         md = json.loads(state_result).get("tree_markdown", "")
@@ -368,7 +367,7 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
     if not window.get("is_on_screen", True):
         log(f"⚠️  IMA 窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到前台...")
         try:
-            run_cua(["call", "bring_to_front", json.dumps({"pid": window["pid"]})])
+            cua_call("bring_to_front", {"pid": window["pid"]})
             time.sleep(2)
             window = get_ima_main_window()
             if not window:
@@ -411,9 +410,9 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
         )
         time.sleep(2)
 
-        # 获取窗口状态
-        state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
-        state = json.loads(state_result)
+        # 获取窗口状态（读取即登记该快照的元素 token，供后续点击换 0.31 路径）
+        state = json.loads(cua_call("get_window_state", {"pid": pid, "window_id": window_id}))
+        remember_window_elements(pid, window_id, state)
         md = state.get("tree_markdown", "")
 
         # 验证 AX Tree 是否包含窗口内容（未激活时只有菜单栏）
@@ -428,14 +427,14 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
             if fresh_window and not fresh_window.get("is_on_screen", True):
                 log(f"  ⚠️  窗口不在屏幕 (is_on_screen=False)，bring_to_front 拉到当前 Space...")
                 try:
-                    run_cua(["call", "bring_to_front", json.dumps({"pid": fresh_window["pid"]})])
+                    cua_call("bring_to_front", {"pid": fresh_window["pid"]})
                     time.sleep(2)
                 except Exception as e:
                     log(f"  ⚠️  bring_to_front 失败: {e}")
             time.sleep(3)
             # 再次获取
-            state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
-            state = json.loads(state_result)
+            state = json.loads(cua_call("get_window_state", {"pid": pid, "window_id": window_id}))
+            remember_window_elements(pid, window_id, state)
             md = state.get("tree_markdown", "")
             static_text_count = len(re.findall(r'AXStaticText', md))
             last_ax_text_count = static_text_count  # 修复 #2：二次重试也更新（最后一次探测为准）
@@ -463,10 +462,10 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
                         break
             if nav_btn is not None:
                 log(f"  检测到对话页，点击'知识库'导航按钮 (element {nav_btn}) 到列表页...")
-                run_cua(["call", "click", json.dumps({"pid": pid, "window_id": window_id, "element_index": nav_btn})])
+                cua_click(pid, window_id, nav_btn)
                 time.sleep(3)
-                state_result = run_cua(["call", "get_window_state", json.dumps({"pid": pid, "window_id": window_id})])
-                md = json.loads(state_result).get("tree_markdown", "")
+                md = json.loads(cua_call("get_window_state",
+                                         {"pid": pid, "window_id": window_id})).get("tree_markdown", "")
                 # 修复 #2：对话页导航后重新探测也更新 last_ax_text_count（覆盖此分支的最后探测）
                 last_ax_text_count = len(re.findall(r'AXStaticText', md))
 
@@ -500,11 +499,7 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
         if elem_idx is not None:
             log(f"  找到知识库 '{kb_name}' (element {elem_idx})，点击...")
 
-            click_result = run_cua(["call", "click", json.dumps({
-                "pid": pid,
-                "window_id": window_id,
-                "element_index": elem_idx
-            })])
+            cua_click(pid, window_id, elem_idx)
 
             for wait in range(8):
                 time.sleep(2.5)
@@ -521,16 +516,18 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
             log(f"  ⚠️  在侧边栏未找到知识库 '{kb_name}'")
             log(f"  尝试滚动侧边栏...")
             try:
-                # 使用 scroll 工具定向滚动侧边栏（参数形状与提取器 scroll_down 一致）
-                scroll_params = {
-                    "pid": pid,
-                    "window_id": window_id,
-                    "direction": "down",
-                    "amount": 3
-                }
+                # 使用 scroll 工具定向滚动侧边栏（参数形状与提取器 scroll_down 一致）；
+                # 有侧边栏元素时走双模（token 优先 0.31+ / index 回退 ≤0.8）
+                scroll_extra = {"direction": "down", "amount": 3}
                 if sidebar_elem is not None:
-                    scroll_params["element_index"] = sidebar_elem
-                run_cua(["call", "scroll", json.dumps(scroll_params)])
+                    cua_element_action(
+                        "scroll", pid, window_id,
+                        element_index=sidebar_elem,
+                        element_token=element_token_for(pid, window_id, sidebar_elem),
+                        extra=scroll_extra,
+                    )
+                else:
+                    cua_call("scroll", {"pid": pid, "window_id": window_id, **scroll_extra})
                 time.sleep(1.5)
             except Exception as e:
                 log(f"    滚动失败: {e}")

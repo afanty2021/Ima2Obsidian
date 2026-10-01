@@ -503,7 +503,7 @@ class TestAxReadyBudget:
         def fake_cua(args, timeout=None):
             return tree
 
-        monkeypatch.setattr("ima_incremental_update.run_cua", fake_cua)
+        monkeypatch.setattr("ima_common.run_cua", fake_cua)
         slept = []
         monkeypatch.setattr("ima_incremental_update.time.sleep",
                             lambda s: slept.append(s))
@@ -535,7 +535,7 @@ class TestAxReadyBudget:
         inc, slept = self._patch_env(tmp_path, monkeypatch, static_texts=8)
         front_calls = []
         monkeypatch.setattr(
-            "ima_incremental_update.run_cua",
+            "ima_common.run_cua",
             lambda args, timeout=None: (
                 front_calls.append(args) or "null"
                 if args[:2] == ["call", "bring_to_front"] else

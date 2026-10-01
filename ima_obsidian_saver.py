@@ -51,6 +51,7 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import requests
 
+import ima_common
 from ima_common import (
     DB_FILE, init_database, now_saved_at, ensure_appnap_disabled, find_cliclick,
     run_cua, get_ime_source, ime_blocks_option_shortcuts,
@@ -58,6 +59,7 @@ from ima_common import (
     CUA_DRIVER, is_daemon_running,
     get_save_wall_cooldown_remaining, set_save_wall_cooldown,
     SAVE_WALL_COOLDOWN_MINUTES,
+    cua_call, cua_element_action,
 )
 
 
@@ -614,7 +616,7 @@ def _cua_call(tool, params, timeout=15):
     不抛异常（沿用提取器 run_cua_call 的容错口径，单次失败只降级不中断）。
     """
     try:
-        out = run_cua(["call", tool, json.dumps(params)], timeout=timeout)
+        out = cua_call(tool, params, timeout=timeout)
     except Exception as e:
         print(f"    ⚠️ cua-driver {tool} 失败: {e}", flush=True)
         return None
@@ -635,7 +637,7 @@ def _chrome_windows():
     所以弹窗回执以「窗口集合的增删」判定，稳定可靠。
     """
     try:
-        data = json.loads(run_cua(["list_windows"], timeout=10))
+        data = json.loads(ima_common.run_cua(["list_windows"], timeout=10))
     except Exception:
         return []
     out = []
@@ -685,10 +687,19 @@ def _ax_press_add_button(popup_win):
             label = str(el.get("label", "")).lower()
             if (any(t in label for t in ADD_BUTTON_LABELS)
                     and "Button" in str(el.get("role", ""))):
-                clicked = _cua_call("click", {
-                    "pid": pid, "window_id": window_id,
-                    "element_index": el["element_index"],
-                })
+                # 双模点击：token 直接取自本次 state 读取的元素行（0.31+ 优先，
+                # token 自带窗口定位）；失败或无 token（0.8）回退 element_index。
+                # 两条路都走 _cua_call——失败返回 None（非抛异常），与下方
+                # 「点击未确认」口径衔接
+                clicked = None
+                tok = el.get("element_token")
+                if tok:
+                    clicked = _cua_call("click", {"pid": pid, "element_token": tok})
+                if clicked is None and el.get("element_index") is not None:
+                    clicked = _cua_call("click", {
+                        "pid": pid, "window_id": window_id,
+                        "element_index": el["element_index"],
+                    })
                 if clicked is None:
                     # 与「未就绪」区分：按钮在、命令没送达，免得与后续日志自相矛盾
                     print("    ⚠️ AX 按钮已就绪但点击未确认")

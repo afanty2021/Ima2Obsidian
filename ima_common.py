@@ -77,6 +77,88 @@ def run_cua(args, timeout: int = 30) -> str:
     return result.stdout
 
 
+# cua-driver 0.31+（#3873）起元素动作只认 element_token，且单次 call 不带
+# session 标签时返回即退役快照——token 跨调用存活的唯一条件是读写共用
+# 同一标签。按进程生成标签，全部 call 统一经 cua_call 注入；0.8 旧驱动
+# 不校验未知参数，注入无害（回滚驱动可不动代码的根据）。
+CUA_SESSION = f"ima-{os.getpid()}"
+
+# (pid, window_id) -> {element_index: element_token}——该窗口最近一次
+# get_window_state 快照的映射。新快照取代旧快照时旧 token 全部失效，
+# 所以每次读窗后必须调 remember_window_elements 刷新（0.8 的 state 无
+# token 字段，映射为空，动作自动走 index 回退）。
+_ELEMENT_TOKENS: dict = {}
+
+
+def cua_call(tool, params, timeout: int = 30) -> str:
+    """cua-driver call 子命令的统一入口：注入会话标签后执行。
+
+    所有 call 都应经此走（而不是直接 run_cua(["call", ...])），否则该次
+    调用游离在会话之外：读窗建不了可复用快照、拿到的 token 下次调用必
+    stale。显式传入的 session 不覆盖（调用方自管时让路）。
+    """
+    merged = dict(params or {})
+    merged.setdefault("session", CUA_SESSION)
+    return run_cua(["call", tool, json.dumps(merged)], timeout=timeout)
+
+
+def remember_window_elements(pid, window_id, state):
+    """登记该窗口最近一次快照的 element_index → element_token 映射。
+
+    在每次解析 get_window_state 返回后调用；元素动作（click/scroll）经
+    element_token_for 取 token，与解析所用快照天然一致。
+    """
+    tokens = {}
+    for el in (state or {}).get("elements") or []:
+        idx = el.get("element_index")
+        tok = el.get("element_token")
+        if idx is not None and tok:
+            tokens[idx] = tok
+    _ELEMENT_TOKENS[(pid, window_id)] = tokens
+
+
+def element_token_for(pid, window_id, element_index):
+    """取该窗口当前快照中某 index 的 token；无（0.8 / 未读过 / 无该元素）返 None。"""
+    return _ELEMENT_TOKENS.get((pid, window_id), {}).get(element_index)
+
+
+def cua_element_action(tool, pid, window_id, element_index=None,
+                       element_token=None, extra=None, timeout: int = 30) -> str:
+    """元素动作（click/scroll 等）的双模入口：token 优先（0.31+），index 回退（≤0.8）。
+
+    token 路径只发 pid + element_token（0.31 语义：token 自带窗口定位，
+    schema 建议此时省略 window_id）；失败（旧驱动不识 token / token 偶发
+    stale）且备有 index 时回退旧参数形状。两条路都失败才向上抛——调用方
+    的重试循环（重读 state）拿到新快照后自然恢复。
+    """
+    if element_token:
+        params = dict(extra or {})
+        params["pid"] = pid
+        params["element_token"] = element_token
+        try:
+            return cua_call(tool, params, timeout=timeout)
+        except RuntimeError:
+            if element_index is None:
+                raise
+    if element_index is None:
+        raise RuntimeError(f"cua-driver {tool}: 无 element_token 且无 element_index 可定位元素")
+    params = dict(extra or {})
+    params["pid"] = pid
+    params["window_id"] = window_id
+    params["element_index"] = element_index
+    return cua_call(tool, params, timeout=timeout)
+
+
+def cua_click(pid, window_id, element_index, timeout: int = 15) -> str:
+    """按元素 index 点击：自动带上该窗口当前快照的 token（有则走 0.31 路径）。"""
+    return cua_element_action(
+        "click", pid, window_id,
+        element_index=element_index,
+        element_token=element_token_for(pid, window_id, element_index),
+        timeout=timeout,
+    )
+
+
 def is_daemon_running() -> bool:
     """检查 cua-driver daemon 是否在运行"""
     try:
@@ -347,10 +429,10 @@ def _is_article_tab_window(window: dict) -> bool:
     get_window_state 失败返回 False（不排除：宁保留主窗口候选也不误删）。
     """
     try:
-        st = json.loads(run_cua([
-            "call", "get_window_state",
-            json.dumps({"pid": window["pid"], "window_id": window["window_id"]}),
-        ]))
+        st = json.loads(cua_call(
+            "get_window_state",
+            {"pid": window["pid"], "window_id": window["window_id"]},
+        ))
         return "地址和搜索栏" in st.get("tree_markdown", "")
     except Exception:
         return False

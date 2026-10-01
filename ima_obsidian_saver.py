@@ -96,9 +96,11 @@ WAIT_CLOSE_TAB = 1.0
 # 首次弹出偏慢（service worker 冷唤醒），过紧会在批前几篇误触发熔断
 WAIT_POPUP_APPEAR = 10.0    # 触发 ⇧⌘O 后等待剪藏器弹窗「窗口」出现的超时（秒）
 WAIT_POPUP_POLL = 0.5       # 弹窗窗口轮询间隔
-WAIT_AX_BUTTONS = 12.0      # 弹窗 AX 按钮就绪等待：Chromium 每轮首个弹窗需数秒开启（实测 ~6s），
+WAIT_AX_BUTTONS = 30.0      # 弹窗 AX 按钮就绪等待：Chromium 每轮首个弹窗需数秒开启（实测 ~6s），
                             # 一次探测即放弃会让"每轮第 1 篇"必然走回车且落盘失败（8/27-8/28 复现）；
-                            # 12s 与 IMA 侧 wait_for_ax_ready 预算对齐，给冷缓存/繁忙机器留余量
+                            # 12s 仍不封顶首弹慢就绪：重页面冷启动实测可超 12s（9/29-10/1「认知投降」
+                            # 连续两轮 12s 内未就绪、回车兜底救不回），放宽到 30s。就绪的弹窗首探即
+                            # 中零开销，预算只在按钮真缺席时消耗
 WAIT_AX_BUTTONS_POLL = 0.5  # AX 按钮轮询间隔
 CONSECUTIVE_FAIL_ABORT = 3  # 同签名连续失败熔断阈值（跳过剩余批次，避免整批空转）
 VERIFY_WALL_ABORT_THRESHOLD = 2  # verify_page_stuck 达此次数判定风控墙活跃，熔断并写冷却
@@ -600,6 +602,10 @@ def trigger_clipper_and_save(mods: list):
 #   exception      = 未预期异常（main 的 except 分支写入）
 _LAST_FAILURE_SIGNATURE = "unknown"
 
+# 最近一次 clipper 弹窗句柄（trigger_clipper_with_receipt 在案，晚到按钮补点用；
+# 每次触发前重置，quick 模式/非 Chrome 路径恒为 None）
+_LAST_CLIPPER_POPUP = None
+
 
 def _cua_call(tool, params, timeout=15):
     """cua-driver 调用 → dict | None。
@@ -704,15 +710,17 @@ def trigger_clipper_with_receipt():
     2. 弹窗出现后优先 AX 点击 'Add to Obsidian'（语义动作）——按钮搜索在
        WAIT_AX_BUTTONS 预算内轮询：Chromium 每轮**首个弹窗**的渲染器 AX 需数秒
        开启（实测 ~6s），后续弹窗进程级已开启、首探即中；
-    3. AX 点击未完成（未就绪 / 点击未确认）才回退回车键（最后手段）。
+    3. AX 点击未完成（未就绪 / 点击未确认）才回退回车键（最后手段）。回车仍未
+       落盘时由调用方在宣告失败前做晚到按钮补点（_reprobe_add_button）。
 
     Returns:
       True  = 保存动作已触发，调用方继续轮询落盘；
       False = 弹窗未出现（快捷键未注册/扩展未响应/击键被 TCC 或输入法拦截），
               写 _LAST_FAILURE_SIGNATURE='popup_missing'，调用方快速失败。
     """
-    global _LAST_FAILURE_SIGNATURE
+    global _LAST_FAILURE_SIGNATURE, _LAST_CLIPPER_POPUP
 
+    _LAST_CLIPPER_POPUP = None  # 触发前重置：上一次的弹窗句柄不得跨篇复用
     baseline = {w["window_id"] for w in _chrome_windows()}
     send_keystroke(CLIPPER_KEY, CLIPPER_MODS)
 
@@ -730,6 +738,7 @@ def trigger_clipper_with_receipt():
         return False
 
     print(f"    ✅ 剪藏器弹窗已出现（window {popup['window_id']}）")
+    _LAST_CLIPPER_POPUP = popup  # 在案：落盘失败时供 _reprobe_add_button 补点
     if _ax_press_add_button(popup):
         print("    ✅ 已 AX 点击 'Add to Obsidian'")
     else:
@@ -737,6 +746,20 @@ def trigger_clipper_with_receipt():
         time.sleep(1.5)
         send_keystroke("return", [])
     return True
+
+
+def _reprobe_add_button() -> bool:
+    """晚到按钮补点：回车回退后落盘轮询仍失败时，最后再探一次弹窗按钮。
+
+    冷启动首弹 + 重页面的渲染器 AX 就绪可晚于 WAIT_AX_BUTTONS 预算——按钮
+    迟到没人点，回车兜底救不回（「认知投降」篇 9/29-10/1 连续两轮同方式失败：
+    弹窗在、按钮 12s 内未就绪、回车后 25s 无文件）。补点成功由调用方再给一轮
+    完整落盘轮询；无在案弹窗（quick 模式 / 非 Chrome / 触发失败）返回 False。
+    """
+    popup = _LAST_CLIPPER_POPUP
+    if not popup:
+        return False
+    return _ax_press_add_button(popup)
 
 
 class ConsecutiveFailureBreaker:
@@ -1813,6 +1836,20 @@ def save_one_article(
         if renamed:
             break
         time.sleep(WAIT_CLIP_POLL)
+
+    if not renamed and _reprobe_add_button():
+        # 晚到按钮补点：首弹 AX 预算内未就绪、回车兜底也没落盘——按钮可能只是
+        # 迟到（冷启动重页面）。点中后重新给一轮完整落盘轮询。
+        print("    🔁 晚到按钮已补点，再轮询落盘...")
+        deadline = time.time() + WAIT_CLIP_TOTAL
+        while time.time() < deadline:
+            renamed, actual_date = find_and_rename_in_vault(
+                title, date_str, existing_files, target_folder=target_folder,
+                require_stable=True,
+            )
+            if renamed:
+                break
+            time.sleep(WAIT_CLIP_POLL)
 
     if not renamed:
         folder_info = f"{target_folder}/" if target_folder else ""

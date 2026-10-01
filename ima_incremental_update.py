@@ -235,6 +235,8 @@ def wait_for_ax_ready(min_elements: int = 5, timeout: int = 12) -> bool:
                 timeout=10,  # 单次探测限时，避免一次阻塞吃满整个等待预算
             )
             state = json.loads(state_result)
+            # 读即注册：维持全项目「每次读窗后 token 映射换代」不变量（评审 #4）
+            remember_window_elements(window["pid"], window["window_id"], state)
             md = state.get("tree_markdown", "")
             count = len(re.findall(r'AXStaticText', md))
             if count >= min_elements:
@@ -267,7 +269,11 @@ def get_ax_window_title() -> str:
             {"pid": window["pid"], "window_id": window["window_id"], **TREE_ONLY},
             timeout=10,
         )
-        md = json.loads(state_result).get("tree_markdown", "")
+        state = json.loads(state_result)
+        # 读即注册：get_ax_window_title 在导航判断里高频调用，漏注册会让
+        # 其后任何点击拿到换代前的 token（max 评审 #4）
+        remember_window_elements(window["pid"], window["window_id"], state)
+        md = state.get("tree_markdown", "")
         m = re.search(r'AXWindow "([^"]*)"', md)
         return m.group(1) if m else ""
     except Exception:
@@ -419,7 +425,7 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
                 subprocess.run(["osascript", "-e", _osa_cmd],
                                capture_output=True, timeout=5)
             except subprocess.TimeoutExpired:
-                log(f"  ⚠️ osascript activate 超时（降级继续）")
+                log("  ⚠️ osascript activate 超时（降级继续）")
         time.sleep(2)
 
         # 获取窗口状态（读取即登记该快照的元素 token，供后续点击换 0.31 路径）

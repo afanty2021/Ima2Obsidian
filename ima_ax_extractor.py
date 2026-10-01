@@ -2,9 +2,9 @@
 """
 IMA AI 知识库文章 URL 提取器 — AX Tree 版本
 
-基于 cua-driver daemon + get_window_state + element_index 的精确提取方案。
+基于 cua-driver daemon + get_window_state + element_token 的精确提取方案。
 利用 AX 树中文章卡片的固定结构（标题 + "公众号" + 作者名）精确识别文章，
-通过 element_index + AXPress 点击打开文章，AXDocument 提取 URL。
+通过 element_token（0.31+，index 回退 ≤0.8）+ AXPress 点击打开文章，AXDocument 提取 URL。
 
 依赖:
   - cua-driver daemon 运行中 (cua-driver serve)
@@ -31,7 +31,7 @@ from ima_common import (
     get_ima_main_window, find_cliclick, is_ima_app_name,
     detect_deleted_reason, mark_dead_title, load_dead_titles,
     cua_call, cua_click, cua_element_action, cua_bring_to_front,
-    remember_window_elements, element_token_for,
+    remember_window_elements, element_token_for, driver_error_code,
 )
 
 # ==================== 配置 ====================
@@ -293,15 +293,13 @@ def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
         output = cua_call(tool, params)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         # 带上驱动侧结构化错误码（stdout 里）：裸 "exit 1" 曾把
-        # screenshot_context_missing 藏了一整轮（2026-10-01）
-        code = ""
-        try:
-            _p = json.loads(getattr(e, "stdout", None) or "")
-            if isinstance(_p, dict) and _p.get("code"):
-                code = f" [{_p['code']}]"
-        except (TypeError, ValueError):
-            pass
-        print(f"  ⚠️  cua-driver call {tool} 失败{code}: {e}")
+        # screenshot_context_missing 藏了一整轮（2026-10-01）。错误码两种
+        # 形状并存（顶层 code / refusal.code），统一走 ima_common 解析；
+        # 解析不到码时打印原文截断——stdout 是唯一诊断载体（max 评审 #2）
+        code = driver_error_code(e)
+        raw = (getattr(e, "stdout", None) or "").strip()
+        suffix = f" [{code}]" if code else (f" [raw: {raw[:120]}]" if raw else "")
+        print(f"  ⚠️  cua-driver call {tool} 失败{suffix}: {e}")
         return None
 
     stripped = output.strip()
@@ -390,10 +388,14 @@ def scroll_down(pid: int, window_id: int, amount: int = 3):
                     element_index=idx, element_token=tok,
                     extra={"direction": "down", "amount": amount},
                 )
-                return
+                return True
             except (RuntimeError, subprocess.TimeoutExpired) as e:
                 print(f"  ⚠️  cua-driver token scroll 失败: {e}")
-                return
+                # 缓存必须作废：守护进程重启（session/快照全亡）后注册表
+                # 不自清，缓存比对恒通过 → 本页 10 连发全败且零重读，
+                # 静默卡到下一页顶（max 评审 #3）。pop 后下轮重读自愈
+                _SCROLL_AREA.pop((pid, window_id), None)
+                return False
 
     state = get_window_state(pid, window_id)  # 读即注册，token 与快照同步
     el = None
@@ -417,20 +419,22 @@ def scroll_down(pid: int, window_id: int, amount: int = 3):
                 element_token=el.get("element_token"),
                 extra={"direction": "down", "amount": amount},
             )
-            return
+            return True
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             print(f"  ⚠️  cua-driver token scroll 失败: {e}")
-            return
+            _SCROLL_AREA.pop((pid, window_id), None)  # 同上：失败不作废会卡死本页
+            return False
 
     # 兜底：0.8 时代的窗口坐标路径（0.31 纯树模式下会失败，仅打印）
     coords = _scroll_local_coords(window_id)
-    run_cua_call("scroll", {
+    result = run_cua_call("scroll", {
         "pid": pid,
         "window_id": window_id,
         "direction": "down",
         "amount": amount,
         **coords,
     })
+    return result is not None
 
 
 # ==================== AppleScript ====================
@@ -833,6 +837,7 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     # 永久不可恢复页（微信拦截页）的归一化标题：库内历史 + 本轮新标记均跳过
     dead_titles = load_dead_titles()
     total_deleted = 0
+    total_scroll_failures = 0  # 滚动失败次数（翻页能力受损的可见信号）
 
     # AX 脱落自愈：重启 ima + 重新导航到目标库（navigate_to_kb 在增量更新模块，
     # 惰性导入保持提取器可独立 CLI 运行、不背增量更新的模块级依赖）。
@@ -1175,9 +1180,17 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
 
         # 滚动加载更多
         print("  滚动加载更多...")
+        burst_failures = 0
         for _ in range(10):
-            scroll_down(pid, window_id, 3)
+            if not scroll_down(pid, window_id, 3):
+                burst_failures += 1
             time.sleep(0.1)
+        if burst_failures:
+            total_scroll_failures += burst_failures
+            # 评审 #5：滚动全败必须可见——20:07 实跑 10/10 连败后同卡重解析，
+            # 被零新增保险丝判「列表已走完」，汇总 0/0/0 无任何翻页已死痕迹
+            print(f"  ⚠️  本页滚动 {burst_failures}/10 次失败"
+                  f"{'（翻页已死，重解析同页将触发无进展停止）' if burst_failures == 10 else ''}")
         await asyncio.sleep(WAIT_SCROLL)
 
         # 自愈宽限消耗与解除：走完一页减一；走回新增内容立即解除
@@ -1199,6 +1212,9 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
     print(f"  本次跳过: {total_skipped} 篇")
     print(f"  本次失败: {total_failed} 篇")
     print(f"  本次标记删除: {total_deleted} 篇")
+    if total_scroll_failures:
+        print(f"  ⚠️  滚动失败: {total_scroll_failures} 次"
+              f"（翻页受限，可能有文章未被遍历到）")
     print(f"  数据库总计: {stats['total']} 篇 ({stats['kb_count']} 个知识库)")
 
 

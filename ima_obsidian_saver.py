@@ -59,7 +59,7 @@ from ima_common import (
     CUA_DRIVER, is_daemon_running,
     get_save_wall_cooldown_remaining, set_save_wall_cooldown,
     SAVE_WALL_COOLDOWN_MINUTES,
-    cua_call, cua_element_action,
+    cua_call,
 )
 
 

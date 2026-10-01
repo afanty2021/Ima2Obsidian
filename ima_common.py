@@ -124,6 +124,26 @@ def element_token_for(pid, window_id, element_index):
     return _ELEMENT_TOKENS.get((pid, window_id), {}).get(element_index)
 
 
+def driver_error_code(e) -> str:
+    """从 run_cua 的 RuntimeError 提取驱动错误码（无则空串）。
+
+    0.31 实测（2026-10-01）两种形状并存：动作拒绝（invalid_arguments /
+    stale_element_token 等）嵌在 stdout JSON 的 refusal.code；bring_to_front
+    的 partial/refused 结果码在顶层 code。stderr 恒空，stdout 是唯一诊断
+    载体——解析不到码时调用方应回退打印原文。
+    """
+    try:
+        payload = json.loads(getattr(e, "stdout", None) or "")
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    for node in (payload, payload.get("refusal"), payload.get("error")):
+        if isinstance(node, dict) and node.get("code"):
+            return str(node["code"])
+    return ""
+
+
 def cua_element_action(tool, pid, window_id, element_index=None,
                        element_token=None, extra=None, timeout: int = 30) -> str:
     """元素动作（click/scroll 等）的双模入口：token 优先（0.31+），index 回退（≤0.8）。
@@ -132,6 +152,12 @@ def cua_element_action(tool, pid, window_id, element_index=None,
     schema 建议此时省略 window_id）；失败（旧驱动不识 token / token 偶发
     stale）且备有 index 时回退旧参数形状。两条路都失败才向上抛——调用方
     的重试循环（重读 state）拿到新快照后自然恢复。
+
+    回退前必须打出 token 路径的错误码：0.31 上 stale token 回退 index 会被
+    硬拒，调用方只看得到第二个错——不打印第一个就会把根因（该重读了）
+    掩成「unknown argument element_index」的谜语（max 评审 #1）。
+    0.8 回滚态下每次点击都会打这条（token 路径必败）——降噪应通过拆掉
+    token 注入实现，而不是静默。
     """
     if element_token:
         params = dict(extra or {})
@@ -139,9 +165,12 @@ def cua_element_action(tool, pid, window_id, element_index=None,
         params["element_token"] = element_token
         try:
             return cua_call(tool, params, timeout=timeout)
-        except RuntimeError:
+        except RuntimeError as e:
             if element_index is None:
                 raise
+            code = driver_error_code(e)
+            print(f"  ⚠️  cua-driver {tool} token 路径失败"
+                  f"{f' [{code}]' if code else ''}，回退 element_index")
     if element_index is None:
         raise RuntimeError(f"cua-driver {tool}: 无 element_token 且无 element_index 可定位元素")
     params = dict(extra or {})
@@ -182,6 +211,9 @@ def cua_bring_to_front(pid, window_id, timeout: int = 15) -> bool:
         except (TypeError, ValueError):
             payload = {}
         if isinstance(payload, dict) and payload.get("process_activated") is True:
+            # partial（进程已前台化、精确窗口验证未达）对本项目即成功，
+            # 留一行日志与完整成功区分，供 Space 拉回排障
+            print(f"  ℹ️  bring_to_front partial（进程已前台化，窗口验证未达）")
             return True
         # 无人值守失败时留下驱动侧原因（stale/ambiguous/超时），方便次晨看日志定位
         reason = str(getattr(e, "stdout", None) or e)[:200]
@@ -465,6 +497,8 @@ def _is_article_tab_window(window: dict) -> bool:
             {"pid": window["pid"], "window_id": window["window_id"],
              "include_screenshot": False},
         ))
+        # 读即注册：维持全项目「每次读窗后 token 映射换代」不变量（评审 #4）
+        remember_window_elements(window["pid"], window["window_id"], st)
         return "地址和搜索栏" in st.get("tree_markdown", "")
     except Exception:
         return False

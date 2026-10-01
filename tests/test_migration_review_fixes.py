@@ -44,8 +44,13 @@ class FakeDriver031:
 
     @staticmethod
     def _fail(code):
-        err = RuntimeError(f"cua-driver failed: exit 1")
-        err.stdout = json.dumps({"error": {"code": code}})
+        # 0.31 实机形状（2026-10-01 捕获）：动作拒绝嵌在 refusal.code，
+        # stderr 恒空、exit 1——此前这里臆造了顶层 error.code 形状
+        err = RuntimeError("cua-driver failed: exit 1")
+        err.stdout = json.dumps({
+            "refusal": {"code": code, "message": code},
+            "status": "refused",
+        })
         raise err
 
     def run(self, args, timeout=30):
@@ -246,6 +251,15 @@ class ScrollFakeDriver:
             if self.scroll_fail is not None and params.get("element_token"):
                 raise_factory, self.scroll_fail = self.scroll_fail, None
                 raise raise_factory
+            if self.snapshot_tokens is not None and not params.get("element_token"):
+                # 0.31 形态下 index 硬拒（与 FakeDriver031.click 同口径）——
+                # 缺这条会让双模的 index 回退在假驱动上假成功，掩住真机必败
+                err = RuntimeError("cua-driver failed: exit 1")
+                err.stdout = json.dumps({
+                    "refusal": {"code": "invalid_arguments",
+                                "message": "scroll: unknown argument element_index"},
+                    "status": "refused"})
+                raise err
             return "{}"
         return "{}"
 
@@ -382,3 +396,142 @@ class TestNavigateClickResilience:
                             self._osascript_timeout_run())
         monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
         extractor.activate_ima()  # 不得抛
+
+
+# ==================== 二轮评审修复（2026-10-01 晚，5 Important） ====================
+
+class TestDriverErrorCode:
+    """0.31 错误码两种真实形状并存（实机捕获钉形）：动作拒绝嵌 refusal.code，
+    bring_to_front 的 partial/refused 结果码在顶层 code。"""
+
+    @staticmethod
+    def _err(payload):
+        e = RuntimeError("cua-driver failed: exit 1")
+        e.stdout = json.dumps(payload) if isinstance(payload, dict) else payload
+        return e
+
+    def test_nested_refusal_shape(self):
+        assert ima_common.driver_error_code(self._err(
+            {"refusal": {"code": "stale_element_token", "message": "x"},
+             "status": "refused"})) == "stale_element_token"
+
+    def test_top_level_code(self):
+        assert ima_common.driver_error_code(self._err(
+            {"code": "ambiguous_window_target", "effect": "refused"}
+        )) == "ambiguous_window_target"
+
+    def test_nested_error_shape(self):
+        assert ima_common.driver_error_code(self._err(
+            {"error": {"code": "boom"}})) == "boom"
+
+    def test_garbage_empty_and_codeless(self):
+        assert ima_common.driver_error_code(self._err("not-json")) == ""
+        assert ima_common.driver_error_code(RuntimeError("no stdout")) == ""
+        assert ima_common.driver_error_code(self._err({"no": "code"})) == ""
+
+
+class TestTokenFallbackVisible:
+    """评审 #1：token 路径失败回退 index 前必须打出错误码——0.31 上 index
+    随后被硬拒，只看第二个错会把「该重读了」的根因掩成谜语。"""
+
+    def test_fallback_prints_token_error_code(self, monkeypatch, capsys):
+        def fake_run_cua(args, timeout=30):
+            e = RuntimeError("cua-driver failed: exit 1")
+            e.stdout = json.dumps({"refusal": {"code": "stale_element_token"},
+                                   "status": "refused"})
+            raise e
+
+        monkeypatch.setattr(ima_common, "run_cua", fake_run_cua)
+        with pytest.raises(RuntimeError):
+            ima_common.cua_element_action("scroll", 10, 20, element_token="tok")
+        # 无 index 可回退 → 直接抛，不打回退日志（避免误导）
+        assert "回退" not in capsys.readouterr().out
+
+    def test_fallback_with_index_prints_code_then_succeeds(self, monkeypatch, capsys):
+        state = {"elements": [{"element_index": 3, "element_token": "tok-3"}]}
+
+        def fake_run_cua(args, timeout=30):
+            params = json.loads(args[2])
+            if params.get("element_token") == "tok-3":
+                e = RuntimeError("cua-driver failed: exit 1")
+                e.stdout = json.dumps({"refusal": {"code": "stale_element_token"},
+                                       "status": "refused"})
+                raise e
+            assert params.get("element_index") == 3  # 回退形状
+            return "{}"
+
+        monkeypatch.setattr(ima_common, "run_cua", fake_run_cua)
+        ima_common.remember_window_elements(10, 20, state)
+        assert ima_common.cua_click(10, 20, 3) == "{}"
+        printed = capsys.readouterr().out
+        assert "stale_element_token" in printed and "回退 element_index" in printed
+
+
+class TestScrollCacheSelfHeal:
+    """评审 #3：scroll 失败必须作废缓存并返回 False——守护进程重启后
+    session/快照全亡而缓存比对恒通过，本页 10 连发会全败且零重读。"""
+
+    def test_failure_pops_cache_and_next_call_selfheals(self, monkeypatch,
+                                                        clean_scroll_cache):
+        drv = ScrollFakeDriver({5: "tok-s-5"})
+        monkeypatch.setattr(ima_common, "run_cua", drv.run)
+        monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
+
+        assert extractor.scroll_down(100, 42) is True  # 首滚成功
+        assert extractor._SCROLL_AREA.get((100, 42)) == (5, "tok-s-5")
+
+        # 注册表保留旧 token（缓存比对仍通过，命中缓存分支），scroll 失败：
+        ima_common._ELEMENT_TOKENS[(100, 42)] = {5: "tok-s-5"}
+        drv.scroll_fail = RuntimeError("cua-driver failed: exit 1")
+        assert extractor.scroll_down(100, 42) is False
+        assert (100, 42) not in extractor._SCROLL_AREA, "失败后缓存必须作废"
+
+        drv.scroll_fail = None
+        assert extractor.scroll_down(100, 42) is True  # 下发重读自愈
+        assert drv.reads >= 2, "pop 后必须重读重找靶子"
+
+
+class TestEveryReadRegisters:
+    """评审 #4：「每次读窗后 remember」不变量的 tripwire 扩宽到全部读窗点。"""
+
+    def test_wait_for_ax_ready_registers(self):
+        assert "remember_window_elements(" in inspect.getsource(upd.wait_for_ax_ready)
+
+    def test_get_ax_window_title_registers(self):
+        assert "remember_window_elements(" in inspect.getsource(upd.get_ax_window_title)
+
+    def test_is_article_tab_window_registers(self):
+        src = inspect.getsource(ima_common._is_article_tab_window)
+        assert "remember_window_elements(" in src
+
+    def test_scroll_burst_counts_failures(self):
+        """评审 #5：突发滚动必须统计失败并计入汇总（翻页已死不得伪装走完）。"""
+        src = inspect.getsource(extractor.extract_articles)
+        assert "burst_failures" in src
+        assert "total_scroll_failures" in src
+
+
+class TestRunCuaCallDiagnostics:
+    """评审 #2：run_cua_call 的错误码提取必须吃下真实形状（refusal.code），
+    解析不到码时打印原文截断——stdout 是唯一诊断载体。"""
+
+    @staticmethod
+    def _run_cua_failing(stdout):
+        def fake(args, timeout=30):
+            e = RuntimeError("cua-driver failed: exit 1")
+            e.stdout = stdout
+            raise e
+        return fake
+
+    def test_refusal_code_surfaced(self, monkeypatch, capsys):
+        monkeypatch.setattr(ima_common, "run_cua", self._run_cua_failing(
+            json.dumps({"refusal": {"code": "screenshot_context_missing"},
+                        "status": "refused"})))
+        assert extractor.run_cua_call("scroll", {}) is None
+        assert "screenshot_context_missing" in capsys.readouterr().out
+
+    def test_raw_stdout_surfaced_when_no_code(self, monkeypatch, capsys):
+        monkeypatch.setattr(ima_common, "run_cua",
+                            self._run_cua_failing("boom text"))
+        assert extractor.run_cua_call("scroll", {}) is None
+        assert "boom text" in capsys.readouterr().out

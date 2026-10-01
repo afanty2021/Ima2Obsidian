@@ -201,3 +201,170 @@ class TestImportHygiene:
             assert m, f"{mod.__name__} 应有 ima_common 导入块"
             assert not re.search(r"\brun_cua\b", m.group(1)), (
                 f"{mod.__name__} 不应裸导入 run_cua（绕过 ima_common.run_cua 接缝）")
+
+
+class ScrollFakeDriver:
+    """scroll_down 行为测试的 0.31/0.8 双形态驱动。
+
+    snapshot_tokens 控制读窗返回的元素 token 形态：dict 时 0.31（带 token），
+    None 时 0.8（无 token 字段）。with_scrollarea=False 模拟树里没有
+    AXScrollArea（坐标兜底路径）。scroll 调用全部记录参数。
+    """
+
+    def __init__(self, snapshot_tokens, with_scrollarea=True):
+        self.snapshot_tokens = snapshot_tokens  # {index: token} 或 None（0.8）
+        self.with_scrollarea = with_scrollarea
+        self.reads = 0
+        self.scrolls = []
+        self.scroll_fail = None  # 异常实例：token 路径首次调用抛出后清空
+
+    def run(self, args, timeout=30):
+        if args[0] == "list_windows":  # _scroll_local_coords 直连形态
+            return json.dumps({"windows": [{
+                "window_id": 42, "bounds": {"width": 1000, "height": 800},
+            }]})
+        tool, params = args[1], json.loads(args[2])
+        if tool == "get_window_state":
+            self.reads += 1
+            md, elements = "", []
+            if self.with_scrollarea:
+                md += '[5] AXScrollArea "列表"\n'
+                elements.append({"element_index": 5, "role": "AXScrollArea"})
+            md += '[8] AXStaticText = "卡片"'
+            elements.append({"element_index": 8, "role": "AXStaticText"})
+            if self.snapshot_tokens is not None:
+                for el in elements:
+                    el["element_token"] = self.snapshot_tokens.get(el["element_index"])
+            return json.dumps({"tree_markdown": md, "elements": elements})
+        if tool == "scroll":
+            self.scrolls.append(params)
+            if self.scroll_fail is not None and params.get("element_token"):
+                raise_factory, self.scroll_fail = self.scroll_fail, None
+                raise raise_factory
+            return "{}"
+        return "{}"
+
+
+@pytest.fixture()
+def clean_scroll_cache():
+    extractor._SCROLL_AREA.clear()
+    extractor._SCROLL_LOCAL_COORDS.clear()
+    ima_common._ELEMENT_TOKENS.clear()
+    yield
+    extractor._SCROLL_AREA.clear()
+    extractor._SCROLL_LOCAL_COORDS.clear()
+    ima_common._ELEMENT_TOKENS.clear()
+
+
+class TestScrollTokenPath:
+    """0.31 纯树模式下 x/y 滚轮路径拿不到 screenshot context（实测
+    screenshot_context_missing 连败），scroll_down 必须走 element_token。"""
+
+    def test_token_scroll_with_burst_cache(self, monkeypatch, clean_scroll_cache):
+        drv = ScrollFakeDriver({5: "tok-s-5"})
+        monkeypatch.setattr(ima_common, "run_cua", drv.run)
+        monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
+        for _ in range(3):  # 调用方 10 连发场景缩小为 3
+            extractor.scroll_down(100, 42)
+        # 首滚发现 ScrollArea（读窗 1 次），突发内缓存命中不再读窗
+        assert drv.reads == 1, f"突发连滚应只读窗 1 次，实际 {drv.reads}"
+        assert len(drv.scrolls) == 3
+        assert all(p.get("element_token") == "tok-s-5" for p in drv.scrolls)
+        assert not any("x" in p for p in drv.scrolls)  # 不走坐标路径
+
+    def test_snapshot_refresh_invalidates_cache(self, monkeypatch, clean_scroll_cache):
+        drv = ScrollFakeDriver({5: "tok-s-5"})
+        monkeypatch.setattr(ima_common, "run_cua", drv.run)
+        monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
+        extractor.scroll_down(100, 42)
+        assert drv.reads == 1
+        # 页循环重读前 token 已换代：重读登记新 token → 缓存比对不符必须作废
+        drv.snapshot_tokens = {5: "tok-s-9"}
+        extractor.get_window_state(100, 42)  # 页循环同款读窗（读即注册）
+        extractor.scroll_down(100, 42)
+        assert drv.reads == 3  # 首次发现 + 页循环重读 + 缓存失效重找
+        assert drv.scrolls[-1].get("element_token") == "tok-s-9"
+
+    def test_08_rollback_uses_index_path(self, monkeypatch, clean_scroll_cache):
+        drv = ScrollFakeDriver(None)  # 0.8：state 无 element_token
+        monkeypatch.setattr(ima_common, "run_cua", drv.run)
+        monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
+        extractor.scroll_down(100, 42)
+        assert drv.scrolls, "0.8 回滚态也应发出 scroll（index 路径）"
+        assert drv.scrolls[0].get("element_index") == 5
+        assert "element_token" not in drv.scrolls[0]
+        assert drv.scrolls[0].get("window_id") == 42
+
+    def test_no_scrollarea_falls_back_to_coords(self, monkeypatch, clean_scroll_cache):
+        drv = ScrollFakeDriver({8: "tok-8"}, with_scrollarea=False)
+        monkeypatch.setattr(ima_common, "run_cua", drv.run)
+        monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
+        extractor.scroll_down(100, 42)
+        assert drv.scrolls and "x" in drv.scrolls[-1] and "y" in drv.scrolls[-1]
+
+    def test_token_scroll_failure_does_not_raise(self, monkeypatch,
+                                                 clean_scroll_cache):
+        drv = ScrollFakeDriver({5: "tok-s-5"})
+        drv.scroll_fail = RuntimeError("cua-driver failed: exit 1")
+        monkeypatch.setattr(ima_common, "run_cua", drv.run)
+        monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
+        extractor.scroll_down(100, 42)  # 不得抛（提取循环自己重试）
+
+
+class TestNavigateClickResilience:
+    def test_kb_click_timeout_degrades_and_retries(self, monkeypatch):
+        """KB 入口点击 TimeoutExpired 必须降级为本次尝试失败（历史死法：
+        cua_call 15s 超时穿透炸整轮），attempt 循环重读重试。"""
+        drv = FakeDriver031()
+        drv.fail_kb_click_once = True
+        monkeypatch.setattr(upd, "get_ima_main_window",
+                            lambda: {"pid": 100, "window_id": 9})
+        monkeypatch.setattr(upd, "subprocess", self._fake_subprocess())
+        monkeypatch.setattr(upd, "is_on_kb_list", lambda kb: True)
+        monkeypatch.setattr(upd.time, "sleep", lambda s: None)
+
+        # FakeDriver031.run 的 click 里没有超时注入点——直接在其外层包：
+        orig_run = drv.run
+
+        def run_with_timeout(args, timeout=30):
+            if (args[1] == "click"
+                    and json.loads(args[2]).get("element_token") == "tok-B-30"
+                    and drv.fail_kb_click_once):
+                drv.fail_kb_click_once = False
+                raise subprocess.TimeoutExpired(cmd=["cua-driver"] + args,
+                                                timeout=timeout)
+            return orig_run(args, timeout=timeout)
+
+        monkeypatch.setattr(ima_common, "run_cua", run_with_timeout)
+        assert upd.navigate_to_kb("AI") is True  # 第 2 次尝试成功，全程无异常上抛
+
+    @staticmethod
+    def _osascript_timeout_run():
+        def _run(*a, **k):
+            raise subprocess.TimeoutExpired(cmd=["osascript"], timeout=5)
+        return _run
+
+    @classmethod
+    def _fake_subprocess(cls):
+        # 替身必须带 TimeoutExpired：navigate 的 except 子句运行期要从
+        # upd.subprocess 取该属性
+        return SimpleNamespace(run=cls._osascript_timeout_run(),
+                               TimeoutExpired=subprocess.TimeoutExpired)
+
+    def test_osascript_activate_timeout_swallowed(self, monkeypatch):
+        """navigate 尝试循环的 osascript activate 5s 超时不得炸（9/16 error log
+        两条 traceback 即此死法）。全程抛超时也照样导航成功。"""
+        drv = FakeDriver031()
+        monkeypatch.setattr(ima_common, "run_cua", drv.run)
+        monkeypatch.setattr(upd, "get_ima_main_window",
+                            lambda: {"pid": 100, "window_id": 9})
+        monkeypatch.setattr(upd, "subprocess", self._fake_subprocess())
+        monkeypatch.setattr(upd, "is_on_kb_list", lambda kb: True)
+        monkeypatch.setattr(upd.time, "sleep", lambda s: None)
+        assert upd.navigate_to_kb("AI") is True
+
+    def test_extractor_activate_ima_swallows_timeout(self, monkeypatch):
+        monkeypatch.setattr(extractor.subprocess, "run",
+                            self._osascript_timeout_run())
+        monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
+        extractor.activate_ima()  # 不得抛

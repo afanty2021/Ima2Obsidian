@@ -323,15 +323,17 @@ def activate_ima():
 
     # app activate + AX set frontmost 双管齐下：launchd 后台 osascript 'activate' 对
     # Electron app(ima.copilot) 间歇失效（AX 树仅菜单栏/0 元素），追加 AX 底层设前台。
-    subprocess.run(
-        ["osascript", "-e", 'tell application "ima.copilot" to activate'],
-        capture_output=True, timeout=5
-    )
-    subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to tell process "ima.copilot" to set frontmost to true'],
-        capture_output=True, timeout=5
-    )
+    # 5s 超时必须吞（2026-09-16 error log 两条 traceback 即此处炸整轮）；激活
+    # 失败由调用方 AX 探测兜底，不致命
+    for _osa_cmd in (
+        'tell application "ima.copilot" to activate',
+        'tell application "System Events" to tell process "ima.copilot" to set frontmost to true',
+    ):
+        try:
+            subprocess.run(["osascript", "-e", _osa_cmd],
+                           capture_output=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            log("  ⚠️ osascript activate 超时（降级继续）")
     time.sleep(2)
 
 
@@ -406,16 +408,18 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
     for attempt in range(1, max_attempts + 1):
         log(f"导航尝试 {attempt}/{max_attempts}...")
 
-        # 激活窗口确保 AX Tree 完整（activate + AX set frontmost，应对 launchd 后台 activate 间歇失效）
-        subprocess.run(
-            ["osascript", "-e", 'tell application "ima.copilot" to activate'],
-            capture_output=True, timeout=5
-        )
-        subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to tell process "ima.copilot" to set frontmost to true'],
-            capture_output=True, timeout=5
-        )
+        # 激活窗口确保 AX Tree 完整（activate + AX set frontmost，应对 launchd 后台 activate 间歇失效）。
+        # osascript 5s 超时必须吞（2026-09-16 error log 两条 traceback 即此处炸整轮；
+        # IMA 忙时 activate 会挂满预算）——激活失败由后续 AX 探测兜底，不致命
+        for _osa_cmd in (
+            'tell application "ima.copilot" to activate',
+            'tell application "System Events" to tell process "ima.copilot" to set frontmost to true',
+        ):
+            try:
+                subprocess.run(["osascript", "-e", _osa_cmd],
+                               capture_output=True, timeout=5)
+            except subprocess.TimeoutExpired:
+                log(f"  ⚠️ osascript activate 超时（降级继续）")
         time.sleep(2)
 
         # 获取窗口状态（读取即登记该快照的元素 token，供后续点击换 0.31 路径）
@@ -470,7 +474,12 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
                         break
             if nav_btn is not None:
                 log(f"  检测到对话页，点击'知识库'导航按钮 (element {nav_btn}) 到列表页...")
-                cua_click(pid, window_id, nav_btn)
+                try:
+                    cua_click(pid, window_id, nav_btn)
+                except Exception as e:
+                    # 点击路径的 TimeoutExpired/RuntimeError 都不得炸整轮：
+                    # 降级继续（下面的重读+注册仍执行），本尝试失败留给下一轮
+                    log(f"  ⚠️ 导航按钮点击失败（降级，留待下轮重试）: {e}")
                 time.sleep(3)
                 # 重读后必须立即刷新 token 注册表：0.31 语义下新快照取代旧快照、
                 # 旧 token 全部退役——漏注册会让随后的 KB 入口点击拿 stale token
@@ -514,20 +523,27 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
 
         if elem_idx is not None:
             log(f"  找到知识库 '{kb_name}' (element {elem_idx})，点击...")
+            clicked_ok = False
+            try:
+                cua_click(pid, window_id, elem_idx)
+                clicked_ok = True
+            except Exception as e:
+                # 同导航按钮：点击失败（含 TimeoutExpired）降级为本尝试失败，
+                # 交给 attempt 循环重读重试，绝不炸整轮无人值守运行
+                log(f"  ⚠️ KB 入口点击失败（降级，留待下轮重试）: {e}")
+            if clicked_ok:
+                title = ""
+                for wait in range(8):
+                    time.sleep(2.5)
+                    title = get_ax_window_title()
+                    if is_on_kb_list(kb_name):
+                        log(f"  ✅ 已导航到 {kb_name} 知识库（列表页验证通过）")
+                        time.sleep(2)
+                        return True
+                    if wait < 7:
+                        log(f"    等待页面加载... ({(wait+1)*2.5}秒) 标题: '{title}'")
 
-            cua_click(pid, window_id, elem_idx)
-
-            for wait in range(8):
-                time.sleep(2.5)
-                title = get_ax_window_title()
-                if is_on_kb_list(kb_name):
-                    log(f"  ✅ 已导航到 {kb_name} 知识库（列表页验证通过）")
-                    time.sleep(2)
-                    return True
-                if wait < 7:
-                    log(f"    等待页面加载... ({(wait+1)*2.5}秒) 标题: '{title}'")
-
-            log(f"  ⚠️  点击后未到达 {kb_name} 列表页，标题: '{title}'")
+                log(f"  ⚠️  点击后未到达 {kb_name} 列表页，标题: '{title}'")
         else:
             log(f"  ⚠️  在侧边栏未找到知识库 '{kb_name}'")
             log(f"  尝试滚动侧边栏...")

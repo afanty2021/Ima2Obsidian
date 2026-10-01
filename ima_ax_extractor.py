@@ -30,7 +30,8 @@ from ima_common import (
     DB_FILE, CUA_DRIVER, IMA_APP_NAME, is_daemon_running, init_database,
     get_ima_main_window, find_cliclick, is_ima_app_name,
     detect_deleted_reason, mark_dead_title, load_dead_titles,
-    cua_call, cua_click, cua_bring_to_front, remember_window_elements,
+    cua_call, cua_click, cua_element_action, cua_bring_to_front,
+    remember_window_elements, element_token_for,
 )
 
 # ==================== 配置 ====================
@@ -291,7 +292,16 @@ def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
     try:
         output = cua_call(tool, params)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
-        print(f"  ⚠️  cua-driver call {tool} 失败: {e}")
+        # 带上驱动侧结构化错误码（stdout 里）：裸 "exit 1" 曾把
+        # screenshot_context_missing 藏了一整轮（2026-10-01）
+        code = ""
+        try:
+            _p = json.loads(getattr(e, "stdout", None) or "")
+            if isinstance(_p, dict) and _p.get("code"):
+                code = f" [{_p['code']}]"
+        except (TypeError, ValueError):
+            pass
+        print(f"  ⚠️  cua-driver call {tool} 失败{code}: {e}")
         return None
 
     stripped = output.strip()
@@ -331,6 +341,10 @@ def click_element(pid: int, window_id: int, element_index: int) -> bool:
 # 定向滚轮的窗口局部坐标缓存（单窗口尺寸整个会话恒定，算一次即可）；
 # 按 window_id 键控——同会话换窗口/重开窗口时不得复用旧尺寸
 _SCROLL_LOCAL_COORDS: dict = {}
+# (pid, window_id) -> (element_index, element_token)：列表滚动区的 AXScrollArea
+# 缓存。token 与注册表比对——读窗换代后不匹配即作废重找（index 会随快照漂移，
+# 不得单凭 index 复用）
+_SCROLL_AREA: dict = {}
 
 
 def _scroll_local_coords(window_id: int) -> dict:
@@ -353,10 +367,56 @@ def _scroll_local_coords(window_id: int) -> dict:
 
 
 def scroll_down(pid: int, window_id: int, amount: int = 3):
-    # 新版 ima 列表是嵌套 overflow 滚动区，不吃合成按键（PageDown/箭头/无目标
-    # 滚轮三路由实测全部无效，2026-09-17）；必须用 cua-driver 定向滚轮路径：
-    # window-local x/y 处合成真实滚轮事件（CGEventCreateScrollWheelEvent），
-    # 按光标命中测试落在列表滚动区上。
+    """向下滚一档列表区。0.31 双路径，token 优先（纯树正路）：
+
+    - element_token 定向滚轮（首选）：0.31 的窗口坐标 x/y 路径锚定截图坐标系，
+      纯树模式（include_screenshot:false 去屏幕录制依赖）永远建不了 screenshot
+      context（2026-10-01 实测 screenshot_context_missing 连败）；定向滚轮同样
+      接受 element_token，对准 AXScrollArea 即可。token 取自注册表当前快照
+      （页解析读窗时登记），突发连滚（调用方 10 连发）零额外读窗；快照换代
+      （token 不再匹配缓存）才重读重找。0.8 回滚态注册表无 token，自动走
+      element_index 路径（0.8 原生）。
+    - x/y 坐标滚轮（兜底）：树里找不到 AXScrollArea 时保留 0.8 时代形状；
+      0.31 上会 screenshot_context_missing 失败，但仅打印不致命。
+    """
+    cached = _SCROLL_AREA.get((pid, window_id))
+    if cached is not None:
+        idx, tok = cached
+        # token 仍是当前快照的（无读窗换代）→ 直接滚，不重读
+        if element_token_for(pid, window_id, idx) == tok:
+            try:
+                cua_element_action(
+                    "scroll", pid, window_id,
+                    element_index=idx, element_token=tok,
+                    extra={"direction": "down", "amount": amount},
+                )
+                return
+            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                print(f"  ⚠️  cua-driver token scroll 失败: {e}")
+                return
+
+    state = get_window_state(pid, window_id)  # 读即注册，token 与快照同步
+    el = None
+    for cand in (state or {}).get("elements") or []:
+        if "ScrollArea" in str(cand.get("role", "")):
+            el = cand
+            break
+    if el is not None:
+        _SCROLL_AREA[(pid, window_id)] = (el["element_index"],
+                                          el.get("element_token"))
+        try:
+            cua_element_action(
+                "scroll", pid, window_id,
+                element_index=el["element_index"],
+                element_token=el.get("element_token"),
+                extra={"direction": "down", "amount": amount},
+            )
+            return
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            print(f"  ⚠️  cua-driver token scroll 失败: {e}")
+            return
+
+    # 兜底：0.8 时代的窗口坐标路径（0.31 纯树模式下会失败，仅打印）
     coords = _scroll_local_coords(window_id)
     run_cua_call("scroll", {
         "pid": pid,
@@ -370,10 +430,15 @@ def scroll_down(pid: int, window_id: int, amount: int = 3):
 # ==================== AppleScript ====================
 
 def activate_ima():
-    subprocess.run(
-        ["osascript", "-e", 'tell application "ima.copilot" to activate'],
-        capture_output=True, timeout=5
-    )
+    # 5s 超时必须吞：IMA 忙时 activate 挂满预算，TimeoutExpired 穿透会炸整轮
+    # 提取（2026-09-16 error log 同款死法）；激活失败由调用方 AX 探测兜底
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "ima.copilot" to activate'],
+            capture_output=True, timeout=5
+        )
+    except subprocess.TimeoutExpired:
+        print("  ⚠️  osascript activate 超时（降级继续）")
     time.sleep(WAIT_ACTIVATE)
 
 

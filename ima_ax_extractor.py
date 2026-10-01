@@ -306,7 +306,12 @@ def run_cua_call(tool: str, params: Dict) -> Optional[Dict]:
 
 
 def get_window_state(pid: int, window_id: int) -> Optional[Dict]:
-    state = run_cua_call("get_window_state", {"pid": pid, "window_id": window_id})
+    # include_screenshot=False：提取只解析树，截图从未被用过；纯树模式还把
+    # TCC 依赖收窄到辅助功能一项（0.31 起截图走屏幕录制授权，换 App 身份
+    # 会失效——2026-10-01 迁移实测）
+    state = run_cua_call("get_window_state", {
+        "pid": pid, "window_id": window_id, "include_screenshot": False,
+    })
     if state is not None:
         # 新快照取代旧快照：立刻刷新该窗口的 index→token 映射，后续
         # click_element 凭此换 token（0.31+），0.8 无 token 走 index 回退

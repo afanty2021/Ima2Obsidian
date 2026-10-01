@@ -95,16 +95,27 @@ def log(message: str, print_too: bool = True):
 
 # ==================== cua-driver ====================
 
+# 纯树读窗参数：项目从不消费截图（提取/导航只解析 tree_markdown 与 elements，
+# saver 本就显式关闭）；0.31 起截图走屏幕录制 TCC——换 App 身份会失效，
+# 纯树模式把依赖收窄到辅助功能一项（2026-10-01 迁移实测可用）
+TREE_ONLY = {"include_screenshot": False}
+
+
 def start_daemon() -> bool:
     """启动 cua-driver daemon"""
     log("启动 cua-driver daemon...")
     try:
-        # 使用 nohup 启动，输出到 /dev/null
+        # 0.31 起 serve 默认有 TCC 权限门（缺授权会开系统设置等用户点击，
+        # 无人值守会永久挂起）。旁路启动门：辅助功能（硬依赖）仍按调用级
+        # 校验，缺失时报错走正常告警链；屏幕录制本项目不需要（纯树模式）
+        env = dict(os.environ)
+        env.setdefault("CUA_DRIVER_RS_PERMISSIONS_GATE", "0")
         subprocess.Popen(
             [CUA_DRIVER, "serve"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True
+            start_new_session=True,
+            env=env,
         )
         # 等待 daemon 启动：进程存在后，再做一次握手确认 IPC socket 就绪
         for i in range(10):
@@ -222,7 +233,7 @@ def wait_for_ax_ready(min_elements: int = 5, timeout: int = 12) -> bool:
         try:
             state_result = cua_call(
                 "get_window_state",
-                {"pid": window["pid"], "window_id": window["window_id"]},
+                {"pid": window["pid"], "window_id": window["window_id"], **TREE_ONLY},
                 timeout=10,  # 单次探测限时，避免一次阻塞吃满整个等待预算
             )
             state = json.loads(state_result)
@@ -255,7 +266,7 @@ def get_ax_window_title() -> str:
             return ""
         state_result = cua_call(
             "get_window_state",
-            {"pid": window["pid"], "window_id": window["window_id"]},
+            {"pid": window["pid"], "window_id": window["window_id"], **TREE_ONLY},
             timeout=10,
         )
         md = json.loads(state_result).get("tree_markdown", "")
@@ -411,7 +422,8 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
         time.sleep(2)
 
         # 获取窗口状态（读取即登记该快照的元素 token，供后续点击换 0.31 路径）
-        state = json.loads(cua_call("get_window_state", {"pid": pid, "window_id": window_id}))
+        state = json.loads(cua_call("get_window_state",
+                                    {"pid": pid, "window_id": window_id, **TREE_ONLY}))
         remember_window_elements(pid, window_id, state)
         md = state.get("tree_markdown", "")
 
@@ -433,7 +445,8 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
                     log(f"  ⚠️  bring_to_front 失败: {e}")
             time.sleep(3)
             # 再次获取
-            state = json.loads(cua_call("get_window_state", {"pid": pid, "window_id": window_id}))
+            state = json.loads(cua_call("get_window_state",
+                                        {"pid": pid, "window_id": window_id, **TREE_ONLY}))
             remember_window_elements(pid, window_id, state)
             md = state.get("tree_markdown", "")
             static_text_count = len(re.findall(r'AXStaticText', md))
@@ -465,7 +478,8 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
                 cua_click(pid, window_id, nav_btn)
                 time.sleep(3)
                 md = json.loads(cua_call("get_window_state",
-                                         {"pid": pid, "window_id": window_id})).get("tree_markdown", "")
+                                         {"pid": pid, "window_id": window_id,
+                                          **TREE_ONLY})).get("tree_markdown", "")
                 # 修复 #2：对话页导航后重新探测也更新 last_ax_text_count（覆盖此分支的最后探测）
                 last_ax_text_count = len(re.findall(r'AXStaticText', md))
 

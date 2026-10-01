@@ -248,3 +248,42 @@ class TestSaverDualModeClick:
         with patch("ima_common.run_cua", return_value="") as mock:
             sv._cua_call("get_window_state", {"pid": 1, "window_id": 2})
         assert json.loads(mock.call_args[0][0][2])["session"] == CUA_SESSION
+
+
+# ==================== 纯树模式：去屏幕录制 TCC 依赖 ====================
+
+class TestTreeOnlyReads:
+    """0.31 起截图走屏幕录制授权（换 App 身份会失效）；本项目从不消费截图，
+    全部读窗显式关截图，把 TCC 依赖收窄到辅助功能一项。"""
+
+    def test_extractor_state_read_is_tree_only(self):
+        import ima_ax_extractor as ext
+        with patch("ima_common.run_cua", return_value="{}") as mock:
+            ext.get_window_state(1, 2)
+        assert json.loads(mock.call_args[0][0][2])["include_screenshot"] is False
+
+    def test_common_article_tab_probe_is_tree_only(self):
+        with patch("ima_common.run_cua", return_value="{}") as mock:
+            ima_common._is_article_tab_window({"pid": 1, "window_id": 2})
+        assert json.loads(mock.call_args[0][0][2])["include_screenshot"] is False
+
+    def test_update_tree_only_constant(self):
+        import ima_incremental_update as upd
+        assert upd.TREE_ONLY == {"include_screenshot": False}
+
+    def test_daemon_start_bypasses_permissions_gate(self, monkeypatch):
+        """start_daemon 注入门旁路环境——无人值守不得挂在 TCC 交互门上等点击。"""
+        import ima_incremental_update as upd
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured.update(cmd=cmd, env=kwargs.get("env"))
+
+        monkeypatch.setattr(upd.subprocess, "Popen", FakePopen)
+        monkeypatch.setattr(upd.time, "sleep", lambda s: None)
+        monkeypatch.setattr(upd, "is_daemon_running", lambda: True)
+        monkeypatch.setattr(ima_common, "run_cua", lambda *a, **k: "{}")
+        assert upd.start_daemon() is True
+        assert captured["env"]["CUA_DRIVER_RS_PERMISSIONS_GATE"] == "0"
+        assert captured["cmd"] == [upd.CUA_DRIVER, "serve"]

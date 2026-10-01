@@ -431,7 +431,9 @@ def _is_article_tab_window(window: dict) -> bool:
     try:
         st = json.loads(cua_call(
             "get_window_state",
-            {"pid": window["pid"], "window_id": window["window_id"]},
+            # 纯树模式：本项目不消费截图，且 0.31 起截图需屏幕录制 TCC
+            {"pid": window["pid"], "window_id": window["window_id"],
+             "include_screenshot": False},
         ))
         return "地址和搜索栏" in st.get("tree_markdown", "")
     except Exception:

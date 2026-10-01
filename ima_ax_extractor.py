@@ -397,9 +397,15 @@ def scroll_down(pid: int, window_id: int, amount: int = 3):
 
     state = get_window_state(pid, window_id)  # 读即注册，token 与快照同步
     el = None
-    for cand in (state or {}).get("elements") or []:
-        if "ScrollArea" in str(cand.get("role", "")):
-            el = cand
+    for wanted in ("ScrollArea", "WebArea"):
+        # ScrollArea 优先；ima 实测（10/1）列表页树里没有 AXScrollArea——嵌套
+        # overflow 滚动区在 AX 里是 AXWebArea 根（带 scrolltovisible 动作），
+        # 定向滚轮落元素屏幕点位，实机验证内容区可滚
+        for cand in (state or {}).get("elements") or []:
+            if wanted in str(cand.get("role", "")):
+                el = cand
+                break
+        if el is not None:
             break
     if el is not None:
         _SCROLL_AREA[(pid, window_id)] = (el["element_index"],

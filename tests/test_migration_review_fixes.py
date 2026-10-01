@@ -211,9 +211,11 @@ class ScrollFakeDriver:
     AXScrollArea（坐标兜底路径）。scroll 调用全部记录参数。
     """
 
-    def __init__(self, snapshot_tokens, with_scrollarea=True):
+    def __init__(self, snapshot_tokens, scroll_shape="scrollarea"):
+        # scroll_shape：scrollarea（有 AXScrollArea，首选靶）/ webarea（ima 实测
+        # 形态——树里只有 AXWebArea）/ none（两者皆无 → 坐标兜底）
         self.snapshot_tokens = snapshot_tokens  # {index: token} 或 None（0.8）
-        self.with_scrollarea = with_scrollarea
+        self.scroll_shape = scroll_shape
         self.reads = 0
         self.scrolls = []
         self.scroll_fail = None  # 异常实例：token 路径首次调用抛出后清空
@@ -227,9 +229,12 @@ class ScrollFakeDriver:
         if tool == "get_window_state":
             self.reads += 1
             md, elements = "", []
-            if self.with_scrollarea:
+            if self.scroll_shape == "scrollarea":
                 md += '[5] AXScrollArea "列表"\n'
                 elements.append({"element_index": 5, "role": "AXScrollArea"})
+            elif self.scroll_shape == "webarea":
+                md += '[5] AXWebArea "AI"\n'
+                elements.append({"element_index": 5, "role": "AXWebArea"})
             md += '[8] AXStaticText = "卡片"'
             elements.append({"element_index": 8, "role": "AXStaticText"})
             if self.snapshot_tokens is not None:
@@ -295,8 +300,17 @@ class TestScrollTokenPath:
         assert "element_token" not in drv.scrolls[0]
         assert drv.scrolls[0].get("window_id") == 42
 
+    def test_webarea_shape_ima_real_form(self, monkeypatch, clean_scroll_cache):
+        """ima 实测形态：列表页无 AXScrollArea，靶子回退到 AXWebArea 根。"""
+        drv = ScrollFakeDriver({5: "tok-s-5"}, scroll_shape="webarea")
+        monkeypatch.setattr(ima_common, "run_cua", drv.run)
+        monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
+        extractor.scroll_down(100, 42)
+        assert drv.scrolls and drv.scrolls[0].get("element_token") == "tok-s-5"
+        assert not any("x" in p for p in drv.scrolls)
+
     def test_no_scrollarea_falls_back_to_coords(self, monkeypatch, clean_scroll_cache):
-        drv = ScrollFakeDriver({8: "tok-8"}, with_scrollarea=False)
+        drv = ScrollFakeDriver({8: "tok-8"}, scroll_shape="none")
         monkeypatch.setattr(ima_common, "run_cua", drv.run)
         monkeypatch.setattr(extractor.time, "sleep", lambda s: None)
         extractor.scroll_down(100, 42)

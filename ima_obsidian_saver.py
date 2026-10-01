@@ -848,10 +848,16 @@ def _ensure_daemon_for_receipt():
         return True
     print("⚠️ cua-driver daemon 未运行，尝试拉起...", flush=True)
     try:
+        # 0.31 起 serve 默认有 TCC 权限门（缺授权会开系统设置等用户点击，
+        # 无人值守会永久挂起）。与 update 侧 start_daemon 同一旁路：辅助功能
+        # （硬依赖）仍按调用级校验，屏幕录制纯树模式不需要（评审 Important #3）
+        env = dict(os.environ)
+        env.setdefault("CUA_DRIVER_RS_PERMISSIONS_GATE", "0")
         subprocess.Popen(
             [CUA_DRIVER, "serve"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
     except Exception as e:
         print(f"❌ 拉起 daemon 失败: {e}", flush=True)

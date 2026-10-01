@@ -29,7 +29,7 @@ from pathlib import Path
 # 导入公共模块
 import ima_common
 from ima_common import (
-    CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running,
+    CUA_DRIVER, IMA_APP_NAME, is_daemon_running,
     cua_call, cua_click, cua_element_action, cua_bring_to_front,
     element_token_for, remember_window_elements,
     ensure_ima_appnap_disabled,
@@ -472,9 +472,16 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
                 log(f"  检测到对话页，点击'知识库'导航按钮 (element {nav_btn}) 到列表页...")
                 cua_click(pid, window_id, nav_btn)
                 time.sleep(3)
-                md = json.loads(cua_call("get_window_state",
-                                         {"pid": pid, "window_id": window_id,
-                                          **TREE_ONLY})).get("tree_markdown", "")
+                # 重读后必须立即刷新 token 注册表：0.31 语义下新快照取代旧快照、
+                # 旧 token 全部退役——漏注册会让随后的 KB 入口点击拿 stale token
+                # 被拒、回退 element_index 又被 0.31 硬拒（invalid_arguments），
+                # RuntimeError 直接炸掉整轮无人值守运行（重启 IMA 后落在对话页
+                # 是自愈链的常态入口，评审 Critical #1）
+                state = json.loads(cua_call("get_window_state",
+                                            {"pid": pid, "window_id": window_id,
+                                             **TREE_ONLY}))
+                remember_window_elements(pid, window_id, state)
+                md = state.get("tree_markdown", "")
                 # 修复 #2：对话页导航后重新探测也更新 last_ax_text_count（覆盖此分支的最后探测）
                 last_ax_text_count = len(re.findall(r'AXStaticText', md))
 

@@ -174,13 +174,18 @@ def cua_bring_to_front(pid, window_id, timeout: int = 15) -> bool:
         cua_call("bring_to_front", {"pid": pid, "window_id": window_id},
                  timeout=timeout)
         return True
-    except RuntimeError as e:
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        # TimeoutExpired 也须吞：守护进程卡死时 15s 超时以 TimeoutExpired 而非
+        # RuntimeError 抛出，漏捕会击穿全部 4 个调用点的降级语义（评审 #4）
         try:
             payload = json.loads(getattr(e, "stdout", None) or "")
         except (TypeError, ValueError):
             payload = {}
         if isinstance(payload, dict) and payload.get("process_activated") is True:
             return True
+        # 无人值守失败时留下驱动侧原因（stale/ambiguous/超时），方便次晨看日志定位
+        reason = str(getattr(e, "stdout", None) or e)[:200]
+        print(f"  ⚠️ bring_to_front 失败: {reason}")
         return False
 
 

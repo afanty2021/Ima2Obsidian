@@ -107,7 +107,7 @@
 旧流程是"热键 fire-and-forget + 25s 文件轮询"，命令层没响应也要空等。新流程：
 
 1. 触发 ⇧⌘O 前记 Chrome 窗口基线，触发后轮询 `list_windows`（窗口层，不受 Chromium 渲染器 AX 按需开启影响）等待**新弹窗窗口**出现——命令层回执；
-2. 弹窗出现后优先 **AX 点击** 'Add to Obsidian'（cua-driver element_index，语义动作）——按钮搜索在 `WAIT_AX_BUTTONS` 预算内轮询：Chromium 每轮**首个弹窗**的渲染器 AX 需数秒开启（实测 ~6s，超 1.5s 会在日志记录实际预热时长），后续弹窗首探即中零开销；
+2. 弹窗出现后优先 **AX 点击** 'Add to Obsidian'（cua-driver 双模：token 优先 0.31+ / element_index 回退 ≤0.8，语义动作）——按钮搜索在 `WAIT_AX_BUTTONS` 预算内轮询：Chromium 每轮**首个弹窗**的渲染器 AX 需数秒开启（实测 ~6s，超 1.5s 会在日志记录实际预热时长），后续弹窗首探即中零开销；
 3. AX 点击未完成（预算内未见按钮 / 点击未确认）才回退回车键（最后手段）；
 4. 弹窗未出现 → **快速失败**（跳过 25s 轮询），签名 `popup_missing`。
 

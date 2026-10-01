@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 # 导入公共模块
 import ima_common
 from ima_common import (
-    DB_FILE, CUA_DRIVER, IMA_APP_NAME, run_cua, is_daemon_running, init_database,
+    DB_FILE, CUA_DRIVER, IMA_APP_NAME, is_daemon_running, init_database,
     get_ima_main_window, find_cliclick, is_ima_app_name,
     detect_deleted_reason, mark_dead_title, load_dead_titles,
     cua_call, cua_click, cua_bring_to_front, remember_window_elements,
@@ -506,8 +506,13 @@ def _probe_article_window_md() -> str:
         if w.get("bounds", {}).get("height", 0) <= 200:
             continue
         try:
+            # include_screenshot=False + 读后注册：与其余读窗点同一纪律——纯树
+            # 模式不依赖屏幕录制授权（评审 Important #2），注册保证「最后一次
+            # 读窗」始终是注册表内容，后续任何对该窗的元素动作不会拿 stale token
             st = json.loads(cua_call("get_window_state",
-                                     {"pid": w["pid"], "window_id": w["window_id"]}))
+                                     {"pid": w["pid"], "window_id": w["window_id"],
+                                      "include_screenshot": False}))
+            remember_window_elements(w["pid"], w["window_id"], st)
         except Exception:
             continue
         md = st.get("tree_markdown", "")

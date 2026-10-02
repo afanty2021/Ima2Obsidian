@@ -299,7 +299,7 @@ def test_fallback_skipped_when_window_rendered_normally():
     （≥5 个元素，含知识库列表等），但找不到目标 KB 'AI' 入口。旧版无差别 quit 会丢失
     用户未保存状态；新版按 last_ax_text_count ≥ min_elements 跳过 restart。
 
-    测试矩阵：last_ax_text_count=6 ≥ 5，allow_restart=True，_RESTARTED_IN_THIS_RUN=False
+    测试矩阵：last_ax_text_count=6 ≥ 5，allow_restart=True，_NAV_RESTARTS_THIS_RUN < MAX（预算未耗尽）
     预期：restart_ima 不调用，返回 False，日志含「窗口渲染正常」
     """
     # log() 只在 tty 下 print，pytest 下用 patch 拦截消息
@@ -331,10 +331,10 @@ def test_fallback_triggered_when_window_not_rendered():
     """#2 对照验证：窗口未渲染（AXStaticText < 5）→ 触发 restart_ima
 
     与 test_fallback_skipped_when_window_rendered_normally 形成对照：相同 allow_restart
-    和 _RESTARTED_IN_THIS_RUN，差异仅在 last_ax_text_count（< 5 vs ≥ 5）。验证阈值判断
+    和 nav restart 预算，差异仅在 last_ax_text_count（< 5 vs ≥ 5）。验证阈值判断
     的正确性——只有窗口真的未渲染（疑似 launchd GUI session 隔离）才 restart。
 
-    测试矩阵：last_ax_text_count=0 < 5，allow_restart=True，_RESTARTED_IN_THIS_RUN=False
+    测试矩阵：last_ax_text_count=0 < 5，allow_restart=True，_NAV_RESTARTS_THIS_RUN < MAX（预算未耗尽）
     预期：restart_ima 调用 1 次，递归 allow_restart=False 后仍失败 → 返回 False
     """
     log_messages = []

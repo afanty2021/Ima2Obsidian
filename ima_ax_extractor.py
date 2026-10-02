@@ -1041,7 +1041,12 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                 verified_page_title: Optional[str] = None
                 for verify_attempt in range(1, CLICK_VERIFY_ATTEMPTS + 1):
                     if verify_attempt > 1:
-                        # 脱落态下点击必落空、状态读取必耗满超时——先廉价探测，脱落则自愈
+                        # 脱落态下点击必落空、状态读取必耗满超时——先廉价探测，脱落则自愈。
+                        # 注意此中卡探测只认菜单栏形态：空树形态（10/2 实证在卡开合
+                        # ~2s 内触发）此处探测不到，其恢复路径=本卡失败+页突发滚动
+                        # 失败+下页页首 elem_count==0 分支接自愈（有界，可接受）；
+                        # _read_main_window_md 读失败与 0 元素同返 ""，如要扩展须改
+                        # 其返回契约带 element_count
                         if ax_tree_menu_bar_only(_read_main_window_md()):
                             if _heal_wedge():
                                 healed_mid_page = True

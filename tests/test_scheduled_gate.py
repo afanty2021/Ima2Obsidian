@@ -106,6 +106,30 @@ class TestParseExtractorStats:
         out = "本次新增: abc 篇\n本次失败:\n"
         assert _parse_extractor_stats(out) == {"new": 0, "skipped": 0, "failed": 0}
 
+    def test_wedge_abort_marker_arms_gate_even_with_zero_failures(self):
+        """「中止本库提取」优雅中止（exit 0、本次失败恰为 0）也必须计 1 失败。
+
+        10/2 评审 Important #1：AX 脱落自愈预算耗尽时提取器优雅 break，若截断点
+        前的卡全部入库（失败 0），库会被计成功、17:10 门控不补扫——截断点以下
+        的新文要等列表翻页才可见。10/2 21:11 轮 AI/英语教与学 即此形态。
+        """
+        out = "\n".join([
+            "  ❌ IMA AX 树为空（0 元素，原位脱落）且自愈无效，中止本库提取"
+            "（已提取文章照常进入保存阶段）",
+            "    本次新增: 5 篇",
+            "    本次跳过: 0 篇",
+            "    本次失败: 0 篇",
+        ])
+        assert _parse_extractor_stats(out) == {"new": 5, "skipped": 0, "failed": 1}
+
+    def test_wedge_abort_marker_does_not_double_count(self):
+        """已计入的逐篇失败不因中止标记重复抬升（门控只看 ≥1）"""
+        out = "\n".join([
+            "  ❌ IMA AX 树已脱落且自愈无效，中止本库提取（已提取文章照常进入保存阶段）",
+            "    本次失败: 2 篇",
+        ])
+        assert _parse_extractor_stats(out)["failed"] == 2
+
     def test_repeated_tags_last_wins(self):
         out = "本次新增: 1 篇\n本次新增: 5 篇\n"
         assert _parse_extractor_stats(out)["new"] == 5

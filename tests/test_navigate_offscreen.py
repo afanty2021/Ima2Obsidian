@@ -13,7 +13,19 @@ StopIteration（preexisting 测试失败根因）。
 """
 from unittest.mock import patch
 
+import pytest
+
 import ima_incremental_update
+
+
+@pytest.fixture(autouse=True)
+def _reset_nav_restart_budget():
+    """y<-50 前置复位现计入 nav restart 预算（10/2 评审 Important #2）——模块级
+    计数器跨用例泄漏会让本文件用例依赖执行顺序（前面用例耗尽预算后，
+    y<-50 用例不再 restart），一律前后清零。"""
+    ima_incremental_update._NAV_RESTARTS_THIS_RUN = 0
+    yield
+    ima_incremental_update._NAV_RESTARTS_THIS_RUN = 0
 
 
 def _win(is_on_screen, y):
@@ -66,6 +78,35 @@ def test_is_on_screen_false_uses_bring_to_front_not_restart():
     mock_restart.assert_not_called()
     # bring_to_front 经 run_cua 调用
     assert any("bring_to_front" in " ".join(str(a) for a in c.args) for c in mock_cua.call_args_list)
+
+
+def test_y_offscreen_restart_counts_into_run_budget():
+    """y<-50 屏外复位必须计入 nav restart 预算（10/2 评审 Important #2：
+    原实现漏计——单条导航链最多 1 次未计（此处）+ 1 次已计（末尾兜底），
+    且 AX 死亡与屏外几何常并发，封顶名存实亡）"""
+    with patch("ima_incremental_update.get_ima_main_window",
+               side_effect=_window_sequence(_win(True, -100))), \
+         patch("ima_incremental_update.restart_ima") as mock_restart, \
+         patch("ima_common.run_cua", return_value='{"tree_markdown":""}'), \
+         patch("ima_incremental_update.subprocess.run"), \
+         patch("ima_incremental_update.time.sleep"):
+        ima_incremental_update.navigate_to_kb("AI", max_attempts=5, allow_restart=False)
+    mock_restart.assert_called_once()
+    assert ima_incremental_update._NAV_RESTARTS_THIS_RUN == 1
+
+
+def test_y_offscreen_skips_restart_when_budget_exhausted():
+    """预算耗尽后 y<-50 不再 restart（有界保证），继续用原窗口走导航"""
+    ima_incremental_update._NAV_RESTARTS_THIS_RUN = (
+        ima_incremental_update.MAX_NAV_RESTARTS_PER_RUN)
+    with patch("ima_incremental_update.get_ima_main_window",
+               side_effect=_window_sequence(_win(True, -100))), \
+         patch("ima_incremental_update.restart_ima") as mock_restart, \
+         patch("ima_common.run_cua", return_value='{"tree_markdown":""}'), \
+         patch("ima_incremental_update.subprocess.run"), \
+         patch("ima_incremental_update.time.sleep"):
+        ima_incremental_update.navigate_to_kb("AI", max_attempts=5, allow_restart=False)
+    mock_restart.assert_not_called()  # 耗尽旁路生效，不烧第 4 次 restart
 
 
 def test_combo_is_on_screen_false_and_y_offscreen_also_restarts():

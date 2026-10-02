@@ -193,11 +193,13 @@ def restart_ima():
 # 原为「单次 run 最多 1 次」布尔标志；2026-10-02 放宽为计数 + 总量封顶）。
 # 背景：10/2 21:11 轮（全机重启后 33 分钟）主窗原位 AX 死亡一轮三现，Invest 用掉
 # run 级唯一预算后 Andrew/皮皮鲁 结构性失救——「restart 救得了先 wedge 的库、救不了
-# 后面的」纯队列顺序伪象。改为每 KB 最多 1 次（递归 allow_restart=False 已天然保证
-# 单条导航链不重复 restart）+ 每 run 总量 MAX_NAV_RESTARTS_PER_RUN 封顶——多库连坏
-# 时依然有界（每次 restart ≈ 30s + 5 attempts ≈ 64s，3 次封顶 ≈ 5 分钟），耗尽后
-# 该库 return False 留待下轮 launchd 重扫。提取器侧 _heal_wedge 有独立 5 次/库预算，
-# 不占本计数。main() 入口 reset 保证每次运行独立。
+# 后面的」纯队列顺序伪象。改为每 KB 最多 1 次兜底 restart（递归 allow_restart=False
+# 已天然保证单条导航链不重复走兜底）+ 每 run 总量 MAX_NAV_RESTARTS_PER_RUN 封顶——
+# 多库连坏时依然有界（每次 restart ≈ 30s + 5 attempts ≈ 64s，3 次封顶 ≈ 5 分钟），
+# 耗尽后该库 return False 留待下轮 launchd 重扫。屏外 y<-50 前置复位（本函数开头）
+# 同走本计数、同受封顶（10/2 评审 Important：原实现漏计，单链最多 1 次未计 +
+# 1 次已计）。提取器侧 _heal_wedge 有独立 5 次/库预算，不占本计数。
+# main() 入口 reset 保证每次运行独立。
 MAX_NAV_RESTARTS_PER_RUN = 3
 _NAV_RESTARTS_THIS_RUN = 0
 
@@ -400,11 +402,21 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
     # 复查最新窗口的 y（bring_to_front 切回 Space 可能暴露离屏 y），独立 if 非 elif，
     # 覆盖 is_on_screen=False 且 y<-50 的组合情况。restart_ima 包 try 对齐 bring_to_front 的 fail-soft。
     if window and window.get("bounds", {}).get("y", 0) < -50:
-        log(f"⚠️  IMA 窗口在屏幕外 (bounds.y={window.get('bounds', {}).get('y')})，restart_ima 重置窗口位置...")
-        try:
-            restart_ima()
-        except Exception as e:
-            log(f"⚠️  restart_ima 失败: {e}，继续尝试原窗口")
+        if _NAV_RESTARTS_THIS_RUN >= MAX_NAV_RESTARTS_PER_RUN:
+            # 屏外复位同走 nav restart 预算（10/2 评审 Important：原实现漏计，
+            # 单链最多 1 次未计 + 1 次已计；AX 死亡与屏外几何常并发）——预算
+            # 耗尽时不再 restart，继续用原窗口（后续 AX 探测自会失败并走失败链）
+            log(f"⚠️  IMA 窗口在屏幕外 (bounds.y={window.get('bounds', {}).get('y')}) "
+                f"但本 run restart 预算已耗尽（{MAX_NAV_RESTARTS_PER_RUN}），继续尝试原窗口")
+        else:
+            _NAV_RESTARTS_THIS_RUN += 1
+            log(f"⚠️  IMA 窗口在屏幕外 (bounds.y={window.get('bounds', {}).get('y')})，"
+                f"restart_ima 重置窗口位置（本 run 第 {_NAV_RESTARTS_THIS_RUN}/"
+                f"{MAX_NAV_RESTARTS_PER_RUN} 次）...")
+            try:
+                restart_ima()
+            except Exception as e:
+                log(f"⚠️  restart_ima 失败: {e}，继续尝试原窗口")
         window = get_ima_main_window()
         if not window:
             log("❌ restart_ima 后仍未找到 IMA 窗口")
@@ -594,7 +606,7 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
     #       不再递归（避免无意义等待）
     # - #5: 用 allow_restart 参数（递归传 False）替代 max_attempts>1 守卫——
     #       解耦「循环次数」与「是否允许兜底」双重含义
-    min_elements = 5  # 与 attempts 完整性判断一致（line 382 static_text_count < 5）
+    min_elements = 5  # 与 attempts 完整性判断一致（navigate 内 static_text_count < min_elements 判断）
     if (allow_restart and _NAV_RESTARTS_THIS_RUN < MAX_NAV_RESTARTS_PER_RUN
             and last_ax_text_count < min_elements):
         _NAV_RESTARTS_THIS_RUN += 1
@@ -937,6 +949,11 @@ def _parse_extractor_stats(stdout):
     「本次失败」必须参与解析：逐篇 URL/点击失败不入库（残留计数看不见它），
     提取器退出码又是 0——漏掉它，前置判断会把「部分失败」误判成「全成功」
     而跳过 17:10 补扫（2026-09-01 评审 Important #1）。
+
+    「中止本库提取」标记同理（10/2 评审 Important #1）：AX 脱落自愈预算耗尽
+    时提取器优雅 break、exit 0，若本次失败恰为 0（截断点前的卡全部入库），
+    该库会被计成功、17:10 门控不补扫——截断点以下的新文要等列表翻页才可见。
+    故见标记即把 failed 抬到 ≥1，武装门控。
     """
     new_count = 0
     skipped_count = 0
@@ -958,6 +975,11 @@ def _parse_extractor_stats(stdout):
                 extract_failed = int(line.split(":")[-1].strip().split()[0])
             except (ValueError, IndexError):
                 pass
+
+    if "中止本库提取" in stdout and extract_failed == 0:
+        # 自愈预算耗尽/自愈后窗口丢失的优雅中止（exit 0）：不计失败会让
+        # 17:10 门控漏补扫（见 docstring）；已计失败则不重复抬
+        extract_failed = 1
 
     return {"new": new_count, "skipped": skipped_count, "failed": extract_failed}
 

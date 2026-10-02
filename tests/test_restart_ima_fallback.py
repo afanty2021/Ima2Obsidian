@@ -11,7 +11,8 @@
 
 本测试覆盖 4 项 code review 修复：
 - #1: 宽泛 try/except 把递归异常误归因为 restart 失败 → restart 单独 try + 递归在外
-- #3: 多 KB 复合重启 → 模块级 _RESTARTED_IN_THIS_RUN 标志，单次 run 最多 restart 1 次
+- #3: 多 KB 复合重启 → nav 级 restart 预算计数（2026-10-02 起每 KB 最多 1 次、
+      每 run 总量 MAX_NAV_RESTARTS_PER_RUN=3 封顶；原为单 run 布尔标志只许 1 次）
 - #4: restart_ima 返回值被忽略 → if not restart_ima(): return False
 - #5: max_attempts 双重含义 → 独立 allow_restart 参数解耦
 """
@@ -24,11 +25,11 @@ import ima_incremental_update
 
 
 @pytest.fixture(autouse=True)
-def _reset_restarted_flag():
-    """每个用例前 reset 模块级 _RESTARTED_IN_THIS_RUN（修复 #3 配套）"""
-    ima_incremental_update._RESTARTED_IN_THIS_RUN = False
+def _reset_nav_restart_budget():
+    """每个用例前 reset 模块级 nav restart 预算计数（修复 #3 配套）"""
+    ima_incremental_update._NAV_RESTARTS_THIS_RUN = 0
     yield
-    ima_incremental_update._RESTARTED_IN_THIS_RUN = False
+    ima_incremental_update._NAV_RESTARTS_THIS_RUN = 0
 
 
 def _win(is_on_screen=True, y=33):
@@ -235,11 +236,12 @@ def test_fallback_returns_false_when_restart_returns_false():
     assert mock_cua.call_count == 10
 
 
-def test_fallback_only_once_per_run():
-    """#3 验证：单次 run 内最多 restart 一次——第二次 navigate_to_kb 不再 restart
+def test_fallback_budget_is_per_kb_not_per_run():
+    """#3 验证（2026-10-02 语义）：预算按 KB 计——第一个 KB 触发 restart 后，
+    第二个 KB 仍可 restart（原单 run 布尔标志会拦下第二个）。
 
-    场景：main() 循环处理多个 KB，第一个 KB 触发 restart 后 _RESTARTED_IN_THIS_RUN=True，
-    后续 KB 即使 5 attempts 全失败也不再 restart（避免 9.5min 复合重启浪费）。
+    背景：10/2 21:11 轮主窗原位 AX 死亡一轮三现，Invest 用掉 run 级唯一预算后
+    Andrew/皮皮鲁 结构性失救。放宽后每个 wedge 的库都有自己的自愈机会。
     """
     # 模拟 main 循环：连续两次 navigate_to_kb（每次 5 attempts × 2 次 = 10 次 run_cua）
     with patch("ima_incremental_update.get_ima_main_window", return_value=_win()), \
@@ -247,15 +249,44 @@ def test_fallback_only_once_per_run():
          patch("ima_common.run_cua", return_value=_empty_md_json()), \
          patch("ima_incremental_update.subprocess.run"), \
          patch("ima_incremental_update.time.sleep"):
-        # 第一次调用：5 attempts 失败 → 触发 restart → 递归 allow_restart=False 也失败 → False
         result1 = ima_incremental_update.navigate_to_kb("AI", max_attempts=5)
-        # 第二次调用：_RESTARTED_IN_THIS_RUN 已 True，不再 restart
         result2 = ima_incremental_update.navigate_to_kb("KB2", max_attempts=5)
 
     assert result1 is False
     assert result2 is False
-    # 关键断言：跨两次 navigate_to_kb，restart_ima 只被调用 1 次（第一次触发，第二次被标志阻止）
-    mock_restart.assert_called_once()
+    # 关键断言：跨两个 KB，restart_ima 各被调用 1 次（预算按 KB 计）
+    assert mock_restart.call_count == 2
+    # run 级计数器同步累积
+    assert ima_incremental_update._NAV_RESTARTS_THIS_RUN == 2
+
+
+def test_fallback_run_cap_stops_restart_after_budget_exhausted():
+    """#3 验证（2026-10-02 语义）：run 总量封顶——MAX_NAV_RESTARTS_PER_RUN=3 耗尽后，
+    后续 KB 即使窗口未渲染也不再 restart，且日志明示「预算已耗尽」（10/2 前此态
+    静默跳库，运维难辨根因）。
+    """
+    cap = ima_incremental_update.MAX_NAV_RESTARTS_PER_RUN
+    assert cap == 3  # 钉住默认值：改封顶须同步更新本测试与文档
+    log_messages = []
+    fake_log = lambda msg, print_too=True: log_messages.append(msg)
+
+    with patch("ima_incremental_update.get_ima_main_window", return_value=_win()), \
+         patch("ima_incremental_update.restart_ima", return_value=True) as mock_restart, \
+         patch("ima_common.run_cua", return_value=_empty_md_json()), \
+         patch("ima_incremental_update.subprocess.run"), \
+         patch("ima_incremental_update.time.sleep"), \
+         patch("ima_incremental_update.log", side_effect=fake_log):
+        results = [ima_incremental_update.navigate_to_kb(f"KB{i}", max_attempts=5)
+                   for i in range(cap + 1)]
+
+    assert results == [False] * (cap + 1)
+    # 前 cap 个 KB 各 restart 一次；第 cap+1 个被预算拦下
+    assert mock_restart.call_count == cap
+    assert ima_incremental_update._NAV_RESTARTS_THIS_RUN == cap
+    combined = "\n".join(log_messages)
+    assert "预算已耗尽" in combined, f"预算耗尽的 KB 应明示根因，实际: {combined}"
+    # 封顶内每次 restart 应带计数（运维可判断离耗尽还差几次）
+    assert f"第 1/{cap} 次" in combined and f"第 {cap}/{cap} 次" in combined
 
 
 # ==================== 修复 #2：兜底条件精确化（窗口未渲染才 restart） ====================

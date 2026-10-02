@@ -893,6 +893,23 @@ async def extract_articles(pid: int, window_id: int, kb_name: str = "AI"):
                 break
 
         elem_count = state.get("element_count", 0)
+        if elem_count == 0:
+            # 空树形态脱落（2026-10-02 实证）：主窗原位 AX 持续死亡——CGWindow 层
+            # bounds/标题正常、AX 树 0 元素、30+ 分钟不自愈（非 9/23 的 ~4 分钟
+            # 瞬时形态、非仅菜单栏形态——后者 element_count 仍 >100 由下方分支管）。
+            # 旧版此处静默 break 截断走库并误报「不在当前 Space」。激活重读（上方）
+            # 仍 0 即走 _heal_wedge，与菜单栏形态共用单库预算。
+            if _heal_wedge():
+                # 重启后 pid/window_id 全变，刷新句柄并重解析当前页
+                nw = get_ima_main_window()
+                if not nw:
+                    print("  ❌ 自愈后未找到 IMA 窗口，中止本库提取")
+                    break
+                pid, window_id = nw["pid"], nw["window_id"]
+                continue
+            print("  ❌ IMA AX 树为空（0 元素，原位脱落）且自愈无效，中止本库提取"
+                  "（已提取文章照常进入保存阶段）")
+            break
         if elem_count < 100:
             print(f"  ⚠️  元素数过少 ({elem_count})，可能窗口不在当前 Space")
             break

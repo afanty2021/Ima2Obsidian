@@ -24,6 +24,9 @@ WEDGED_MD = (
     "    - [2] AXMenuItem \"关于本机\"\n"
 )
 WEDGED_STATE = {"element_count": 262, "tree_markdown": WEDGED_MD}
+# 空树形态（2026-10-02 实证）：主窗原位 AX 持续死亡——CGWindow 层 bounds/标题
+# 正常、AX 树 0 元素、30+ 分钟不自愈。与菜单栏形态（element_count 仍 >100）区分。
+EMPTY_TREE_STATE = {"element_count": 0, "tree_markdown": ""}
 HEALTHY_MD = (
     "- [0] AXWindow \"英语教与学\"\n"
     "- [12] AXStaticText = \"个人知识库\"\n"
@@ -742,3 +745,93 @@ def test_second_heal_during_active_grace_reassigns_descent_budget(temp_db, monke
     assert clicked == [1, 2, 3, 4, 4]
     # 10 次解析走完全序列：宽限期内没有任何停止条件提前截停
     assert len(parsed) == 10
+
+
+def test_empty_tree_heal_at_page_start_recovers_and_continues(temp_db, monkeypatch):
+    """空树形态页首自愈（2026-10-02 实证回归）：0 元素原位脱落 → 激活重读仍空
+    → 自愈（重启+重新导航）→ 刷新句柄重解析并继续走库。
+
+    旧版此形态走 elem_count<100 的静默 break——截断走库、误报「可能窗口不在
+    当前 Space」、不触发任何自愈（10/2 AI/英语教与学 两库翻页死于此）。
+    几何与 test_wedge_heal_at_page_start_recovers_and_continues 同构：页1 双读
+    均空 → 自愈 → 页2-5 健康（全已知），前两页宽限、后两页连续全已知停。
+    """
+    import ima_incremental_update
+    from ima_common import init_database
+
+    init_database()
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 5)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 5)
+    states = [dict(EMPTY_TREE_STATE), dict(EMPTY_TREE_STATE)] + [
+        dict(HEALTHY_STATE) for _ in range(4)
+    ]
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_window_state",
+        lambda _p, _w: states.pop(0),
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "parse_articles_from_tree",
+        lambda _state, _kb: [{"element_index": 1, "title": "库内文章甲"}],
+    )
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_ima_main_window",
+        lambda: {"pid": 9, "window_id": 9, "bounds": {"width": 1512, "height": 949}},
+    )
+    calls = {"restart": 0, "navigate": 0}
+
+    def fake_restart():
+        calls["restart"] += 1
+        return True
+
+    def fake_navigate(kb, allow_restart=True):
+        calls["navigate"] += 1
+        return True
+
+    monkeypatch.setattr(ima_incremental_update, "restart_ima", fake_restart)
+    monkeypatch.setattr(ima_incremental_update, "navigate_to_kb", fake_navigate)
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", lambda: None)
+    monkeypatch.setattr(
+        ima_ax_extractor, "click_element", lambda *_a: (_ for _ in ()).throw(AssertionError("不应点击")))
+
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute(
+            "INSERT INTO articles (url, title, knowledge_base, status) VALUES "
+            "('https://mp.weixin.qq.com/s/known', '库内文章甲', '英语教与学', 'success')"
+        )
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "英语教与学"))
+
+    assert calls == {"restart": 1, "navigate": 1}
+
+
+def test_empty_tree_budget_exhausted_aborts_without_clicks(temp_db, monkeypatch, capsys):
+    """空树形态预算耗尽中止：MAX_WEDGE_RESTARTS_PER_KB=0 时 _heal_wedge 被拒
+    → 中止本库、明示「0 元素」根因、不产生任何点击（对齐菜单栏形态的中止语义）"""
+    from ima_common import init_database
+
+    init_database()
+    monkeypatch.setattr(ima_ax_extractor, "MAX_PAGES", 5)
+    monkeypatch.setattr(ima_ax_extractor, "MAX_WEDGE_RESTARTS_PER_KB", 0)  # 预算清零 → 走中止分支
+    states = [dict(EMPTY_TREE_STATE), dict(EMPTY_TREE_STATE)]
+    monkeypatch.setattr(
+        ima_ax_extractor, "get_window_state",
+        lambda _p, _w: states.pop(0),
+    )
+    _patch_common(monkeypatch)
+
+    def activate():
+        activations.append(True)
+
+    activations = []
+    monkeypatch.setattr(ima_ax_extractor, "activate_ima", activate)
+    monkeypatch.setattr(
+        ima_ax_extractor, "click_element", lambda *_a: (_ for _ in ()).throw(AssertionError("不应点击")))
+
+    asyncio.run(ima_ax_extractor.extract_articles(1, 1, "英语教与学"))
+
+    assert len(activations) == 1  # <100 分支的一次激活重读
+    out = capsys.readouterr().out
+    assert "0 元素" in out, f"中止消息应明示空树根因，实际: {out[-500:]}"
+    with sqlite3.connect(temp_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0] == 0

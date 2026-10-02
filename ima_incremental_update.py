@@ -189,12 +189,17 @@ def restart_ima():
     return launch_ima()
 
 
-# 单次 run 内最多 restart 一次的标志（fix/saver-restart-ima-fallback code review #3）。
-# main() 循环调 navigate_to_kb 处理多个 KB，若 GUI session 隔离持续，每个 KB 都走完
-# 5 attempts + restart ≈ 64s，5 KB 共 ~9.5 分钟浪费。第一次 restart 后此标志置 True，
-# 后续 KB 不再 restart（直接 return False，让 main 跳过该 KB——下次 launchd 跑再处理）。
-# main() 入口 reset 为 False 保证每次运行独立。
-_RESTARTED_IN_THIS_RUN = False
+# nav 级 restart_ima 兜底的 run 级预算（fix/saver-restart-ima-fallback code review #3
+# 原为「单次 run 最多 1 次」布尔标志；2026-10-02 放宽为计数 + 总量封顶）。
+# 背景：10/2 21:11 轮（全机重启后 33 分钟）主窗原位 AX 死亡一轮三现，Invest 用掉
+# run 级唯一预算后 Andrew/皮皮鲁 结构性失救——「restart 救得了先 wedge 的库、救不了
+# 后面的」纯队列顺序伪象。改为每 KB 最多 1 次（递归 allow_restart=False 已天然保证
+# 单条导航链不重复 restart）+ 每 run 总量 MAX_NAV_RESTARTS_PER_RUN 封顶——多库连坏
+# 时依然有界（每次 restart ≈ 30s + 5 attempts ≈ 64s，3 次封顶 ≈ 5 分钟），耗尽后
+# 该库 return False 留待下轮 launchd 重扫。提取器侧 _heal_wedge 有独立 5 次/库预算，
+# 不占本计数。main() 入口 reset 保证每次运行独立。
+MAX_NAV_RESTARTS_PER_RUN = 3
+_NAV_RESTARTS_THIS_RUN = 0
 
 
 def wait_for_ax_ready(min_elements: int = 5, timeout: int = 12) -> bool:
@@ -359,8 +364,8 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
 
     返回: True 表示成功导航
     """
-    # 修复 #3：声明 global 才能在函数内读写模块级 _RESTARTED_IN_THIS_RUN
-    global _RESTARTED_IN_THIS_RUN
+    # 声明 global 才能在函数内读写模块级 nav restart 预算计数（原 code review #3）
+    global _NAV_RESTARTS_THIS_RUN
 
     import re
 
@@ -576,23 +581,26 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
     # （NSRunningApplication.activate 不在用户 GUI session 中），窗口仍未渲染。
     # 强制 restart_ima（quit + relaunch 重置窗口 + 强制渲染），再递归一次重试。
     #
-    # PR review 4 项修复：
+    # PR review 4 项修复 + 2026-10-02 预算放宽：
     # - #1: restart_ima 单独 try/except，递归调用移到 try 外——避免递归内 run_cua/
     #       json.loads 抛异常被误归因为「restart_ima 兜底失败」
     # - #2: 兜底条件精确化——只在窗口未渲染（last_ax_text_count < min_elements）时才
     #       restart，避免无差别 quit。窗口正常渲染时 quit 无效（KB 名错/UI 改版/cua-driver bug）
     #       且交互运行时会丢失用户未保存的 IMA 状态。
-    # - #3: 单次 run 内最多 restart 一次（_RESTARTED_IN_THIS_RUN 模块级标志）——
-    #       main 循环处理多个 KB 时，第一次 restart 后后续 KB 不再 restart
+    # - #3: 预算原为单次 run 内最多 restart 一次（布尔标志）；2026-10-02 起放宽为
+    #       每 KB 最多 1 次（递归 allow_restart=False 天然保证）+ run 总量
+    #       MAX_NAV_RESTARTS_PER_RUN 封顶——单 run 多库 AX 死亡不再结构性失救后位库
     # - #4: 检查 restart_ima() 返回值——launch 失败（30s 内未启动）直接 return False，
     #       不再递归（避免无意义等待）
     # - #5: 用 allow_restart 参数（递归传 False）替代 max_attempts>1 守卫——
     #       解耦「循环次数」与「是否允许兜底」双重含义
     min_elements = 5  # 与 attempts 完整性判断一致（line 382 static_text_count < 5）
-    if allow_restart and not _RESTARTED_IN_THIS_RUN and last_ax_text_count < min_elements:
+    if (allow_restart and _NAV_RESTARTS_THIS_RUN < MAX_NAV_RESTARTS_PER_RUN
+            and last_ax_text_count < min_elements):
+        _NAV_RESTARTS_THIS_RUN += 1
         log(f"⚠️  {max_attempts} 次导航尝试都失败，最后一次 AX 探测仅 {last_ax_text_count} 个元素"
-            f"（窗口未渲染，疑似 launchd GUI session 隔离），强制 restart_ima 自愈...")
-        _RESTARTED_IN_THIS_RUN = True  # 修复 #3：本次 run 内不再 restart
+            f"（窗口未渲染，疑似 launchd GUI session 隔离），强制 restart_ima 自愈"
+            f"（本 run 第 {_NAV_RESTARTS_THIS_RUN}/{MAX_NAV_RESTARTS_PER_RUN} 次）...")
         try:
             restart_ok = restart_ima()  # 内部已调 launch_ima（含 wait_for_ax_ready 等渲染就绪）
         except Exception as e:
@@ -605,11 +613,16 @@ def navigate_to_kb(kb_name: str, max_attempts: int = 5, allow_restart: bool = Tr
         # 修复 #1：递归在 try 外——递归内异常不会再被误归因为 restart 失败
         return navigate_to_kb(kb_name, max_attempts=max_attempts, allow_restart=False)
 
-    # 修复 #2：窗口渲染正常但导航失败——restart 无效（KB 名错/UI 改版/cua-driver bug）
-    # 交互运行时 quit 会丢失用户未保存状态，故不重启；launchd 后台跑也不必（无人值守时无状态可丢）
-    if allow_restart and not _RESTARTED_IN_THIS_RUN:
-        log(f"❌ {max_attempts} 次导航尝试都失败，但窗口渲染正常（{last_ax_text_count} 个元素 ≥ {min_elements}）"
-            f"——restart 无效，跳过（疑似 KB 名错或 IMA UI 改版）")
+    if allow_restart:
+        # 修复 #2：窗口渲染正常但导航失败——restart 无效（KB 名错/UI 改版/cua-driver bug）
+        # 交互运行时 quit 会丢失用户未保存状态，故不重启；launchd 后台跑也不必（无人值守时无状态可丢）
+        if last_ax_text_count >= min_elements:
+            log(f"❌ {max_attempts} 次导航尝试都失败，但窗口渲染正常（{last_ax_text_count} 个元素 ≥ {min_elements}）"
+                f"——restart 无效，跳过（疑似 KB 名错或 IMA UI 改版）")
+        elif _NAV_RESTARTS_THIS_RUN >= MAX_NAV_RESTARTS_PER_RUN:
+            # 预算耗尽的未渲染失败单独明示（10/2 前此态静默跳库，运维难辨根因）
+            log(f"❌ {max_attempts} 次导航尝试都失败且窗口未渲染（{last_ax_text_count} 个元素），"
+                f"但本 run restart 预算已耗尽（{MAX_NAV_RESTARTS_PER_RUN} 次），跳过该库留待下轮")
 
     return False
 
@@ -1127,9 +1140,9 @@ def cleanup_gui_apps(interactive: bool = False):
 # ==================== 主函数 ====================
 
 def main():
-    # 修复 #3：reset 单次 run 内 restart 标志，保证每次 main 运行独立
-    global _RESTARTED_IN_THIS_RUN
-    _RESTARTED_IN_THIS_RUN = False
+    # reset 单次 run 内 nav restart 预算计数，保证每次 main 运行独立（原 code review #3）
+    global _NAV_RESTARTS_THIS_RUN
+    _NAV_RESTARTS_THIS_RUN = 0
 
     # 文件锁防止并发执行
     lock_fd = open(LOCK_FILE, "w")

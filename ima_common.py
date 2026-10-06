@@ -111,12 +111,20 @@ def cua_call(tool, params, timeout: int = 30) -> str:
     try:
         return run_cua(["call", tool, json.dumps(merged)], timeout=timeout)
     except RuntimeError as e:
+        # 子串匹配是刻意取舍：session-ended 文案可能落在 str(e)（生产 10/6 形态）
+        # 或 e.stdout（错误 JSON 的另一半形状）——误匹配面（树文本恰好含该子串）
+        # 触发的复活+注册表清空有界且自愈（注册表是缓存，消费者重读即重建）
         if "session has ended" not in (
                 str(e) + str(getattr(e, "stdout", None) or "")):
             raise
+        # 用 merged 的标签复活（而非恒 CUA_SESSION）：显式自管 session 的调用方
+        # 被回收时复活错标签会平添空 session + 重试必再败
+        label = merged["session"]
         run_cua(["call", "start_session",
-                 json.dumps({"session": CUA_SESSION})], timeout=timeout)
+                 json.dumps({"session": label})], timeout=timeout)
         _ELEMENT_TOKENS.clear()
+        print(f"  🩹 cua session '{label}' 空闲被驱动端回收，已同标签复活"
+              f"并清空 token 注册表（原调用重试一次）", flush=True)
         return run_cua(["call", tool, json.dumps(merged)], timeout=timeout)
 
 

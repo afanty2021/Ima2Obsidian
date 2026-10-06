@@ -626,3 +626,59 @@ class TestSessionRevival:
             ima_common.cua_call("get_window_state", {"pid": 1, "window_id": 2})
         # 恰 3 次（原调用+复活+重试），绝不无限循环复活
         assert len(calls) == 3
+
+    def test_match_via_stdout_channel_revives(self, monkeypatch, capsys,
+                                              clean_token_registry):
+        """双通道匹配的另一半形状：str(e) 不含关键字、错误 JSON 落在 e.stdout
+        内含 'session has ended'——同样触发复活（fab34eb 评审 Minor#3 补钉）；
+        并钉住复活分支的可观测日志（评审 Important#1：静默自愈会抹掉诊断线索）。"""
+        calls = []
+        ended = {"done": False}
+
+        def fake_run(args, timeout=30):
+            calls.append(list(args))
+            if args[0] == "call" and args[1] == "get_window_state" and not ended["done"]:
+                ended["done"] = True
+                err = RuntimeError("cua-driver failed: exit 1")
+                err.stdout = json.dumps(
+                    {"error": {"message": "session has ended; tool call "
+                                          "'get_window_state' was rejected."}})
+                raise err
+            if args[0] == "call" and args[1] == "start_session":
+                return "{}"
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr(ima_common, "run_cua", fake_run)
+        out = ima_common.cua_call("get_window_state", {"pid": 1, "window_id": 2})
+        assert json.loads(out) == {"ok": True}
+        assert [c[1] for c in calls] == ["get_window_state", "start_session",
+                                         "get_window_state"]
+        assert "空闲被驱动端回收" in capsys.readouterr().out
+
+    def test_explicit_session_label_revived_not_default(self, monkeypatch,
+                                                        clean_token_registry):
+        """调用方自管 session（显式传参不覆盖）被回收时，复活与重试都必须沿用
+        该标签而非恒 CUA_SESSION——复活错标签会平添空 session 且重试必再败
+        （fab34eb 评审 Minor#2：用 merged 标签取代硬编码）。"""
+        started_labels = []
+        called_labels = []
+
+        def fake_run(args, timeout=30):
+            if args[0] == "call" and args[1] == "get_window_state":
+                called_labels.append(json.loads(args[2])["session"])
+                if len(called_labels) == 1:
+                    raise self._ended_err("get_window_state")
+                return json.dumps({"ok": True})
+            if args[0] == "call" and args[1] == "start_session":
+                started_labels.append(json.loads(args[2])["session"])
+                return "{}"
+            raise AssertionError(f"unexpected call: {args}")
+
+        monkeypatch.setattr(ima_common, "run_cua", fake_run)
+        out = ima_common.cua_call(
+            "get_window_state", {"pid": 1, "window_id": 2,
+                                 "session": "ima-custom"})
+        assert json.loads(out) == {"ok": True}
+        # 原调用与重试均带自管标签；复活也是同标签
+        assert called_labels == ["ima-custom", "ima-custom"]
+        assert started_labels == ["ima-custom"]

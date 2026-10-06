@@ -535,3 +535,94 @@ class TestRunCuaCallDiagnostics:
                             self._run_cua_failing("boom text"))
         assert extractor.run_cua_call("scroll", {}) is None
         assert "boom text" in capsys.readouterr().out
+
+
+@pytest.fixture()
+def clean_token_registry():
+    ima_common._ELEMENT_TOKENS.clear()
+    yield
+    ima_common._ELEMENT_TOKENS.clear()
+
+
+class TestSessionRevival:
+    """0.31 daemon 空闲回收 session 的自愈回归（10/6 两轮 launchd 崩于此）。
+
+    生产形状：主进程把提取/保存交给子进程（各带自己标签），空闲 ~5-8 分钟
+    后 session has ended、切下一库时全部调用被拒。cua_call 须在同标签
+    start_session 复活 + 清空 token 注册表后重试一次。
+    """
+
+    @staticmethod
+    def _ended_err(tool):
+        err = RuntimeError(
+            f"cua-driver failed: session has ended; tool call '{tool}' "
+            f"was rejected. Call start_session to start it again.")
+        err.stdout = json.dumps({"error": {"code": "session_ended"}})
+        return err
+
+    def test_revives_retries_and_clears_registry(self, monkeypatch,
+                                                 clean_token_registry):
+        calls = []
+        ended = {"done": False}
+
+        def fake_run(args, timeout=30):
+            calls.append(list(args))
+            if args[0] == "call" and args[1] == "get_window_state" and not ended["done"]:
+                ended["done"] = True
+                raise self._ended_err("get_window_state")
+            if args[0] == "call" and args[1] == "start_session":
+                assert json.loads(args[2])["session"] == ima_common.CUA_SESSION
+                return "{}"
+            return json.dumps({"tree_markdown": "revived", "elements": []})
+
+        monkeypatch.setattr(ima_common, "run_cua", fake_run)
+        ima_common._ELEMENT_TOKENS[(99, 9)] = {5: "stale-tok"}  # 旧 session 残留
+        out = ima_common.cua_call("get_window_state", {"pid": 99, "window_id": 9})
+        assert json.loads(out)["tree_markdown"] == "revived"
+        # 序列：原调用 → start_session（同标签）→ 重试
+        assert [c[1] for c in calls] == ["get_window_state", "start_session",
+                                         "get_window_state"]
+        # 旧 session 的 token 全废，注册表必须清空
+        assert (99, 9) not in ima_common._ELEMENT_TOKENS
+
+    def test_non_session_error_not_revived(self, monkeypatch,
+                                           clean_token_registry):
+        calls = []
+
+        def fake_run(args, timeout=30):
+            calls.append(list(args))
+            err = RuntimeError("cua-driver failed: exit 1")
+            err.stdout = json.dumps({"error": {"code": "stale_element_token"}})
+            raise err
+
+        monkeypatch.setattr(ima_common, "run_cua", fake_run)
+        with pytest.raises(RuntimeError):
+            ima_common.cua_call("click", {"pid": 1, "element_token": "t"})
+        assert [c[1] for c in calls] == ["click"]  # 不做复活旁路
+
+    def test_start_session_failure_propagates(self, monkeypatch,
+                                              clean_token_registry):
+        def fake_run(args, timeout=30):
+            if args[1] == "start_session":
+                raise RuntimeError("cua-driver failed: daemon down")
+            raise self._ended_err("bring_to_front")
+
+        monkeypatch.setattr(ima_common, "run_cua", fake_run)
+        with pytest.raises(RuntimeError, match="daemon down"):
+            ima_common.cua_call("bring_to_front", {"pid": 1, "window_id": 2})
+
+    def test_retry_failure_does_not_loop(self, monkeypatch,
+                                         clean_token_registry):
+        calls = []
+
+        def fake_run(args, timeout=30):
+            calls.append(list(args))
+            if args[1] == "start_session":
+                return "{}"
+            raise self._ended_err("get_window_state")  # 重试仍 ended
+
+        monkeypatch.setattr(ima_common, "run_cua", fake_run)
+        with pytest.raises(RuntimeError):
+            ima_common.cua_call("get_window_state", {"pid": 1, "window_id": 2})
+        # 恰 3 次（原调用+复活+重试），绝不无限循环复活
+        assert len(calls) == 3

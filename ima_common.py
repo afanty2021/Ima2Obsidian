@@ -98,10 +98,26 @@ def cua_call(tool, params, timeout: int = 30) -> str:
     所有 call 都应经此走（而不是直接 run_cua(["call", ...])），否则该次
     调用游离在会话之外：读窗建不了可复用快照、拿到的 token 下次调用必
     stale。显式传入的 session 不覆盖（调用方自管时让路）。
+
+    session 被驱动端空闲回收时自动复活（10/6 两轮 launchd 崩于此：提取/
+    保存都是子进程各带标签，主进程空闲 ~5-8 分钟后 session has ended，切
+    下一库时全部调用被拒）。复活 = 同标签 start_session（官方钦定的复活
+    路径，普通动作不复活已结束的会话）+ 清空 token 注册表（旧 session 的
+    快照/token 已全废，防拿 stale token 空转）+ 原调用重试一次；复活或
+    重试再失败照常上抛，绝不循环。
     """
     merged = dict(params or {})
     merged.setdefault("session", CUA_SESSION)
-    return run_cua(["call", tool, json.dumps(merged)], timeout=timeout)
+    try:
+        return run_cua(["call", tool, json.dumps(merged)], timeout=timeout)
+    except RuntimeError as e:
+        if "session has ended" not in (
+                str(e) + str(getattr(e, "stdout", None) or "")):
+            raise
+        run_cua(["call", "start_session",
+                 json.dumps({"session": CUA_SESSION})], timeout=timeout)
+        _ELEMENT_TOKENS.clear()
+        return run_cua(["call", tool, json.dumps(merged)], timeout=timeout)
 
 
 def remember_window_elements(pid, window_id, state):
